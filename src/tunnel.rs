@@ -9,6 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const STDERR_LOG_CAP: usize = 200;
+/// How long the accept loop sleeps between polls; also the worst-case delay
+/// before stop() can return.
+const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 pub struct Counters {
@@ -47,6 +50,9 @@ pub struct ActiveTunnel {
     /// Port ssh actually listens on for -L/-D; our relay sits in front of it.
     internal_port: Option<u16>,
     stop_flag: Arc<AtomicBool>,
+    /// Owns the listening socket; joined on stop so the port is free the moment
+    /// stop() returns and a replacement tunnel can bind it.
+    relay: Option<thread::JoinHandle<()>>,
     last_sample: (u64, u64),
     pub rate_tx: u64,
     pub rate_rx: u64,
@@ -127,16 +133,20 @@ pub fn spawn(tunnel: &Tunnel) -> Result<ActiveTunnel> {
     let counters = Arc::new(Counters::default());
     let stop_flag = Arc::new(AtomicBool::new(false));
 
+    let mut relay = None;
     if let Some(internal) = internal_port {
-        if let Err(e) = start_relay(
+        match start_relay(
             tunnel.local_port,
             internal,
             Arc::clone(&counters),
             Arc::clone(&stop_flag),
         ) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
+            Ok(handle) => relay = Some(handle),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
         }
     }
 
@@ -149,6 +159,7 @@ pub fn spawn(tunnel: &Tunnel) -> Result<ActiveTunnel> {
         stderr_log,
         internal_port,
         stop_flag,
+        relay,
         last_sample: (0, 0),
         rate_tx: 0,
         rate_rx: 0,
@@ -221,6 +232,11 @@ impl ActiveTunnel {
         self.stop_flag.store(true, Ordering::SeqCst);
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Wait for the accept loop to drop the listener, otherwise starting a
+        // tunnel on the same port right after this returns hits EADDRINUSE.
+        if let Some(relay) = self.relay.take() {
+            let _ = relay.join();
+        }
     }
 
     pub fn recent_stderr(&self, n: usize) -> Vec<String> {
@@ -242,14 +258,14 @@ fn start_relay(
     internal_port: u16,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", listen_port))
         .with_context(|| format!("binding 127.0.0.1:{listen_port} (port in use?)"))?;
     listener
         .set_nonblocking(true)
         .context("setting listener non-blocking")?;
 
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         loop {
             if stop.load(Ordering::SeqCst) {
                 break;
@@ -261,13 +277,14 @@ fn start_relay(
                     thread::spawn(move || handle_conn(client, internal_port, counters, stop));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(RELAY_POLL_INTERVAL);
                 }
                 Err(_) => break,
             }
         }
+        // Dropping `listener` here releases the port.
     });
-    Ok(())
+    Ok(handle)
 }
 
 fn handle_conn(
@@ -386,6 +403,26 @@ mod tests {
         assert_eq!(counters.total_conns.load(Ordering::Relaxed), 1);
 
         stop.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn stopping_a_relay_frees_the_port_for_the_next_tunnel() {
+        // Evicting a conflicting tunnel is only useful if its port is free by
+        // the time the replacement binds.
+        let listen_port = free_port().unwrap();
+        let counters = Arc::new(Counters::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle =
+            start_relay(listen_port, 1, Arc::clone(&counters), Arc::clone(&stop)).unwrap();
+
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let again = start_relay(listen_port, 1, Arc::new(Counters::default()), Arc::clone(&stop2));
+        assert!(again.is_ok(), "port should be free: {:?}", again.err());
+        stop2.store(true, Ordering::SeqCst);
+        again.unwrap().join().unwrap();
     }
 
     #[test]

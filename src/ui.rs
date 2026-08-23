@@ -1,10 +1,12 @@
 use crate::app::{
-    App, FormField, FormMode, RdpField, RdpMode, RowItem, Tab, FORM_FIELDS, RDP_FIELDS,
+    App, FormField, FormMode, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab,
+    FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
 };
 use crate::rdp::RdpStatus;
+use crate::ssh;
 use crate::theme::{self, Theme};
 use crate::tunnel::Status;
-use crate::types::{ForwardType, Tunnel};
+use crate::types::{vpn_requirement_label, ForwardType, Tunnel};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -74,6 +76,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Tab::Dashboard => render_dashboard(f, app, chunks[1]),
         Tab::Vpn => render_vpn(f, app, chunks[1]),
         Tab::Tunnels => render_tunnels(f, app, chunks[1]),
+        Tab::Ssh => render_ssh(f, app, chunks[1]),
         Tab::Rdp => render_rdp(f, app, chunks[1]),
     }
     render_status(f, app, chunks[2]);
@@ -92,6 +95,18 @@ pub fn render(f: &mut Frame, app: &App) {
             render_rdp_password_overlay(f, app, area, *idx, input)
         }
         RdpMode::Logs => render_rdp_logs_overlay(f, app, area),
+    }
+
+    match &app.ssh_mode {
+        SshMode::None => {}
+        SshMode::Add | SshMode::Edit(_) => render_ssh_form_overlay(f, app, area),
+        SshMode::DeleteConfirm(i) => render_ssh_delete_confirm(f, app, area, *i),
+        SshMode::PasswordWarning => render_password_warning(f, app, area),
+    }
+
+    // A conflict prompt holds a tunnel start hostage; it wins over everything.
+    if app.conflict.is_some() {
+        render_conflict_prompt(f, app, area);
     }
 
     if app.show_help {
@@ -203,9 +218,10 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
         ])
         .split(rows[0]);
 
@@ -246,6 +262,17 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
             ),
         ),
     ];
+    let chained = app
+        .tunnels
+        .iter()
+        .filter(|t| !t.requires_vpn.is_empty() || !t.depends_on.is_empty())
+        .count();
+    if chained > 0 {
+        ssh_lines.push(kv(
+            "chained",
+            Span::styled(chained.to_string(), Style::default().fg(TEXT())),
+        ));
+    }
     if app.active.is_empty() {
         ssh_lines.push(Line::from(""));
         ssh_lines.push(Line::from(Span::styled(
@@ -343,7 +370,39 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
     }
-    f.render_widget(summary_block("rdp [4]", rdp_lines), cols[2]);
+    f.render_widget(summary_block("rdp [5]", rdp_lines), cols[3]);
+
+    // --- SSH hosts summary ---
+    let with_password = app
+        .ssh_hosts
+        .iter()
+        .filter(|h| !h.password.is_empty())
+        .count();
+    let mut ssh_host_lines = vec![kv(
+        "configured",
+        Span::styled(app.ssh_hosts.len().to_string(), Style::default().fg(TEXT())),
+    )];
+    if with_password > 0 {
+        ssh_host_lines.push(kv(
+            "cleartext",
+            Span::styled(
+                format!("{with_password} password(s)"),
+                Style::default().fg(WARN()),
+            ),
+        ));
+    }
+    if let Some(act) = &app.activation {
+        ssh_host_lines.push(kv(
+            "starting",
+            Span::styled(truncate(&act.progress(), 16), Style::default().fg(WARN())),
+        ));
+    }
+    ssh_host_lines.push(Line::from(""));
+    ssh_host_lines.push(Line::from(Span::styled(
+        " sessions run in this terminal",
+        Style::default().fg(DIM()),
+    )));
+    f.render_widget(summary_block("ssh hosts [4]", ssh_host_lines), cols[2]);
 
     // --- Active tunnels + RDP sessions table ---
     render_active_table(f, app, rows[1]);
@@ -473,7 +532,7 @@ fn render_active_table(f: &mut Frame, app: &App, area: Rect) {
 
     if names.is_empty() && rdp_names.is_empty() {
         let hint = Paragraph::new(Line::from(Span::styled(
-            "  nothing active — start a tunnel [3] or an RDP session [4]",
+            "  nothing active — start a tunnel [3] or an RDP session [5]",
             Style::default().fg(DIM()),
         )));
         let inner = Rect {
@@ -489,6 +548,35 @@ fn render_active_table(f: &mut Frame, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 // Tunnels tab (unchanged behavior)
 // ---------------------------------------------------------------------------
+
+/// Compact "needs …" tail for a tunnel row; the details panel spells out which
+/// profile and which tunnel.
+fn needs_span(app: &App, t: &Tunnel) -> Span<'static> {
+    let mut parts: Vec<&str> = Vec::new();
+    if !t.requires_vpn.is_empty() {
+        parts.push("vpn");
+    }
+    if !t.depends_on.is_empty() {
+        parts.push("tun");
+    }
+    if parts.is_empty() {
+        return Span::raw("");
+    }
+    let ready = app.vpn_satisfied(&t.requires_vpn)
+        && (t.depends_on.is_empty()
+            || matches!(
+                app.active.get(&t.depends_on).map(|a| a.status),
+                Some(Status::Up)
+            ));
+    let color = if app.dependency_missing(&t.depends_on) {
+        DANGER()
+    } else if ready {
+        OK()
+    } else {
+        DIM()
+    };
+    Span::styled(format!("needs {}", parts.join("+")), Style::default().fg(color))
+}
 
 fn render_tunnels(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -522,17 +610,18 @@ fn render_tunnels(f: &mut Frame, app: &App, area: Rect) {
                     Span::raw(indent.to_string()),
                     status_dot(app, t),
                     Span::styled(
-                        format!(" {:<18}", truncate(&t.name, 18)),
+                        format!(" {:<16}", truncate(&t.name, 16)),
                         Style::default().fg(TEXT()),
                     ),
                     Span::styled(
-                        format!("{:<26}", truncate(&t.forward_summary(), 26)),
+                        format!("{:<22}", truncate(&t.forward_summary(), 22)),
                         Style::default().fg(DIM()),
                     ),
                     Span::styled(
-                        format!("via {}", t.ssh_host),
+                        format!("via {:<12}", truncate(&t.ssh_host, 12)),
                         Style::default().fg(DIM()),
                     ),
+                    needs_span(app, t),
                 ]))
             }
         })
@@ -634,6 +723,19 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
                 "reconnect",
                 if t.auto_reconnect { "auto" } else { "manual" }.to_string(),
             ));
+            lines.push(Line::from(vec![
+                Span::styled("needs vpn  ", Style::default().fg(DIM())),
+                vpn_span(app, &t.requires_vpn),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("needs tun  ", Style::default().fg(DIM())),
+                dependency_span(app, &t.depends_on),
+            ]));
+            lines.extend(chain_lines(app, Step::Tunnel(t.name.clone())));
+            let dependents = app.dependents_of(&t.name);
+            if !dependents.is_empty() {
+                lines.push(field("needed by", dependents.join(", ")));
+            }
 
             if let Some(a) = app.active.get(&t.name) {
                 lines.push(Line::from(""));
@@ -766,6 +868,13 @@ fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
             if p.active {
                 spans.push(Span::styled("  (active)", Style::default().fg(DIM())));
             }
+            let needed_by = app.vpn_dependents_of(&p.name).len();
+            if needed_by > 0 {
+                spans.push(Span::styled(
+                    format!("  {needed_by} dep(s)"),
+                    Style::default().fg(DIM()),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -828,9 +937,39 @@ fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(DANGER()),
         )));
     }
+    if let Some(p) = app.nb.profiles.get(app.nb.selected) {
+        let dependents = app.vpn_dependents_of(&p.name);
+        let any = app.vpn_dependents_of(crate::types::VPN_ANY);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" requires '{}':", p.name),
+            Style::default().fg(DIM()),
+        )));
+        if dependents.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "   nothing",
+                Style::default().fg(DIM()),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", dependents.join(", ")),
+                Style::default().fg(TEXT()),
+            )));
+        }
+        if !any.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("   plus {} needing any profile", any.len()),
+                Style::default().fg(DIM()),
+            )));
+        }
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " Enter switches to the selected profile and connects.",
+        Style::default().fg(DIM()),
+    )));
+    lines.push(Line::from(Span::styled(
+        " Anything that requires the profile being left is disconnected.",
         Style::default().fg(DIM()),
     )));
 
@@ -870,18 +1009,22 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
                 Span::raw(" "),
                 rdp_status_dot(app, &c.name),
                 Span::styled(
-                    format!(" {:<18}", truncate(&c.name, 18)),
+                    format!(" {:<16}", truncate(&c.name, 16)),
                     Style::default().fg(TEXT()),
                 ),
                 Span::styled(
-                    format!("{:<22}", truncate(&c.target_summary(), 22)),
+                    format!("{:<20}", truncate(&c.target_summary(), 20)),
                     Style::default().fg(DIM()),
                 ),
                 Span::styled(
-                    format!("as {}", c.login_summary()),
+                    format!("{:<15}", format!("as {}", truncate(&c.login_summary(), 12))),
                     Style::default().fg(DIM()),
                 ),
-            ]))
+                Span::styled("via ", Style::default().fg(DIM())),
+            ]
+            .into_iter()
+            .chain(requires_spans(app, &c.requires_vpn, &c.depends_on))
+            .collect::<Vec<_>>()))
         })
         .collect();
 
@@ -939,6 +1082,21 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(field("domain", c.domain.clone()));
             }
             lines.push(field("username", c.username.clone()));
+            lines.push(Line::from(vec![
+                Span::styled("needs vpn  ", Style::default().fg(DIM())),
+                vpn_span(app, &c.requires_vpn),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("needs tun  ", Style::default().fg(DIM())),
+                dependency_span(app, &c.depends_on),
+            ]));
+            lines.extend(chain_lines(
+                app,
+                Step::Rdp {
+                    name: c.name.clone(),
+                    password: String::new(),
+                },
+            ));
             if !c.extra_args.is_empty() {
                 lines.push(field("extra args", c.extra_args.clone()));
             }
@@ -1000,17 +1158,275 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// SSH tab
+// ---------------------------------------------------------------------------
+
+/// Dependency shown next to a connection: dim when idle, green when the tunnel
+/// it needs is up, red when the tunnel no longer exists.
+fn dependency_span(app: &App, dep: &str) -> Span<'static> {
+    if dep.is_empty() {
+        return Span::styled("—", Style::default().fg(DIM()));
+    }
+    if app.dependency_missing(dep) {
+        return Span::styled(format!("{dep} (missing)"), Style::default().fg(DANGER()));
+    }
+    let color = match app.active.get(dep).map(|a| a.status) {
+        Some(Status::Up) => OK(),
+        Some(Status::Connecting) => WARN(),
+        Some(Status::Failed) => DANGER(),
+        None => DIM(),
+    };
+    Span::styled(dep.to_string(), Style::default().fg(color))
+}
+
+/// The full path a connection runs through, e.g. "vpn work → tun base → ssh app".
+/// Renders the reason instead when the chain cannot be resolved.
+fn chain_lines(app: &App, step: Step) -> Vec<Line<'static>> {
+    match app.chain_of(step) {
+        Ok(parts) if parts.len() > 1 => vec![
+            Line::from(Span::styled("chain", Style::default().fg(DIM()))),
+            Line::from(Span::styled(
+                format!("  {}", parts.join(" → ")),
+                Style::default().fg(TEXT()),
+            )),
+        ],
+        Ok(_) => Vec::new(),
+        Err(e) => vec![Line::from(Span::styled(
+            format!("chain      {e}"),
+            Style::default().fg(DANGER()),
+        ))],
+    }
+}
+
+/// "vpn work" / "any profile" with a colour for whether it currently holds.
+fn vpn_span(app: &App, req: &str) -> Span<'static> {
+    if req.is_empty() {
+        return Span::styled("—", Style::default().fg(DIM()));
+    }
+    let color = if app.vpn_satisfied(req) { OK() } else { DIM() };
+    Span::styled(vpn_requirement_label(req), Style::default().fg(color))
+}
+
+/// Same, shortened for a list row where it sits next to a tunnel name.
+fn vpn_span_short(app: &App, req: &str) -> Span<'static> {
+    let color = if app.vpn_satisfied(req) { OK() } else { DIM() };
+    let label = if req == crate::types::VPN_ANY {
+        "vpn any".to_string()
+    } else {
+        format!("vpn {req}")
+    };
+    Span::styled(label, Style::default().fg(color))
+}
+
+/// "vpn work + base" for a connection row, each half coloured by whether it
+/// currently holds.
+fn requires_spans(app: &App, vpn: &str, tunnel: &str) -> Vec<Span<'static>> {
+    if vpn.is_empty() && tunnel.is_empty() {
+        return vec![Span::styled("—", Style::default().fg(DIM()))];
+    }
+    let mut spans = Vec::new();
+    if !vpn.is_empty() {
+        spans.push(vpn_span_short(app, vpn));
+    }
+    if !tunnel.is_empty() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" + ", Style::default().fg(DIM())));
+        }
+        spans.push(dependency_span(app, tunnel));
+    }
+    spans
+}
+
+fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .ssh_hosts
+        .iter()
+        .map(|h| {
+            let lock = if h.password.is_empty() {
+                Span::raw(" ")
+            } else {
+                Span::styled("!", Style::default().fg(WARN()).bold())
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(" "),
+                lock,
+                Span::styled(
+                    format!(" {:<16}", truncate(&h.name, 16)),
+                    Style::default().fg(TEXT()),
+                ),
+                Span::styled(
+                    format!("{:<24}", truncate(&h.target_summary(), 24)),
+                    Style::default().fg(DIM()),
+                ),
+                Span::styled("via ", Style::default().fg(DIM())),
+            ]
+            .into_iter()
+            .chain(requires_spans(app, &h.requires_vpn, &h.depends_on))
+            .collect::<Vec<_>>()))
+        })
+        .collect();
+
+    let empty = items.is_empty();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(SELECTION_BG()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER()))
+                .title(Span::styled(" ssh hosts ", Style::default().fg(TEXT()))),
+        );
+    let mut state = ListState::default();
+    if !empty {
+        state.select(Some(app.ssh_selected));
+    }
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    if empty {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no SSH hosts configured yet",
+                Style::default().fg(DIM()),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  press ", Style::default().fg(DIM())),
+                Span::styled("a", Style::default().fg(ACCENT()).bold()),
+                Span::styled(" to add your first host", Style::default().fg(DIM())),
+            ]),
+        ]);
+        let inner = Rect {
+            x: chunks[0].x + 1,
+            y: chunks[0].y + 1,
+            width: chunks[0].width.saturating_sub(2),
+            height: chunks[0].height.saturating_sub(2),
+        };
+        f.render_widget(hint, inner);
+    }
+
+    // Details panel
+    let mut lines: Vec<Line> = Vec::new();
+    match app.ssh_hosts.get(app.ssh_selected) {
+        Some(h) => {
+            let field = |k: &str, v: String| {
+                Line::from(vec![
+                    Span::styled(format!("{k:<11}"), Style::default().fg(DIM())),
+                    Span::styled(v, Style::default().fg(TEXT())),
+                ])
+            };
+            lines.push(field("name", h.name.clone()));
+            lines.push(field("target", h.target_summary()));
+            lines.push(field("auth", h.auth_summary()));
+            if h.skip_host_key_check {
+                lines.push(Line::from(vec![
+                    Span::styled("host key   ", Style::default().fg(DIM())),
+                    Span::styled("verification skipped", Style::default().fg(WARN())),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("needs vpn  ", Style::default().fg(DIM())),
+                vpn_span(app, &h.requires_vpn),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("needs tun  ", Style::default().fg(DIM())),
+                dependency_span(app, &h.depends_on),
+            ]));
+            lines.extend(chain_lines(app, Step::Ssh(h.name.clone())));
+            if !h.extra_args.is_empty() {
+                lines.push(field("extra args", h.extra_args.clone()));
+            }
+
+            if !h.password.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "password stored in cleartext in ssh.toml",
+                    Style::default().fg(WARN()),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("press ", Style::default().fg(DIM())),
+                    Span::styled("p", Style::default().fg(ACCENT()).bold()),
+                    Span::styled(" to remove it", Style::default().fg(DIM())),
+                ]));
+                if !app.sshpass_installed {
+                    lines.push(Line::from(Span::styled(
+                        "sshpass is not on PATH — it cannot be used",
+                        Style::default().fg(DANGER()),
+                    )));
+                }
+            }
+
+            if let Some(last) = app.ssh_last.get(&h.name) {
+                lines.push(Line::from(""));
+                let style = if last.code == 0 {
+                    Style::default().fg(DIM())
+                } else {
+                    Style::default().fg(DANGER())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("last run   ", Style::default().fg(DIM())),
+                    Span::styled(last.label(), style),
+                ]));
+                lines.push(field("lasted", fmt_duration(last.duration)));
+                lines.push(field("ended", format!("{} ago", fmt_duration(last.finished_at.elapsed()))));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                truncate(&ssh::command_preview(h), 60),
+                Style::default().fg(DIM()),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("press ", Style::default().fg(DIM())),
+                Span::styled("Enter", Style::default().fg(ACCENT()).bold()),
+                Span::styled(" to open a session in this terminal", Style::default().fg(DIM())),
+            ]));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "nothing selected",
+                Style::default().fg(DIM()),
+            )));
+        }
+    }
+
+    let details = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER()))
+            .title(Span::styled(" details ", Style::default().fg(TEXT()))),
+    );
+    f.render_widget(details, chunks[1]);
+}
+
+// ---------------------------------------------------------------------------
 // Status bar / overlays
 // ---------------------------------------------------------------------------
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some((msg, is_error, _)) = &app.status_msg {
+    // A running plan owns the status bar: it is the only thing that keeps
+    // moving on its own, and its steps are what the user is waiting for.
+    let line = if let Some(act) = &app.activation {
+        Line::from(vec![
+            Span::styled(" ⟳ ", Style::default().fg(WARN()).bold()),
+            Span::styled(
+                format!("starting {} ", act.target),
+                Style::default().fg(TEXT()),
+            ),
+            Span::styled(act.progress(), Style::default().fg(ACCENT())),
+        ])
+    } else if let Some((msg, is_error, _)) = &app.status_msg {
         let color = if *is_error { DANGER() } else { OK() };
         Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)))
     } else {
         let hints: &[(&str, &str)] = match app.tab {
             Tab::Dashboard => &[
-                ("1-4/tab", "switch tab"),
+                ("1-5/tab", "switch tab"),
                 ("t", "theme"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1031,6 +1447,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("u", "up"),
                 ("d", "down"),
                 ("r", "refresh"),
+                ("?", "help"),
+                ("q", "quit"),
+            ],
+            Tab::Ssh => &[
+                ("↵", "open session"),
+                ("a", "add"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("p", "clear password"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
@@ -1070,7 +1495,7 @@ fn render_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         .filter(|fld| fld.applies(form.forward))
         .collect();
     let height = (visible.len() + 5) as u16;
-    let rect = centered_rect(64, height, area);
+    let rect = centered_rect(70, height, area);
     f.render_widget(Clear, rect);
 
     let title = match app.form_mode {
@@ -1098,16 +1523,12 @@ fn render_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             FormField::AutoReconnect => {
                 format!("◂ {} ▸", if form.auto_reconnect { "yes" } else { "no" })
             }
+            FormField::RequiresVpn => format!("◂ {} ▸", form.vpn.label()),
+            FormField::DependsOn => format!("◂ {} ▸", form.dep.label()),
         };
-        let cursor = if is_active
-            && !matches!(fld, FormField::Forward | FormField::AutoReconnect)
-        {
-            "▏"
-        } else {
-            ""
-        };
+        let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<24}", fld.label(form.forward)), label_style),
+            Span::styled(format!(" {:<32}", fld.label(form.forward)), label_style),
             Span::styled(value, Style::default().fg(TEXT())),
             Span::styled(cursor, Style::default().fg(ACCENT())),
         ]));
@@ -1206,8 +1627,10 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             RdpField::Domain => form.domain.clone(),
             RdpField::Username => form.username.clone(),
             RdpField::ExtraArgs => form.extra_args.clone(),
+            RdpField::RequiresVpn => format!("◂ {} ▸", form.vpn.label()),
+            RdpField::DependsOn => format!("◂ {} ▸", form.dep.label()),
         };
-        let cursor = if is_active { "▏" } else { "" };
+        let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<30}", fld.label()), label_style),
             Span::styled(value, Style::default().fg(TEXT())),
@@ -1222,7 +1645,7 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            " tab/↓ next · ↑ prev · Enter save · Esc cancel",
+            " tab/↓ next · ↑ prev · ◂▸ toggle · Enter save · Esc cancel",
             Style::default().fg(DIM()),
         )));
     }
@@ -1319,8 +1742,218 @@ fn render_rdp_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
+fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let form = &app.ssh_form;
+    let height = (SSH_FIELDS.len() + 5) as u16;
+    let rect = centered_rect(70, height, area);
+    f.render_widget(Clear, rect);
+
+    let title = match app.ssh_mode {
+        SshMode::Edit(_) => " edit ssh host ",
+        _ => " add ssh host ",
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for fld in SSH_FIELDS {
+        let is_active = *fld == form.field();
+        let label_style = if is_active {
+            Style::default().fg(ACCENT()).bold()
+        } else {
+            Style::default().fg(DIM())
+        };
+        let (value, value_style) = match fld {
+            SshField::Name => (form.name.clone(), Style::default().fg(TEXT())),
+            SshField::Host => (form.host.clone(), Style::default().fg(TEXT())),
+            SshField::Port => (form.port.clone(), Style::default().fg(TEXT())),
+            SshField::Username => (form.username.clone(), Style::default().fg(TEXT())),
+            SshField::KeyPath => (form.key_path.clone(), Style::default().fg(TEXT())),
+            // Typed in the clear so the user can see what they are storing.
+            SshField::Password => (
+                form.password.clone(),
+                Style::default().fg(if form.password.is_empty() {
+                    TEXT()
+                } else {
+                    WARN()
+                }),
+            ),
+            SshField::SkipHostKey => (
+                format!(
+                    "◂ {} ▸",
+                    if form.skip_host_key_check { "yes" } else { "no" }
+                ),
+                Style::default().fg(if form.skip_host_key_check {
+                    WARN()
+                } else {
+                    TEXT()
+                }),
+            ),
+            SshField::RequiresVpn => (
+                format!("◂ {} ▸", form.vpn.label()),
+                Style::default().fg(TEXT()),
+            ),
+            SshField::DependsOn => (
+                format!("◂ {} ▸", form.dep.label()),
+                Style::default().fg(TEXT()),
+            ),
+            SshField::ExtraArgs => (form.extra_args.clone(), Style::default().fg(TEXT())),
+        };
+        let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<32}", fld.label()), label_style),
+            Span::styled(value, value_style),
+            Span::styled(cursor, Style::default().fg(ACCENT())),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(DANGER()),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " tab/↓ next · ↑ prev · ◂▸ toggle · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+    }
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+fn render_ssh_delete_confirm(f: &mut Frame, app: &App, area: Rect, idx: usize) {
+    let name = app
+        .ssh_hosts
+        .get(idx)
+        .map(|h| h.name.as_str())
+        .unwrap_or("?");
+    render_confirm_box(f, area, &format!(" delete SSH host '{name}'?"));
+}
+
+fn render_password_warning(f: &mut Frame, app: &App, area: Rect) {
+    let path = app.paths.ssh_file.display().to_string();
+    let rect = centered_rect(68, 10, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(
+            " The password is saved in cleartext.",
+            Style::default().fg(WARN()).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" It is written to {path}"),
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(Span::styled(
+            " (file mode 0600) and passed to ssh through sshpass.",
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(Span::styled(
+            " Anyone who can read your home directory can read it,",
+            Style::default().fg(DIM()),
+        )),
+        Line::from(Span::styled(
+            " and backups will carry it along. A key is safer.",
+            Style::default().fg(DIM()),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" y", Style::default().fg(WARN()).bold()),
+            Span::styled(" save it anyway · ", Style::default().fg(DIM())),
+            Span::styled("any other key", Style::default().fg(ACCENT())),
+            Span::styled(" back to the form", Style::default().fg(DIM())),
+        ]),
+    ])
+    .wrap(Wrap { trim: false })
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(
+                " cleartext password ",
+                Style::default().fg(WARN()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
+}
+
+fn render_conflict_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(c) = &app.conflict else {
+        return;
+    };
+    let blocking = c.blocking();
+    let height = (9 + blocking.len().min(4) + usize::from(c.note.is_some())) as u16;
+    let rect = centered_rect(72, height, area);
+    f.render_widget(Clear, rect);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" starting  ", Style::default().fg(DIM())),
+            Span::styled(c.step.describe(), Style::default().fg(ACCENT()).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(" needs     ", Style::default().fg(DIM())),
+            Span::styled(c.resource.clone(), Style::default().fg(WARN()).bold()),
+        ]),
+    ];
+    if let Some(note) = &c.note {
+        lines.push(Line::from(vec![
+            Span::styled(" change    ", Style::default().fg(DIM())),
+            Span::styled(note.clone(), Style::default().fg(TEXT())),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if blocking.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Nothing else is using it right now.",
+            Style::default().fg(DIM()),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " These are disconnected first:",
+            Style::default().fg(DIM()),
+        )));
+        for b in blocking.iter().take(4) {
+            lines.push(Line::from(Span::styled(
+                format!("   {b}"),
+                Style::default().fg(TEXT()),
+            )));
+        }
+    }
+    // Only worth saying when there is more to the plan than this one step.
+    if let Some(act) = app.activation.as_ref().filter(|a| a.total > 1) {
+        lines.push(Line::from(Span::styled(
+            format!(" Part of starting {} ({}).", act.target, act.progress()),
+            Style::default().fg(DIM()),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" y/Enter", Style::default().fg(WARN()).bold()),
+        Span::styled(" go ahead · ", Style::default().fg(DIM())),
+        Span::styled("any other key", Style::default().fg(ACCENT())),
+        Span::styled(" cancel", Style::default().fg(DIM())),
+    ]));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(
+                " conflict ",
+                Style::default().fg(WARN()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let rect = centered_rect(66, 26, area);
+    let rect = centered_rect(70, 38, area);
     f.render_widget(Clear, rect);
     let entry = |k: &str, d: &str| {
         Line::from(vec![
@@ -1335,7 +1968,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         ))
     };
     let lines = vec![
-        entry("1-4 / tab", "switch tab (dashboard, vpn, tunnels, rdp)"),
+        entry("1-5 / tab", "switch tab (dashboard, vpn, tunnels, ssh, rdp)"),
         entry("j k ↑ ↓", "move selection"),
         entry("t", "cycle color theme"),
         entry("q", "quit (stops tunnels; RDP windows stay open)"),
@@ -1351,12 +1984,23 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         entry("u / d", "netbird up / netbird down"),
         entry("r", "refresh status"),
         Line::from(""),
+        section("ssh"),
+        entry("enter", "open a session in this terminal"),
+        entry("a / e / d", "add / edit / delete host"),
+        entry("p", "clear a stored cleartext password"),
+        Line::from(""),
         section("rdp"),
         entry("enter", "connect (asks password) / disconnect"),
         entry("a / e / d", "add / edit / delete connection"),
         entry("l", "view session log"),
         entry("c", "clear finished session"),
         entry("x", "close all sessions"),
+        Line::from(""),
+        section("dependencies"),
+        entry("", "tunnels, ssh and rdp can require a VPN profile"),
+        entry("", "and a tunnel — tunnels stack on other tunnels"),
+        entry("", "activating one brings the whole chain up in order"),
+        entry("y", "in a conflict prompt: evict what is in the way"),
         Line::from(""),
         Line::from(Span::styled(
             " press any key to close",

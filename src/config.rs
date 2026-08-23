@@ -1,4 +1,4 @@
-use crate::types::{RdpConnection, Tunnel};
+use crate::types::{RdpConnection, SshHost, Tunnel};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ pub struct Paths {
     pub tunnels_file: PathBuf,
     pub config_file: PathBuf,
     pub rdp_file: PathBuf,
+    pub ssh_file: PathBuf,
 }
 
 impl Paths {
@@ -21,11 +22,13 @@ impl Paths {
         let tunnels_file = config_dir.join("tunnels.toml");
         let config_file = config_dir.join("config.toml");
         let rdp_file = config_dir.join("rdp.toml");
+        let ssh_file = config_dir.join("ssh.toml");
         Ok(Self {
             config_dir,
             tunnels_file,
             config_file,
             rdp_file,
+            ssh_file,
         })
     }
 
@@ -84,6 +87,47 @@ pub fn save_rdp(path: &Path, connections: &[RdpConnection]) -> Result<()> {
     };
     let raw = toml::to_string_pretty(&file)?;
     fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SshFile {
+    #[serde(default)]
+    hosts: Vec<SshHost>,
+}
+
+pub fn load_ssh(path: &Path) -> Result<Vec<SshHost>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let file: SshFile =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(file.hosts)
+}
+
+/// SSH hosts may carry a cleartext password, so the file is written 0600.
+pub fn save_ssh(path: &Path, hosts: &[SshHost]) -> Result<()> {
+    let file = SshFile {
+        hosts: hosts.to_vec(),
+    };
+    let raw = toml::to_string_pretty(&file)?;
+    fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    restrict_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("locking down {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 

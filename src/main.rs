@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod netbird;
 mod rdp;
+mod ssh;
 mod theme;
 mod tunnel;
 mod types;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
         println!("tunnels    : {}", paths.tunnels_file.display());
         println!("config     : {}", paths.config_file.display());
         println!("rdp        : {}", paths.rdp_file.display());
+        println!("ssh        : {}", paths.ssh_file.display());
         return Ok(());
     }
 
@@ -49,10 +51,11 @@ fn main() -> Result<()> {
     paths.ensure_dirs().context("creating config dir")?;
     let tunnels = config::load_tunnels(&paths.tunnels_file)?;
     let rdp_conns = config::load_rdp(&paths.rdp_file)?;
+    let ssh_hosts = config::load_ssh(&paths.ssh_file)?;
     let app_config = config::load_app_config(&paths.config_file)?;
 
     let mut terminal = init_terminal()?;
-    let res = app::App::new(tunnels, rdp_conns, paths, app_config).run(&mut terminal);
+    let res = app::App::new(tunnels, rdp_conns, ssh_hosts, paths, app_config).run(&mut terminal);
     restore_terminal(&mut terminal)?;
     res
 }
@@ -70,5 +73,23 @@ fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Hand the terminal back to a child process (interactive ssh).
+pub fn suspend_terminal(terminal: &mut Tui) -> Result<()> {
+    restore_terminal(terminal)
+}
+
+/// Take the terminal back after the child exited.
+pub fn resume_terminal(terminal: &mut Tui) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, Clear(ClearType::All))?;
+    terminal.hide_cursor()?;
+    // The alternate screen we came back to is blank, but ratatui still diffs
+    // against the frame drawn before the session; drop it so the next draw
+    // repaints every cell. (Terminal::clear would do this too, but it asks the
+    // terminal for the cursor position first and that can hang.)
+    terminal.swap_buffers();
     Ok(())
 }
