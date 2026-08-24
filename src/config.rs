@@ -1,4 +1,4 @@
-use crate::types::{RdpConnection, SshHost, Tunnel};
+use crate::types::{RdpConnection, SshHost, Tunnel, VpnConfig};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,14 @@ pub struct Paths {
     pub config_file: PathBuf,
     pub rdp_file: PathBuf,
     pub ssh_file: PathBuf,
+    pub vpn_file: PathBuf,
+    /// WireGuard configs controlcenter generates and hands to `wg-quick`.
+    pub wireguard_dir: PathBuf,
+    /// One directory per imported OpenVPN profile: the `.ovpn` plus the
+    /// certificates it ships with.
+    pub openvpn_dir: PathBuf,
+    /// Short-lived files, e.g. the pid openvpn writes so it can be signalled.
+    pub run_dir: PathBuf,
 }
 
 impl Paths {
@@ -23,17 +31,35 @@ impl Paths {
         let config_file = config_dir.join("config.toml");
         let rdp_file = config_dir.join("rdp.toml");
         let ssh_file = config_dir.join("ssh.toml");
+        let vpn_file = config_dir.join("vpn.toml");
+        let wireguard_dir = config_dir.join("wireguard");
+        let openvpn_dir = config_dir.join("openvpn");
+        let run_dir = dirs
+            .runtime_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("controlcenter");
         Ok(Self {
             config_dir,
             tunnels_file,
             config_file,
             rdp_file,
             ssh_file,
+            vpn_file,
+            wireguard_dir,
+            openvpn_dir,
+            run_dir,
         })
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.config_dir)?;
+        // These hold private keys and client certificates, so they are 0700
+        // even before a single file lands in them.
+        for dir in [&self.wireguard_dir, &self.openvpn_dir] {
+            fs::create_dir_all(dir)?;
+            restrict_dir(dir)?;
+        }
         Ok(())
     }
 }
@@ -131,10 +157,70 @@ fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn restrict_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("locking down {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+pub fn load_vpn(path: &Path) -> Result<VpnConfig> {
+    if !path.exists() {
+        return Ok(VpnConfig::default());
+    }
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let cfg: VpnConfig =
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(cfg)
+}
+
+/// VPN profiles may carry a WireGuard private key or an OpenVPN password, so the
+/// file is written 0600 just like ssh.toml.
+pub fn save_vpn(path: &Path, cfg: &VpnConfig) -> Result<()> {
+    let raw = toml::to_string_pretty(cfg)?;
+    fs::write(path, raw).with_context(|| format!("writing {}", path.display()))?;
+    restrict_permissions(path)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub ssh: SshConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshConfig {
+    /// Where an interactive session opens:
+    ///   auto     the first terminal emulator found on PATH ($TERMINAL first),
+    ///            falling back to inline when there is none
+    ///   inline   hand the current terminal to ssh until the session ends
+    ///   <cmd>    a terminal command line of your own, e.g.
+    ///            "kitty --title ssh" or "alacritty -e sh -c {cmd}";
+    ///            without a {cmd} placeholder the command is appended
+    #[serde(default = "default_ssh_terminal")]
+    pub terminal: String,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            terminal: default_ssh_terminal(),
+        }
+    }
+}
+
+fn default_ssh_terminal() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

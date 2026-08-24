@@ -1,12 +1,13 @@
 mod app;
+mod browser;
 mod config;
-mod netbird;
 mod rdp;
 mod ssh;
 mod theme;
 mod tunnel;
 mod types;
 mod ui;
+mod vpn;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -40,6 +41,10 @@ fn main() -> Result<()> {
         println!("config     : {}", paths.config_file.display());
         println!("rdp        : {}", paths.rdp_file.display());
         println!("ssh        : {}", paths.ssh_file.display());
+        println!("vpn        : {}", paths.vpn_file.display());
+        println!("wireguard  : {}", paths.wireguard_dir.display());
+        println!("openvpn    : {}", paths.openvpn_dir.display());
+        println!("runtime    : {}", paths.run_dir.display());
         return Ok(());
     }
 
@@ -52,10 +57,12 @@ fn main() -> Result<()> {
     let tunnels = config::load_tunnels(&paths.tunnels_file)?;
     let rdp_conns = config::load_rdp(&paths.rdp_file)?;
     let ssh_hosts = config::load_ssh(&paths.ssh_file)?;
+    let vpn_cfg = config::load_vpn(&paths.vpn_file)?;
     let app_config = config::load_app_config(&paths.config_file)?;
 
     let mut terminal = init_terminal()?;
-    let res = app::App::new(tunnels, rdp_conns, ssh_hosts, paths, app_config).run(&mut terminal);
+    let res = app::App::new(tunnels, rdp_conns, ssh_hosts, vpn_cfg, paths, app_config)
+        .run(&mut terminal);
     restore_terminal(&mut terminal)?;
     res
 }

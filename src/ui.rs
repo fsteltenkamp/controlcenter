@@ -1,12 +1,14 @@
 use crate::app::{
-    App, FormField, FormMode, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab,
-    FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
+    App, FormField, FormMode, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab, VpnMode,
+    VpnPane, FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
 };
+use crate::browser::FileBrowser;
 use crate::rdp::RdpStatus;
 use crate::ssh;
 use crate::theme::{self, Theme};
 use crate::tunnel::Status;
 use crate::types::{vpn_requirement_label, ForwardType, Tunnel};
+use crate::vpn::ProviderId;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -85,15 +87,18 @@ pub fn render(f: &mut Frame, app: &App) {
         FormMode::None => {}
         FormMode::Add | FormMode::Edit(_) => render_form_overlay(f, app, area),
         FormMode::DeleteConfirm(i) => render_delete_confirm(f, app, area, *i),
+        FormMode::Logs => render_tunnel_logs_overlay(f, app, area),
     }
 
     match &app.rdp_mode {
         RdpMode::None => {}
         RdpMode::Add | RdpMode::Edit(_) => render_rdp_form_overlay(f, app, area),
         RdpMode::DeleteConfirm(i) => render_rdp_delete_confirm(f, app, area, *i),
-        RdpMode::Password { idx, input } => {
-            render_rdp_password_overlay(f, app, area, *idx, input)
-        }
+        RdpMode::Password {
+            pending,
+            collected,
+            input,
+        } => render_rdp_password_overlay(f, app, area, pending, collected.len(), input),
         RdpMode::Logs => render_rdp_logs_overlay(f, app, area),
     }
 
@@ -104,13 +109,36 @@ pub fn render(f: &mut Frame, app: &App) {
         SshMode::PasswordWarning => render_password_warning(f, app, area),
     }
 
+    match &app.vpn_mode {
+        VpnMode::None => {}
+        VpnMode::Form { edit, .. } => render_vpn_form_overlay(f, app, area, edit.is_some()),
+        VpnMode::DeleteConfirm { provider, idx } => {
+            render_vpn_delete_confirm(f, app, area, *provider, *idx)
+        }
+        VpnMode::SecretWarning { .. } => render_vpn_secret_warning(f, app, area),
+        VpnMode::Logs => render_vpn_logs_overlay(f, app, area),
+    }
+
+    // The file picker covers the form that opened it.
+    if let Some(browser) = &app.browser {
+        render_browser_overlay(f, browser, area);
+    }
+
     // A conflict prompt holds a tunnel start hostage; it wins over everything.
     if app.conflict.is_some() {
         render_conflict_prompt(f, app, area);
     }
 
+    // The panic button asks over the top of anything else on screen.
+    if app.panic.is_some() {
+        render_panic_prompt(f, app, area);
+    }
+
     if app.show_help {
         render_help_overlay(f, area);
+    }
+    if app.show_keys {
+        render_keys_overlay(f, area);
     }
 }
 
@@ -136,17 +164,20 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .values()
         .filter(|a| a.status == RdpStatus::Running)
         .count();
-    let nb = if !app.nb.installed {
+    // Name what is actually up rather than a single up/down, now that more than
+    // one VPN can be connected at a time.
+    let connected = app.vpn.connected();
+    let vpn = if !app.vpn.any_installed() {
         "-".to_string()
-    } else if app.nb.busy.is_some() {
-        "…".to_string()
-    } else if app.nb.status.connected {
-        "up".to_string()
+    } else if connected.is_empty() {
+        if app.vpn.any_busy() { "…".to_string() } else { "down".to_string() }
     } else {
-        "down".to_string()
+        let mut names: Vec<&str> = connected.iter().map(|p| p.id.slug()).collect();
+        names.sort_unstable();
+        names.join("+")
     };
     let title_right =
-        format!(" ssh {}/{} up · vpn {} · rdp {} ", up, app.active.len(), nb, rdp_running);
+        format!(" ssh {}/{} up · vpn {} · rdp {} ", up, app.active.len(), vpn, rdp_running);
 
     let tabs = Tabs::new(titles)
         .select(app.tab.index())
@@ -282,55 +313,60 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(summary_block("ssh tunnels [3]", ssh_lines), cols[1]);
 
-    // --- NetBird summary ---
+    // --- VPN summary: one line per client ---
     let mut nb_lines: Vec<Line> = Vec::new();
-    if !app.nb.installed {
+    if !app.vpn.any_installed() {
         nb_lines.push(Line::from(""));
         nb_lines.push(Line::from(Span::styled(
-            " netbird not found on PATH",
+            " no VPN client found on PATH",
             Style::default().fg(DIM()),
         )));
     } else {
-        let st = &app.nb.status;
-        let state = if st.connected {
-            Span::styled("connected", Style::default().fg(OK()).bold())
-        } else {
-            Span::styled("disconnected", Style::default().fg(DANGER()).bold())
-        };
-        nb_lines.push(kv("state", state));
-        let profile = st
-            .field("Profile")
-            .map(str::to_string)
-            .or_else(|| {
-                app.nb
-                    .profiles
-                    .iter()
-                    .find(|p| p.active)
-                    .map(|p| p.name.clone())
-            })
-            .unwrap_or_else(|| "-".into());
-        nb_lines.push(kv("profile", Span::styled(profile, Style::default().fg(ACCENT()))));
-        for key in ["NetBird IP", "FQDN", "Peers count"] {
-            if let Some(v) = st.field(key) {
-                let label = match key {
-                    "NetBird IP" => "ip",
-                    "FQDN" => "fqdn",
-                    _ => "peers",
-                };
-                nb_lines.push(kv(label, Span::styled(v.to_string(), Style::default().fg(TEXT()))));
+        for state in &app.vpn.providers {
+            let (mark, style) = if !state.installed {
+                ("·", Style::default().fg(DIM()))
+            } else if state.busy.is_some() {
+                ("◌", Style::default().fg(WARN()))
+            } else if state.status.connected {
+                ("●", Style::default().fg(OK()))
+            } else {
+                ("○", Style::default().fg(DIM()))
+            };
+            let detail = if !state.installed {
+                "not installed".to_string()
+            } else if let Some(busy) = &state.busy {
+                format!("{busy}…")
+            } else if state.status.connected {
+                state.active_profile().unwrap_or("connected").to_string()
+            } else {
+                "down".to_string()
+            };
+            nb_lines.push(Line::from(vec![
+                Span::styled(format!(" {mark} "), style),
+                Span::styled(format!("{:<11}", state.id.slug()), Style::default().fg(TEXT())),
+                Span::styled(
+                    truncate(&detail, 18),
+                    Style::default().fg(if state.status.connected { ACCENT() } else { DIM() }),
+                ),
+            ]));
+        }
+        // The one detail worth the space: where the connected client puts you.
+        if let Some(primary) = app.vpn.connected().first() {
+            for key in ["NetBird IP", "Tailscale IP", "Address"] {
+                if let Some(v) = primary.status.field(key) {
+                    nb_lines.push(kv("ip", Span::styled(v.to_string(), Style::default().fg(TEXT()))));
+                    break;
+                }
             }
         }
-        if let Some(busy) = &app.nb.busy {
-            nb_lines.push(kv("busy", Span::styled(format!("{busy}…"), Style::default().fg(WARN()))));
-        }
-        if let Some(err) = &app.nb.error {
+        if let Some(err) = app.vpn.providers.iter().find_map(|p| p.error.as_ref()) {
             nb_lines.push(Line::from(Span::styled(
                 format!(" {}", truncate(err, 40)),
                 Style::default().fg(DANGER()),
             )));
         }
     }
-    f.render_widget(summary_block("vpn · netbird [2]", nb_lines), cols[0]);
+    f.render_widget(summary_block("vpn [2]", nb_lines), cols[0]);
 
     // --- RDP summary ---
     let rdp_running = app
@@ -382,6 +418,20 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
         "configured",
         Span::styled(app.ssh_hosts.len().to_string(), Style::default().fg(TEXT())),
     )];
+    let open_windows: usize = app
+        .ssh_hosts
+        .iter()
+        .map(|h| app.ssh_windows_open(&h.name))
+        .sum();
+    if open_windows > 0 {
+        ssh_host_lines.push(kv(
+            "sessions",
+            Span::styled(
+                format!("{open_windows} window(s) open"),
+                Style::default().fg(OK()),
+            ),
+        ));
+    }
     if with_password > 0 {
         ssh_host_lines.push(kv(
             "cleartext",
@@ -578,6 +628,35 @@ fn needs_span(app: &App, t: &Tunnel) -> Span<'static> {
     Span::styled(format!("needs {}", parts.join("+")), Style::default().fg(color))
 }
 
+/// The head of a group's details panel: its name, how many members it has and
+/// how many of them are up. `state` names what "up" means for that tab.
+fn group_details(name: &str, members: usize, up: usize, state: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("group     ", Style::default().fg(DIM())),
+            Span::styled(name.to_string(), Style::default().fg(ACCENT()).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled("members   ", Style::default().fg(DIM())),
+            Span::styled(members.to_string(), Style::default().fg(TEXT())),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{state:<10}"), Style::default().fg(DIM())),
+            Span::styled(up.to_string(), Style::default().fg(TEXT())),
+        ]),
+        Line::from(""),
+    ]
+}
+
+/// A group row: "▸ name  (2/3 active)".
+fn group_header(name: &str, summary: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(vec![
+        Span::styled("▸ ", Style::default().fg(ACCENT())),
+        Span::styled(name.to_string(), Style::default().fg(ACCENT()).bold()),
+        Span::styled(format!("  {summary}"), Style::default().fg(DIM())),
+    ]))
+}
+
 fn render_tunnels(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -594,16 +673,9 @@ fn render_tunnels(f: &mut Frame, app: &App, area: Rect) {
                     .iter()
                     .filter(|i| app.active.contains_key(&app.tunnels[**i].name))
                     .count();
-                ListItem::new(Line::from(vec![
-                    Span::styled("▸ ", Style::default().fg(ACCENT())),
-                    Span::styled(g.clone(), Style::default().fg(ACCENT()).bold()),
-                    Span::styled(
-                        format!("  ({up}/{} active)", members.len()),
-                        Style::default().fg(DIM()),
-                    ),
-                ]))
+                group_header(g, &format!("({up}/{} active)", members.len()))
             }
-            RowItem::Tunnel(i) => {
+            RowItem::Item(i) => {
                 let t = &app.tunnels[*i];
                 let indent = if t.group.is_empty() { " " } else { "   " };
                 ListItem::new(Line::from(vec![
@@ -679,19 +751,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .filter(|i| app.active.contains_key(&app.tunnels[**i].name))
                 .count();
-            lines.push(Line::from(vec![
-                Span::styled("group     ", Style::default().fg(DIM())),
-                Span::styled(g.clone(), Style::default().fg(ACCENT()).bold()),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("members   ", Style::default().fg(DIM())),
-                Span::styled(format!("{}", members.len()), Style::default().fg(TEXT())),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("active    ", Style::default().fg(DIM())),
-                Span::styled(format!("{up}"), Style::default().fg(TEXT())),
-            ]));
-            lines.push(Line::from(""));
+            lines.extend(group_details(g, members.len(), up, "active"));
             lines.push(Line::from(Span::styled(
                 "Enter starts every inactive member,",
                 Style::default().fg(DIM()),
@@ -701,7 +761,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(DIM()),
             )));
         }
-        Some(RowItem::Tunnel(i)) => {
+        Some(RowItem::Item(i)) => {
             let t = &app.tunnels[*i];
             let field = |k: &str, v: String| {
                 Line::from(vec![
@@ -816,41 +876,84 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// VPN tab (currently backed by netbird; more providers may follow)
+// VPN tab
 // ---------------------------------------------------------------------------
 
+/// Clients on the left, that client's profiles in the middle, its status on the
+/// right. A client that is not installed stays in the list, greyed out, so the
+/// status pane can say where to get it.
 fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
-    if !app.nb.installed {
-        let msg = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  netbird was not found on PATH",
-                Style::default().fg(WARN()),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  install it from https://netbird.io to manage profiles here",
-                Style::default().fg(DIM()),
-            )),
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            // Wide enough for "· wireguard  n/i" without truncating.
+            Constraint::Length(22),
+            Constraint::Percentage(38),
+            Constraint::Percentage(62),
         ])
+        .split(area);
+
+    render_vpn_clients(f, app, chunks[0]);
+    render_vpn_profiles(f, app, chunks[1]);
+    render_vpn_status(f, app, chunks[2]);
+}
+
+/// The border of the pane that has the keyboard is drawn in the accent colour.
+fn pane_border(focused: bool) -> Style {
+    Style::default().fg(if focused { ACCENT() } else { BORDER() })
+}
+
+fn render_vpn_clients(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .vpn
+        .providers
+        .iter()
+        .map(|state| {
+            let (dot, dot_style) = if !state.installed {
+                ("·", Style::default().fg(DIM()))
+            } else if state.busy.is_some() {
+                ("◌", Style::default().fg(WARN()))
+            } else if state.status.connected {
+                ("●", Style::default().fg(OK()))
+            } else {
+                ("○", Style::default().fg(DIM()))
+            };
+            let name_style = match (state.installed, state.status.connected) {
+                (false, _) => Style::default().fg(DIM()),
+                (true, true) => Style::default().fg(TEXT()).bold(),
+                (true, false) => Style::default().fg(TEXT()),
+            };
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(format!("{dot} "), dot_style),
+                Span::styled(state.id.slug(), name_style),
+            ];
+            if !state.installed {
+                spans.push(Span::styled("  n/i", Style::default().fg(DIM())));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(SELECTION_BG()))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER()))
-                .title(Span::styled(" vpn ", Style::default().fg(TEXT()))),
+                .border_style(pane_border(app.vpn.focus == VpnPane::Clients))
+                .title(Span::styled(" clients ", Style::default().fg(TEXT()))),
         );
-        f.render_widget(msg, area);
-        return;
-    }
+    let mut state = ListState::default();
+    state.select(Some(app.vpn.client_idx));
+    f.render_stateful_widget(list, area, &mut state);
+}
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+fn render_vpn_profiles(f: &mut Frame, app: &App, area: Rect) {
+    let provider = app.vpn.current();
+    let title = format!(" {} profiles ", provider.id.slug());
+    let focused = app.vpn.focus == VpnPane::Profiles;
 
-    // Profiles list
-    let items: Vec<ListItem> = app
-        .nb
+    let items: Vec<ListItem> = provider
         .profiles
         .iter()
         .map(|p| {
@@ -865,13 +968,18 @@ fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(TEXT())
             };
             let mut spans = vec![Span::raw(" "), dot, Span::styled(p.name.clone(), name_style)];
-            if p.active {
-                spans.push(Span::styled("  (active)", Style::default().fg(DIM())));
-            }
-            let needed_by = app.vpn_dependents_of(&p.name).len();
+            let needed_by = app
+                .vpn_dependents_of(&format!("{}:{}", provider.id.slug(), p.name))
+                .len();
             if needed_by > 0 {
                 spans.push(Span::styled(
                     format!("  {needed_by} dep(s)"),
+                    Style::default().fg(DIM()),
+                ));
+            }
+            if !p.detail.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", truncate(&p.detail, 24)),
                     Style::default().fg(DIM()),
                 ));
             }
@@ -885,64 +993,140 @@ fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER()))
-                .title(Span::styled(" netbird profiles ", Style::default().fg(TEXT()))),
+                .border_style(pane_border(focused))
+                .title(Span::styled(title, Style::default().fg(TEXT()))),
         );
     let mut state = ListState::default();
     if !empty {
-        state.select(Some(app.nb.selected));
+        state.select(Some(provider.selected));
     }
-    f.render_stateful_widget(list, chunks[0], &mut state);
+    f.render_stateful_widget(list, area, &mut state);
 
     if empty {
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "  no profiles found",
-            Style::default().fg(DIM()),
-        )));
+        let hint = if !provider.installed {
+            format!("  {} is not installed", provider.id.slug())
+        } else if provider.id.manages_profiles() {
+            "  no profiles yet — press a to add one".to_string()
+        } else {
+            "  no profiles found".to_string()
+        };
         let inner = Rect {
-            x: chunks[0].x + 1,
-            y: chunks[0].y + 1,
-            width: chunks[0].width.saturating_sub(2),
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
             height: 1,
         };
-        f.render_widget(hint, inner);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM())))),
+            inner,
+        );
+    }
+}
+
+fn render_vpn_status(f: &mut Frame, app: &App, area: Rect) {
+    let provider = app.vpn.current();
+    let mut lines: Vec<Line> = Vec::new();
+
+    if !provider.installed {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {} was not found on PATH", provider.id.slug()),
+            Style::default().fg(WARN()),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", provider.id.install_hint()),
+            Style::default().fg(DIM()),
+        )));
+        let waiting = app.vpn_dependents_of_provider(provider.id);
+        if !waiting.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {} connection(s) ask for it:", waiting.len()),
+                Style::default().fg(DIM()),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("   {}", waiting.join(", ")),
+                Style::default().fg(TEXT()),
+            )));
+        }
+        f.render_widget(vpn_status_block(lines), area);
+        return;
     }
 
-    // Status panel
-    let mut lines: Vec<Line> = Vec::new();
-    let st = &app.nb.status;
+    let st = &provider.status;
     let state_span = if st.connected {
         Span::styled("connected", Style::default().fg(OK()).bold())
     } else {
         Span::styled("disconnected", Style::default().fg(DANGER()).bold())
     };
     lines.push(kv("state", state_span));
-    if let Some(busy) = &app.nb.busy {
+    if let Some(busy) = &provider.busy {
         lines.push(kv(
             "action",
             Span::styled(format!("{busy}…"), Style::default().fg(WARN()).bold()),
         ));
     }
+    if provider.id.needs_root() && !crate::vpn::privileged::available() {
+        lines.push(kv(
+            "root",
+            Span::styled(
+                "no pkexec or sudo found",
+                Style::default().fg(DANGER()),
+            ),
+        ));
+    }
     lines.push(Line::from(""));
     for (k, v) in &st.fields {
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<20}", k.to_lowercase()), Style::default().fg(DIM())),
+            Span::styled(
+                format!(" {:<20}", k.to_lowercase()),
+                Style::default().fg(DIM()),
+            ),
             Span::styled(v.clone(), Style::default().fg(TEXT())),
         ]));
     }
-    if let Some(err) = st.error.as_ref().or(app.nb.error.as_ref()) {
+    if let Some(err) = st.error.as_ref().or(provider.error.as_ref()) {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(" {err}"),
-            Style::default().fg(DANGER()),
-        )));
+        for line in err.lines() {
+            lines.push(Line::from(Span::styled(
+                format!(" {line}"),
+                Style::default().fg(DANGER()),
+            )));
+        }
     }
-    if let Some(p) = app.nb.profiles.get(app.nb.selected) {
-        let dependents = app.vpn_dependents_of(&p.name);
+
+    // OpenVPN profiles are a directory, not a single setting: show what is in it.
+    if provider.id == ProviderId::Openvpn {
+        if let Some((name, files)) = app.openvpn_import_listing() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(" '{name}' imported into controlcenter:"),
+                Style::default().fg(DIM()),
+            )));
+            if files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   nothing yet — save the profile to import it",
+                    Style::default().fg(WARN()),
+                )));
+            } else {
+                for f in files {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {f}"),
+                        Style::default().fg(TEXT()),
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(p) = provider.selected_profile() {
+        let want = format!("{}:{}", provider.id.slug(), p.name);
+        let dependents = app.vpn_dependents_of(&want);
         let any = app.vpn_dependents_of(crate::types::VPN_ANY);
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!(" requires '{}':", p.name),
+            format!(" requires '{want}':"),
             Style::default().fg(DIM()),
         )));
         if dependents.is_empty() {
@@ -958,28 +1142,220 @@ fn render_vpn(f: &mut Frame, app: &App, area: Rect) {
         }
         if !any.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!("   plus {} needing any profile", any.len()),
+                format!("   plus {} needing any VPN", any.len()),
                 Style::default().fg(DIM()),
             )));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Enter switches to the selected profile and connects.",
-        Style::default().fg(DIM()),
-    )));
-    lines.push(Line::from(Span::styled(
-        " Anything that requires the profile being left is disconnected.",
-        Style::default().fg(DIM()),
-    )));
 
-    let status = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    lines.push(Line::from(""));
+    for hint in vpn_hints(provider.id) {
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(DIM()))));
+    }
+
+    f.render_widget(vpn_status_block(lines), area);
+}
+
+fn vpn_status_block(lines: Vec<Line>) -> Paragraph {
+    Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER()))
             .title(Span::styled(" status ", Style::default().fg(TEXT()))),
+    )
+}
+
+/// What is worth knowing about this particular client, in the space there is.
+fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
+    match id {
+        ProviderId::Netbird => vec![
+            " Enter switches to the selected profile and connects.",
+            " Anything that requires the profile being left is disconnected.",
+            " Profiles are netbird's own; add them with the netbird CLI.",
+        ],
+        ProviderId::Wireguard => vec![
+            " Enter runs wg-quick up on the selected profile; Enter again takes it down.",
+            " Several interfaces can be up at once, so profiles never conflict.",
+            " Connecting asks for root through polkit.",
+        ],
+        ProviderId::Openvpn => vec![
+            " Enter starts the session; l shows its log.",
+            " Saving a profile copies the .ovpn and every certificate it names",
+            " into controlcenter, so it survives the download folder being cleaned up.",
+            " Disconnecting asks for root a second time: the process runs as root",
+            " and has to be signalled by the pid openvpn wrote.",
+        ],
+        ProviderId::Tailscale => vec![
+            " Enter runs tailscale up --reset with the profile's flags,",
+            " so a profile always means exactly the state it describes.",
+            " Connecting asks for root through polkit.",
+        ],
+    }
+}
+
+/// Full-screen view of the selected OpenVPN session's log.
+fn render_vpn_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let rect = centered_rect(area.width.saturating_sub(8), area.height.saturating_sub(4), area);
+    f.render_widget(Clear, rect);
+    let (title, lines) = match app.selected_ovpn() {
+        Some((name, session)) => {
+            let rows = rect.height.saturating_sub(2) as usize;
+            let lines: Vec<Line> = session
+                .recent_log(rows)
+                .into_iter()
+                .map(|l| Line::from(Span::styled(format!(" {l}"), Style::default().fg(TEXT()))))
+                .collect();
+            (format!(" openvpn '{name}' log "), lines)
+        }
+        None => (
+            " openvpn log ".to_string(),
+            vec![Line::from(Span::styled(
+                " no session running for the selected profile",
+                Style::default().fg(DIM()),
+            ))],
+        ),
+    };
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
     );
-    f.render_widget(status, chunks[1]);
+    f.render_widget(para, rect);
+}
+
+/// The add/edit form. All three editable providers share it, driven by their
+/// field table, because they differ only in which lines they show.
+fn render_vpn_form_overlay(f: &mut Frame, app: &App, area: Rect, edit: bool) {
+    let form = &app.vpn_form;
+    let fields = form.fields();
+    // fields + a blank line + the hint, and one more for wireguard's key hint.
+    let height = fields.len() as u16 + if form.provider == ProviderId::Wireguard { 5 } else { 4 };
+    let rect = centered_rect(84, height.min(area.height), area);
+    f.render_widget(Clear, rect);
+
+    let title = format!(
+        " {} {} profile ",
+        if edit { "edit" } else { "add" },
+        form.provider.slug()
+    );
+    let value_width = value_width(rect, 33);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, spec) in fields.iter().enumerate() {
+        let is_active = i == form.field_idx;
+        let label_style = if is_active {
+            Style::default().fg(ACCENT()).bold()
+        } else {
+            Style::default().fg(DIM())
+        };
+        let raw = form.display(spec);
+        let value = if spec.flag {
+            format!("◂ {raw} ▸")
+        } else {
+            scrolled(&raw, value_width)
+        };
+        let value_style = if spec.secret && !raw.is_empty() {
+            Style::default().fg(WARN())
+        } else {
+            Style::default().fg(TEXT())
+        };
+        let cursor = if is_active && !spec.flag { "▏" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<32}", spec.label), label_style),
+            Span::styled(value, value_style),
+            Span::styled(cursor, Style::default().fg(ACCENT())),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(DANGER()),
+        )));
+    } else if form.field().is_some_and(|f| f.id == "config_path") {
+        lines.push(Line::from(Span::styled(
+            " Ctrl+O file picker · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " tab/↓ next · ↑ prev · ◂▸ toggle · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+        if form.provider == ProviderId::Wireguard {
+            lines.push(Line::from(Span::styled(
+                " g on the private key field generates a fresh keypair",
+                Style::default().fg(DIM()),
+            )));
+        }
+    }
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+fn render_vpn_delete_confirm(f: &mut Frame, app: &App, area: Rect, provider: ProviderId, idx: usize) {
+    let name = match provider {
+        ProviderId::Wireguard => app.vpn_cfg.wireguard.get(idx).map(|p| p.name.clone()),
+        ProviderId::Openvpn => app.vpn_cfg.openvpn.get(idx).map(|p| p.name.clone()),
+        ProviderId::Tailscale => app.vpn_cfg.tailscale.get(idx).map(|p| p.name.clone()),
+        ProviderId::Netbird => None,
+    }
+    .unwrap_or_else(|| "?".into());
+    render_confirm_box(
+        f,
+        area,
+        &format!(" delete {} profile '{name}'?", provider.slug()),
+    );
+}
+
+/// The same acknowledgement the SSH tab asks for before storing a password:
+/// vpn.toml is 0600, but it is still cleartext on disk.
+fn render_vpn_secret_warning(f: &mut Frame, app: &App, area: Rect) {
+    let path = app.paths.vpn_file.display().to_string();
+    let what = match app.vpn_form.provider {
+        ProviderId::Wireguard => "The private key is saved in cleartext.",
+        _ => "The password is saved in cleartext.",
+    };
+    let rect = centered_rect(68, 10, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" {what}"),
+            Style::default().fg(WARN()).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" It goes into {path}, which is written mode 0600."),
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(Span::styled(
+            " Anything that can read your files can read it.",
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " y / Enter to save anyway · any other key to go back",
+            Style::default().fg(DIM()),
+        )),
+    ])
+    .wrap(Wrap { trim: false })
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(
+                " store a secret? ",
+                Style::default().fg(WARN()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,29 +1378,41 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let items: Vec<ListItem> = app
-        .rdp_conns
+        .rdp_rows
         .iter()
-        .map(|c| {
-            ListItem::new(Line::from(vec![
-                Span::raw(" "),
-                rdp_status_dot(app, &c.name),
-                Span::styled(
-                    format!(" {:<16}", truncate(&c.name, 16)),
-                    Style::default().fg(TEXT()),
-                ),
-                Span::styled(
-                    format!("{:<20}", truncate(&c.target_summary(), 20)),
-                    Style::default().fg(DIM()),
-                ),
-                Span::styled(
-                    format!("{:<15}", format!("as {}", truncate(&c.login_summary(), 12))),
-                    Style::default().fg(DIM()),
-                ),
-                Span::styled("via ", Style::default().fg(DIM())),
-            ]
-            .into_iter()
-            .chain(requires_spans(app, &c.requires_vpn, &c.depends_on))
-            .collect::<Vec<_>>()))
+        .map(|row| match row {
+            RowItem::Group(g) => {
+                let members = app.rdp_group_members(g);
+                let up = members
+                    .iter()
+                    .filter(|i| app.rdp_running(&app.rdp_conns[**i].name))
+                    .count();
+                group_header(g, &format!("({up}/{} connected)", members.len()))
+            }
+            RowItem::Item(i) => {
+                let c = &app.rdp_conns[*i];
+                let indent = if c.group.is_empty() { " " } else { "   " };
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    rdp_status_dot(app, &c.name),
+                    Span::styled(
+                        format!(" {:<16}", truncate(&c.name, 16)),
+                        Style::default().fg(TEXT()),
+                    ),
+                    Span::styled(
+                        format!("{:<20}", truncate(&c.target_summary(), 20)),
+                        Style::default().fg(DIM()),
+                    ),
+                    Span::styled(
+                        format!("{:<15}", format!("as {}", truncate(&c.login_summary(), 12))),
+                        Style::default().fg(DIM()),
+                    ),
+                    Span::styled("via ", Style::default().fg(DIM())),
+                ]
+                .into_iter()
+                .chain(requires_spans(app, &c.requires_vpn, &c.depends_on))
+                .collect::<Vec<_>>()))
+            }
         })
         .collect();
 
@@ -1068,8 +1456,29 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
 
     // Details panel
     let mut lines: Vec<Line> = Vec::new();
-    match app.rdp_conns.get(app.rdp_selected) {
-        Some(c) => {
+    match app.rdp_rows.get(app.rdp_selected) {
+        Some(RowItem::Group(g)) => {
+            let members = app.rdp_group_members(g);
+            let up = members
+                .iter()
+                .filter(|i| app.rdp_running(&app.rdp_conns[**i].name))
+                .count();
+            lines.extend(group_details(g, members.len(), up, "connected"));
+            lines.push(Line::from(Span::styled(
+                "Enter connects every idle member —",
+                Style::default().fg(DIM()),
+            )));
+            lines.push(Line::from(Span::styled(
+                "each is asked for its password in turn —",
+                Style::default().fg(DIM()),
+            )));
+            lines.push(Line::from(Span::styled(
+                "or disconnects all when everything is up.",
+                Style::default().fg(DIM()),
+            )));
+        }
+        Some(RowItem::Item(idx)) => {
+            let c = &app.rdp_conns[*idx];
             let field = |k: &str, v: String| {
                 Line::from(vec![
                     Span::styled(format!("{k:<11}"), Style::default().fg(DIM())),
@@ -1244,30 +1653,48 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let items: Vec<ListItem> = app
-        .ssh_hosts
+        .ssh_rows
         .iter()
-        .map(|h| {
-            let lock = if h.password.is_empty() {
-                Span::raw(" ")
-            } else {
-                Span::styled("!", Style::default().fg(WARN()).bold())
-            };
-            ListItem::new(Line::from(vec![
-                Span::raw(" "),
-                lock,
-                Span::styled(
-                    format!(" {:<16}", truncate(&h.name, 16)),
-                    Style::default().fg(TEXT()),
-                ),
-                Span::styled(
-                    format!("{:<24}", truncate(&h.target_summary(), 24)),
-                    Style::default().fg(DIM()),
-                ),
-                Span::styled("via ", Style::default().fg(DIM())),
-            ]
-            .into_iter()
-            .chain(requires_spans(app, &h.requires_vpn, &h.depends_on))
-            .collect::<Vec<_>>()))
+        .map(|row| match row {
+            RowItem::Group(g) => {
+                let members = app.ssh_group_members(g);
+                let open = members
+                    .iter()
+                    .filter(|i| app.ssh_windows_open(&app.ssh_hosts[**i].name) > 0)
+                    .count();
+                group_header(g, &format!("({open}/{} open)", members.len()))
+            }
+            RowItem::Item(i) => {
+                let h = &app.ssh_hosts[*i];
+                let indent = if h.group.is_empty() { "" } else { "  " };
+                let lock = if h.password.is_empty() {
+                    Span::raw(" ")
+                } else {
+                    Span::styled("!", Style::default().fg(WARN()).bold())
+                };
+                let open = if app.ssh_windows_open(&h.name) > 0 {
+                    Span::styled("●", Style::default().fg(OK()))
+                } else {
+                    Span::raw(" ")
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    open,
+                    lock,
+                    Span::styled(
+                        format!(" {:<16}", truncate(&h.name, 16)),
+                        Style::default().fg(TEXT()),
+                    ),
+                    Span::styled(
+                        format!("{:<24}", truncate(&h.target_summary(), 24)),
+                        Style::default().fg(DIM()),
+                    ),
+                    Span::styled("via ", Style::default().fg(DIM())),
+                ]
+                .into_iter()
+                .chain(requires_spans(app, &h.requires_vpn, &h.depends_on))
+                .collect::<Vec<_>>()))
+            }
         })
         .collect();
 
@@ -1311,8 +1738,25 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
 
     // Details panel
     let mut lines: Vec<Line> = Vec::new();
-    match app.ssh_hosts.get(app.ssh_selected) {
-        Some(h) => {
+    match app.ssh_rows.get(app.ssh_selected) {
+        Some(RowItem::Group(g)) => {
+            let members = app.ssh_group_members(g);
+            let open = members
+                .iter()
+                .filter(|i| app.ssh_windows_open(&app.ssh_hosts[**i].name) > 0)
+                .count();
+            lines.extend(group_details(g, members.len(), open, "open"));
+            lines.push(Line::from(Span::styled(
+                "Enter opens a session for every member,",
+                Style::default().fg(DIM()),
+            )));
+            lines.push(Line::from(Span::styled(
+                "bringing a shared VPN or tunnel up once.",
+                Style::default().fg(DIM()),
+            )));
+        }
+        Some(RowItem::Item(idx)) => {
+            let h = &app.ssh_hosts[*idx];
             let field = |k: &str, v: String| {
                 Line::from(vec![
                     Span::styled(format!("{k:<11}"), Style::default().fg(DIM())),
@@ -1360,12 +1804,24 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
 
+            let open = app.ssh_windows_open(&h.name);
+            if open > 0 {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("session    ", Style::default().fg(DIM())),
+                    Span::styled(
+                        format!("{open} window{} open", if open == 1 { "" } else { "s" }),
+                        Style::default().fg(OK()),
+                    ),
+                ]));
+            }
+
             if let Some(last) = app.ssh_last.get(&h.name) {
                 lines.push(Line::from(""));
-                let style = if last.code == 0 {
-                    Style::default().fg(DIM())
-                } else {
+                let style = if last.failed() {
                     Style::default().fg(DANGER())
+                } else {
+                    Style::default().fg(DIM())
                 };
                 lines.push(Line::from(vec![
                     Span::styled("last run   ", Style::default().fg(DIM())),
@@ -1384,7 +1840,10 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled("press ", Style::default().fg(DIM())),
                 Span::styled("Enter", Style::default().fg(ACCENT()).bold()),
-                Span::styled(" to open a session in this terminal", Style::default().fg(DIM())),
+                Span::styled(
+                    format!(" to open a session in {}", app.ssh_launcher.label()),
+                    Style::default().fg(DIM()),
+                ),
             ]));
         }
         None => {
@@ -1424,51 +1883,58 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         let color = if *is_error { DANGER() } else { OK() };
         Line::from(Span::styled(format!(" {msg}"), Style::default().fg(color)))
     } else {
+        // The same keys in the same order everywhere; only what each one acts
+        // on differs, so only the words after the key change.
         let hints: &[(&str, &str)] = match app.tab {
             Tab::Dashboard => &[
-                ("1-5/tab", "switch tab"),
+                ("1-5/tab", "tab"),
+                ("r", "reload"),
+                ("c", "clear"),
+                ("x", "panic"),
                 ("t", "theme"),
                 ("?", "help"),
-                ("q", "quit"),
-            ],
-            Tab::Tunnels => &[
-                ("↵/space", "start/stop"),
-                ("a", "add"),
-                ("e", "edit"),
-                ("d", "delete"),
-                ("r", "restart"),
-                ("x", "stop all"),
-                ("?", "help"),
+                ("k", "keys"),
                 ("q", "quit"),
             ],
             Tab::Vpn => &[
-                ("j/k", "select"),
-                ("↵", "switch profile + connect"),
-                ("u", "up"),
-                ("d", "down"),
+                ("↵", "connect/disconnect"),
+                ("a/e/d", "profile"),
                 ("r", "refresh"),
+                ("p", "password"),
+                ("l", "log"),
+                ("x", "panic"),
                 ("?", "help"),
-                ("q", "quit"),
+                ("k", "keys"),
+            ],
+            Tab::Tunnels => &[
+                ("↵", "start/stop"),
+                ("a/e/d", "tunnel"),
+                ("r", "restart"),
+                ("l", "log"),
+                ("c", "clear"),
+                ("x", "panic"),
+                ("?", "help"),
+                ("k", "keys"),
             ],
             Tab::Ssh => &[
                 ("↵", "open session"),
-                ("a", "add"),
-                ("e", "edit"),
-                ("d", "delete"),
-                ("p", "clear password"),
+                ("a/e/d", "host"),
+                ("r", "new session"),
+                ("p", "password"),
+                ("c", "clear"),
+                ("x", "panic"),
                 ("?", "help"),
-                ("q", "quit"),
+                ("k", "keys"),
             ],
             Tab::Rdp => &[
                 ("↵", "connect/disconnect"),
-                ("a", "add"),
-                ("e", "edit"),
-                ("d", "delete"),
-                ("l", "logs"),
-                ("c", "clear finished"),
-                ("x", "close all"),
+                ("a/e/d", "connection"),
+                ("r", "reconnect"),
+                ("l", "log"),
+                ("c", "clear"),
+                ("x", "panic"),
                 ("?", "help"),
-                ("q", "quit"),
+                ("k", "keys"),
             ],
         };
         let mut spans = Vec::new();
@@ -1502,6 +1968,7 @@ fn render_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         FormMode::Edit(_) => " edit tunnel ",
         _ => " add tunnel ",
     };
+    let value_width = value_width(rect, 33);
 
     let mut lines: Vec<Line> = Vec::new();
     for fld in &visible {
@@ -1527,6 +1994,7 @@ fn render_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             FormField::DependsOn => format!("◂ {} ▸", form.dep.label()),
         };
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
+        let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<32}", fld.label(form.forward)), label_style),
             Span::styled(value, Style::default().fg(TEXT())),
@@ -1611,6 +2079,7 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         RdpMode::Edit(_) => " edit rdp connection ",
         _ => " add rdp connection ",
     };
+    let value_width = value_width(rect, 31);
 
     let mut lines: Vec<Line> = Vec::new();
     for fld in RDP_FIELDS {
@@ -1622,6 +2091,7 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         };
         let value: String = match fld {
             RdpField::Name => form.name.clone(),
+            RdpField::Group => form.group.clone(),
             RdpField::Host => form.host.clone(),
             RdpField::Port => form.port.clone(),
             RdpField::Domain => form.domain.clone(),
@@ -1631,6 +2101,7 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             RdpField::DependsOn => format!("◂ {} ▸", form.dep.label()),
         };
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
+        let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<30}", fld.label()), label_style),
             Span::styled(value, Style::default().fg(TEXT())),
@@ -1659,12 +2130,28 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
-fn render_rdp_password_overlay(f: &mut Frame, app: &App, area: Rect, idx: usize, input: &str) {
-    let (name, login) = app
-        .rdp_conns
-        .get(idx)
+/// `pending` holds the connections still to be asked about, current one first;
+/// `done` how many of a group have already been answered.
+fn render_rdp_password_overlay(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    pending: &[usize],
+    done: usize,
+    input: &str,
+) {
+    let (name, login) = pending
+        .first()
+        .and_then(|i| app.rdp_conns.get(*i))
         .map(|c| (c.name.clone(), format!("{} @ {}", c.login_summary(), c.target_summary())))
         .unwrap_or_else(|| ("?".into(), String::new()));
+    let total = done + pending.len();
+    // Only a group start asks more than once, and then it says where it is.
+    let counter = if total > 1 {
+        format!("  ({} of {total})", done + 1)
+    } else {
+        String::new()
+    };
     let rect = centered_rect(56, 7, area);
     f.render_widget(Clear, rect);
     let masked: String = "•".repeat(input.chars().count());
@@ -1672,6 +2159,7 @@ fn render_rdp_password_overlay(f: &mut Frame, app: &App, area: Rect, idx: usize,
         Line::from(vec![
             Span::styled(" connect to ", Style::default().fg(DIM())),
             Span::styled(name, Style::default().fg(ACCENT()).bold()),
+            Span::styled(counter, Style::default().fg(DIM())),
         ]),
         Line::from(Span::styled(format!(" {login}"), Style::default().fg(DIM()))),
         Line::from(""),
@@ -1703,9 +2191,8 @@ fn render_rdp_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     let name = app
-        .rdp_conns
-        .get(app.rdp_selected)
-        .map(|c| c.name.clone())
+        .selected_rdp_conn()
+        .map(|i| app.rdp_conns[i].name.clone())
         .unwrap_or_default();
     match app.rdp_active.get(&name) {
         Some(a) => {
@@ -1742,16 +2229,112 @@ fn render_rdp_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
+/// Full-screen view of what ssh has printed for the selected tunnel. Tunnels
+/// run with `BatchMode=yes`, so this is where a refused key or a dead host ends
+/// up saying so.
+fn render_tunnel_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
+    let rect = centered_rect(
+        area.width.saturating_sub(8).max(40),
+        area.height.saturating_sub(4).max(10),
+        area,
+    );
+    f.render_widget(Clear, rect);
+
+    let name = app.selected_active_tunnel().unwrap_or_default().to_string();
+    let mut lines: Vec<Line> = Vec::new();
+    match app.active.get(&name) {
+        Some(a) => {
+            let n = rect.height.saturating_sub(3) as usize;
+            for l in a.recent_stderr(n) {
+                lines.push(Line::from(Span::styled(l, Style::default().fg(TEXT()))));
+            }
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    " nothing yet — a quiet tunnel says nothing",
+                    Style::default().fg(DIM()),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            " no running tunnel",
+            Style::default().fg(DIM()),
+        ))),
+    }
+    lines.push(Line::from(Span::styled(
+        " c clears · Esc/q/l close",
+        Style::default().fg(DIM()),
+    )));
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER()))
+            .title(Span::styled(
+                format!(" ssh log · {name} "),
+                Style::default().fg(ACCENT()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
+}
+
+/// The panic button's confirmation: what is up, and that it all goes.
+fn render_panic_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.panic else {
+        return;
+    };
+    let items = p.lines();
+    let rect = centered_rect(60, (items.len() + 7) as u16, area);
+    f.render_widget(Clear, rect);
+
+    let mut lines = vec![Line::from(Span::styled(
+        " Disconnect everything?",
+        Style::default().fg(TEXT()).bold(),
+    ))];
+    for item in &items {
+        lines.push(Line::from(Span::styled(
+            format!("   {item}"),
+            Style::default().fg(WARN()),
+        )));
+    }
+    lines.push(Line::from(""));
+    if !p.vpn.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Taking a VPN down asks for root.",
+            Style::default().fg(DIM()),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Auto-reconnect stops too; nothing comes back on its own.",
+        Style::default().fg(DIM()),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled(" y/enter ", Style::default().fg(DANGER()).bold()),
+        Span::styled("disconnect  ", Style::default().fg(DIM())),
+        Span::styled("any key ", Style::default().fg(ACCENT()).bold()),
+        Span::styled("leave it", Style::default().fg(DIM())),
+    ]));
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DANGER()))
+            .title(Span::styled(" panic ", Style::default().fg(DANGER()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
 fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
     let form = &app.ssh_form;
     let height = (SSH_FIELDS.len() + 5) as u16;
-    let rect = centered_rect(70, height, area);
+    // Wide enough that a key path is readable without scrolling it.
+    let rect = centered_rect(80, height, area);
     f.render_widget(Clear, rect);
 
     let title = match app.ssh_mode {
         SshMode::Edit(_) => " edit ssh host ",
         _ => " add ssh host ",
     };
+    let value_width = value_width(rect, 33);
 
     let mut lines: Vec<Line> = Vec::new();
     for fld in SSH_FIELDS {
@@ -1763,6 +2346,7 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         };
         let (value, value_style) = match fld {
             SshField::Name => (form.name.clone(), Style::default().fg(TEXT())),
+            SshField::Group => (form.group.clone(), Style::default().fg(TEXT())),
             SshField::Host => (form.host.clone(), Style::default().fg(TEXT())),
             SshField::Port => (form.port.clone(), Style::default().fg(TEXT())),
             SshField::Username => (form.username.clone(), Style::default().fg(TEXT())),
@@ -1798,6 +2382,7 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             SshField::ExtraArgs => (form.extra_args.clone(), Style::default().fg(TEXT())),
         };
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
+        let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
         lines.push(Line::from(vec![
             Span::styled(format!(" {:<32}", fld.label()), label_style),
             Span::styled(value, value_style),
@@ -1809,6 +2394,11 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!(" {err}"),
             Style::default().fg(DANGER()),
+        )));
+    } else if form.field() == SshField::KeyPath {
+        lines.push(Line::from(Span::styled(
+            " Ctrl+O file picker · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
         )));
     } else {
         lines.push(Line::from(Span::styled(
@@ -1953,11 +2543,73 @@ fn render_conflict_prompt(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {
-    let rect = centered_rect(70, 38, area);
-    f.render_widget(Clear, rect);
     let entry = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(format!(" {k:<12}"), Style::default().fg(ACCENT())),
+            Span::styled(d.to_string(), Style::default().fg(TEXT())),
+        ])
+    };
+    let text = |d: &str| Line::from(Span::styled(format!("   {d}"), Style::default().fg(TEXT())));
+    let section = |t: &str| {
+        Line::from(Span::styled(
+            format!(" {t}"),
+            Style::default().fg(DIM()).bold(),
+        ))
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            " SSH tunnels, SSH logins, VPN clients and RDP sessions in one place.",
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(""),
+        section("tabs"),
+        entry("  dashboard", "everything that is up, and what it is moving"),
+        entry("  vpn", "netbird, wireguard, openvpn and tailscale side by side"),
+        entry("  tunnels", "ssh forwards — local (-L), remote (-R), dynamic (-D)"),
+        entry("  ssh", "interactive logins, each in a terminal window of its own"),
+        entry("  rdp", "xfreerdp3 sessions, running in the background"),
+        Line::from(""),
+        section("groups"),
+        text("entries sharing a group name stack under one header, and the"),
+        text("header acts on every member as one plan — so a VPN or tunnel"),
+        text("several of them share is brought up once, not once each"),
+        Line::from(""),
+        section("dependencies"),
+        text("a tunnel, ssh host or rdp connection can require a VPN profile"),
+        text("and a tunnel, and tunnels stack on other tunnels. Connecting"),
+        text("brings the whole chain up in order: VPNs first, then the"),
+        text("tunnels bottom-up, then the session itself"),
+        Line::from(""),
+        section("conflicts"),
+        text("a step that cannot coexist with what is already running asks"),
+        text("first — y evicts what is in the way, anything else cancels"),
+        Line::from(""),
+        section("config"),
+        text("TOML under ~/.config/controlcenter, editable by hand"),
+        text("(controlcenter --config-paths says exactly where)"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" k ", Style::default().fg(ACCENT()).bold()),
+            Span::styled("for the keys · any key closes", Style::default().fg(DIM())),
+        ]),
+    ];
+    let rect = centered_rect(72, (lines.len() + 2) as u16, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER()))
+            .title(Span::styled(" help ", Style::default().fg(ACCENT()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+/// The keybinding cheat sheet. Every key means the same thing on every tab, so
+/// the sheet is one list plus a grid of what each one acts on where.
+fn render_keys_overlay(f: &mut Frame, area: Rect) {
+    let entry = |k: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<14}"), Style::default().fg(ACCENT())),
             Span::styled(d.to_string(), Style::default().fg(TEXT())),
         ])
     };
@@ -1967,53 +2619,185 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             Style::default().fg(DIM()).bold(),
         ))
     };
+    // key, vpn, tunnels, ssh, rdp
+    let row = |k: &str, a: &str, b: &str, c: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<8}"), Style::default().fg(ACCENT())),
+            Span::styled(
+                format!("{a:<15}{b:<15}{c:<15}{d}"),
+                Style::default().fg(TEXT()),
+            ),
+        ])
+    };
     let lines = vec![
-        entry("1-5 / tab", "switch tab (dashboard, vpn, tunnels, ssh, rdp)"),
-        entry("j k ↑ ↓", "move selection"),
-        entry("t", "cycle color theme"),
-        entry("q", "quit (stops tunnels; RDP windows stay open)"),
+        section("acting on what is selected"),
+        entry("enter space", "connect · disconnect if it is already up"),
+        entry("a", "add"),
+        entry("e", "edit"),
+        entry("d", "delete"),
+        entry("r", "reconnect · reload"),
+        entry("p", "remove the stored password"),
+        entry("l", "log"),
+        entry("c", "clear — the log, or entries that have finished"),
         Line::from(""),
-        section("tunnels"),
-        entry("enter/space", "start/stop tunnel or whole group"),
-        entry("a / e / d", "add / edit / delete"),
-        entry("r", "restart selected active tunnel"),
-        entry("x", "stop all tunnels"),
+        section("everywhere"),
+        Line::from(vec![
+            Span::styled(
+                format!(" {:<14}", "x"),
+                Style::default().fg(DANGER()).bold(),
+            ),
+            Span::styled(
+                "disconnect EVERYTHING — the panic button",
+                Style::default().fg(TEXT()),
+            ),
+        ]),
+        entry("t", "cycle the colour theme"),
+        entry("?", "help · k these keys"),
+        entry("q", "close what is focused, and the application once"),
+        entry("", "nothing is left to close"),
         Line::from(""),
-        section("vpn (netbird)"),
-        entry("enter", "select profile and connect (netbird up)"),
-        entry("u / d", "netbird up / netbird down"),
-        entry("r", "refresh status"),
+        section("moving about"),
+        entry("1-5 tab", "switch tab (shift+tab goes back)"),
+        entry("↑ ↓", "move the selection"),
+        entry("← →", "switch pane · change the field under the cursor"),
+        entry("esc", "cancel a form, close a popup"),
+        entry("y", "confirm in a prompt"),
+        entry("ctrl+o", "open the file picker on a path field"),
         Line::from(""),
-        section("ssh"),
-        entry("enter", "open a session in this terminal"),
-        entry("a / e / d", "add / edit / delete host"),
-        entry("p", "clear a stored cleartext password"),
+        section("what each one acts on"),
+        row("", "VPN", "TUNNELS", "SSH", "RDP"),
+        row("enter", "connect", "start/stop", "open session", "connect"),
+        row("a e d", "profile", "tunnel", "host", "connection"),
+        row("r", "refresh", "restart", "new session", "reconnect"),
+        row("p", "openvpn pw", "—", "stored pw", "never stored"),
+        row("l", "openvpn log", "ssh output", "—", "xfreerdp log"),
+        row("c", "errors", "failed", "last session", "finished"),
         Line::from(""),
-        section("rdp"),
-        entry("enter", "connect (asks password) / disconnect"),
-        entry("a / e / d", "add / edit / delete connection"),
-        entry("l", "view session log"),
-        entry("c", "clear finished session"),
-        entry("x", "close all sessions"),
-        Line::from(""),
-        section("dependencies"),
-        entry("", "tunnels, ssh and rdp can require a VPN profile"),
-        entry("", "and a tunnel — tunnels stack on other tunnels"),
-        entry("", "activating one brings the whole chain up in order"),
-        entry("y", "in a conflict prompt: evict what is in the way"),
-        Line::from(""),
-        Line::from(Span::styled(
-            " press any key to close",
-            Style::default().fg(DIM()),
-        )),
+        Line::from(vec![
+            Span::styled(" ? ", Style::default().fg(ACCENT()).bold()),
+            Span::styled("for help · any key closes", Style::default().fg(DIM())),
+        ]),
     ];
+    let rect = centered_rect(76, (lines.len() + 2) as u16, area);
+    f.render_widget(Clear, rect);
     let para = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER()))
-            .title(Span::styled(" help ", Style::default().fg(ACCENT()).bold())),
+            .title(Span::styled(" keys ", Style::default().fg(ACCENT()).bold())),
     );
     f.render_widget(para, rect);
+}
+
+/// How much room a form leaves for a value: the box minus its borders, the
+/// label column and the cursor.
+fn value_width(rect: Rect, label_width: u16) -> usize {
+    rect.width.saturating_sub(2 + label_width + 1) as usize
+}
+
+/// Form text is appended at the end, so that is where the cursor is: when a
+/// value outgrows its field, show the tail instead of letting it disappear
+/// under the border.
+fn scrolled(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let tail: String = value.chars().skip(len - keep).collect();
+    format!("…{tail}")
+}
+
+/// The file picker: the path being typed, and the directory it points at.
+fn render_browser_overlay(f: &mut Frame, browser: &FileBrowser, area: Rect) {
+    let width = 76.min(area.width);
+    let height = area.height.saturating_sub(4).clamp(8, 26);
+    let rect = centered_rect(width, height, area);
+    f.render_widget(Clear, rect);
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(
+                " pick a file ",
+                Style::default().fg(ACCENT()).bold(),
+            )),
+        rect,
+    );
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let path_width = inner.width.saturating_sub(7) as usize;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" path ", Style::default().fg(DIM())),
+            Span::styled(
+                scrolled(&browser.input, path_width),
+                Style::default().fg(TEXT()),
+            ),
+            Span::styled("▏", Style::default().fg(ACCENT())),
+        ])),
+        chunks[0],
+    );
+
+    let subtitle = match &browser.error {
+        Some(e) => Span::styled(format!(" {}", truncate(e, inner.width as usize - 1)), Style::default().fg(DANGER())),
+        None if browser.entries.is_empty() => {
+            Span::styled(" nothing here matches", Style::default().fg(DIM()))
+        }
+        None => Span::styled(
+            format!(" {} entries", browser.entries.len()),
+            Style::default().fg(DIM()),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(subtitle)), chunks[1]);
+
+    let items: Vec<ListItem> = browser
+        .entries
+        .iter()
+        .map(|e| {
+            let (mark, name, style) = if e.is_dir {
+                ("▸ ", format!("{}/", e.name), Style::default().fg(ACCENT()))
+            } else {
+                ("  ", e.name.clone(), Style::default().fg(TEXT()))
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(DIM())),
+                Span::styled(name, style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !browser.entries.is_empty() {
+        state.select(Some(browser.selected));
+    }
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+        chunks[2],
+        &mut state,
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ select · → / Enter open folder · Enter pick file · ← up · Esc cancel",
+            Style::default().fg(DIM()),
+        ))),
+        chunks[3],
+    );
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -2025,6 +2809,10 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: w,
         height: h,
     }
+}
+
+pub fn truncate_pub(s: &str, max: usize) -> String {
+    truncate(s, max)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2055,7 +2843,7 @@ pub fn human_rate(b: u64) -> String {
     format!("{}/s", human_bytes(b))
 }
 
-fn fmt_duration(d: std::time::Duration) -> String {
+pub fn fmt_duration(d: std::time::Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{s}s")

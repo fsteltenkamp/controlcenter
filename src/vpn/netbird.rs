@@ -1,44 +1,12 @@
+//! NetBird, driven through its own CLI. `netbird` talks to its daemon over a
+//! socket it owns, so nothing here needs to escalate.
+
+use super::{ProviderId, VpnMsg, VpnProfile, VpnStatus};
 use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-#[derive(Debug, Clone)]
-pub struct Profile {
-    pub name: String,
-    pub active: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NbStatus {
-    pub connected: bool,
-    /// Ordered `key: value` pairs from `netbird status`.
-    pub fields: Vec<(String, String)>,
-    pub error: Option<String>,
-}
-
-impl NbStatus {
-    pub fn field(&self, key: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_str())
-    }
-}
-
-pub enum NbMsg {
-    Refreshed {
-        profiles: Result<Vec<Profile>, String>,
-        status: NbStatus,
-    },
-    ActionDone {
-        desc: String,
-        error: Option<String>,
-    },
-}
-
-pub fn installed() -> bool {
-    crate::tunnel::which_bin("netbird").is_some()
-}
+const ME: ProviderId = ProviderId::Netbird;
 
 fn run(args: &[&str]) -> Result<String, String> {
     let out = Command::new("netbird")
@@ -60,21 +28,22 @@ fn run(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn parse_profiles(raw: &str) -> Vec<Profile> {
+fn parse_profiles(raw: &str) -> Vec<VpnProfile> {
     raw.lines()
         .skip(1) // "NAME  ACTIVE" header
         .filter_map(|line| {
             let name = line.split_whitespace().next()?.to_string();
             let rest = &line[line.find(&name).unwrap_or(0) + name.len()..];
-            Some(Profile {
+            Some(VpnProfile {
                 active: !rest.trim().is_empty(),
                 name,
+                detail: String::new(),
             })
         })
         .collect()
 }
 
-fn parse_status(raw: &str) -> NbStatus {
+fn parse_status(raw: &str) -> VpnStatus {
     let mut fields = Vec::new();
     for line in raw.lines() {
         if let Some((k, v)) = line.split_once(':') {
@@ -87,32 +56,44 @@ fn parse_status(raw: &str) -> NbStatus {
     let connected = fields
         .iter()
         .any(|(k, v)| k == "Management" && v.starts_with("Connected"));
-    NbStatus {
+    let active_profile = fields
+        .iter()
+        .find(|(k, _)| k == "Profile")
+        .map(|(_, v)| v.clone());
+    VpnStatus {
         connected,
+        active_profile,
         fields,
         error: None,
     }
 }
 
-/// Fetch profiles and status on a background thread; result arrives as `NbMsg::Refreshed`.
-pub fn refresh(tx: Sender<NbMsg>) {
+/// Fetch profiles and status on a background thread.
+pub fn refresh(tx: Sender<VpnMsg>) {
     thread::spawn(move || {
         let profiles = run(&["profile", "list"]).map(|out| parse_profiles(&out));
-        let status = match run(&["status"]) {
+        let mut status = match run(&["status"]) {
             Ok(out) => parse_status(&out),
-            Err(e) => NbStatus {
-                connected: false,
-                fields: Vec::new(),
-                error: Some(e),
-            },
+            Err(e) => VpnStatus::failed(e),
         };
-        let _ = tx.send(NbMsg::Refreshed { profiles, status });
+        // `netbird status` omits the profile when it is not connected; fall back
+        // to whichever one the profile list flags as active.
+        if status.active_profile.is_none() {
+            if let Ok(list) = &profiles {
+                status.active_profile = list.iter().find(|p| p.active).map(|p| p.name.clone());
+            }
+        }
+        let _ = tx.send(VpnMsg::Refreshed {
+            provider: ME,
+            profiles,
+            status,
+        });
     });
 }
 
-/// Run a sequence of netbird commands on a background thread (stops at the first
-/// failure), then refresh. `netbird up` may block until login completes.
-pub fn action(tx: Sender<NbMsg>, desc: String, cmds: Vec<Vec<String>>) {
+/// Run a sequence of netbird commands (stopping at the first failure), then
+/// refresh. `netbird up` may block until a browser login completes.
+pub fn action(tx: Sender<VpnMsg>, desc: String, cmds: Vec<Vec<String>>) {
     thread::spawn(move || {
         let mut error = None;
         for cmd in &cmds {
@@ -122,9 +103,36 @@ pub fn action(tx: Sender<NbMsg>, desc: String, cmds: Vec<Vec<String>>) {
                 break;
             }
         }
-        let _ = tx.send(NbMsg::ActionDone { desc, error });
+        let _ = tx.send(VpnMsg::ActionDone {
+            provider: ME,
+            desc,
+            error,
+        });
         refresh(tx);
     });
+}
+
+/// The argv for bringing a profile up, or just connecting when `profile` is None.
+pub fn connect_cmds(profile: Option<&str>) -> Vec<Vec<String>> {
+    match profile {
+        Some(p) => vec![
+            vec!["profile".into(), "select".into(), p.to_string()],
+            vec!["up".into()],
+        ],
+        None => vec![vec!["up".into()]],
+    }
+}
+
+pub fn connect(tx: Sender<VpnMsg>, profile: Option<&str>) {
+    let desc = match profile {
+        Some(p) => format!("switching to profile '{p}'"),
+        None => "connecting".to_string(),
+    };
+    action(tx, desc, connect_cmds(profile));
+}
+
+pub fn disconnect(tx: Sender<VpnMsg>) {
+    action(tx, "disconnecting".into(), vec![vec!["down".into()]]);
 }
 
 #[cfg(test)]
@@ -148,6 +156,7 @@ mod tests {
         let st = parse_status(raw);
         assert!(st.connected);
         assert_eq!(st.field("Profile"), Some("tn"));
+        assert_eq!(st.active_profile.as_deref(), Some("tn"));
         assert_eq!(st.field("NetBird IP"), Some("100.120.192.110/16"));
     }
 
@@ -156,5 +165,11 @@ mod tests {
         let raw = "Daemon status: NeedsLogin\nManagement: Disconnected\n";
         let st = parse_status(raw);
         assert!(!st.connected);
+    }
+
+    #[test]
+    fn connecting_without_a_profile_does_not_switch() {
+        assert_eq!(connect_cmds(None), vec![vec!["up".to_string()]]);
+        assert_eq!(connect_cmds(Some("tn"))[0][2], "tn");
     }
 }

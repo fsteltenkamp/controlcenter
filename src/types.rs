@@ -1,3 +1,4 @@
+use crate::vpn::ProviderId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -75,6 +76,9 @@ pub struct Tunnel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RdpConnection {
     pub name: String,
+    /// Empty string means ungrouped.
+    #[serde(default)]
+    pub group: String,
     pub host: String,
     #[serde(default = "default_rdp_port")]
     pub port: u16,
@@ -142,6 +146,9 @@ impl Tunnel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshHost {
     pub name: String,
+    /// Empty string means ungrouped.
+    #[serde(default)]
+    pub group: String,
     pub host: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
@@ -218,16 +225,90 @@ impl Tunnel {
     }
 }
 
-/// A VPN requirement of "any profile, just be connected".
+/// A VPN requirement of "anything, just be connected".
 pub const VPN_ANY: &str = "*";
+
+/// What a connection means when it names a VPN.
+///
+/// Written as `provider:profile`, where either half may be `*`:
+///
+/// | written | means |
+/// |---|---|
+/// | `""` | nothing |
+/// | `"*"` | any provider, connected |
+/// | `"netbird:*"` | any netbird profile |
+/// | `"wireguard:home"` | that profile |
+/// | `"work"` | netbird's, from before there was more than one provider |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpnRequirement {
+    /// `None` = any provider will do.
+    pub provider: Option<ProviderId>,
+    /// `None` = any profile of that provider will do.
+    pub profile: Option<String>,
+}
+
+impl VpnRequirement {
+    /// How it is written in config files and carried in a plan step.
+    pub fn canonical(&self) -> String {
+        match (self.provider, &self.profile) {
+            (None, _) => VPN_ANY.to_string(),
+            (Some(p), None) => format!("{}:{}", p.slug(), VPN_ANY),
+            (Some(p), Some(name)) => format!("{}:{}", p.slug(), name),
+        }
+    }
+
+    /// How it reads in the UI.
+    pub fn label(&self) -> String {
+        match (self.provider, &self.profile) {
+            (None, _) => "any VPN".to_string(),
+            (Some(p), None) => format!("{} (any profile)", p.slug()),
+            (Some(p), Some(name)) => format!("{}: {name}", p.slug()),
+        }
+    }
+}
+
+/// Read a `requires_vpn` value. `None` for "no VPN needed".
+///
+/// An unqualified name is netbird's, because that is what it meant when netbird
+/// was the only provider and existing config files are full of them.
+pub fn parse_vpn_requirement(req: &str) -> Option<VpnRequirement> {
+    let req = req.trim();
+    if req.is_empty() {
+        return None;
+    }
+    if req == VPN_ANY {
+        return Some(VpnRequirement {
+            provider: None,
+            profile: None,
+        });
+    }
+    let (provider, profile) = match req.split_once(':') {
+        Some((slug, rest)) => match ProviderId::from_slug(slug) {
+            Some(p) => (p, rest.trim()),
+            // Not a provider we know — treat the whole thing as a netbird
+            // profile name rather than silently dropping the requirement.
+            None => (ProviderId::Netbird, req),
+        },
+        None => (ProviderId::Netbird, req),
+    };
+    Some(VpnRequirement {
+        provider: Some(provider),
+        profile: (profile != VPN_ANY && !profile.is_empty()).then(|| profile.to_string()),
+    })
+}
+
+/// The stored form of a requirement, with legacy spellings normalised.
+pub fn canonical_vpn_requirement(req: &str) -> String {
+    parse_vpn_requirement(req)
+        .map(|r| r.canonical())
+        .unwrap_or_default()
+}
 
 /// How a VPN requirement reads in the UI.
 pub fn vpn_requirement_label(req: &str) -> String {
-    match req {
-        "" => "—".into(),
-        VPN_ANY => "any profile".into(),
-        name => name.to_string(),
-    }
+    parse_vpn_requirement(req)
+        .map(|r| r.label())
+        .unwrap_or_else(|| "\u{2014}".into())
 }
 
 /// What a connection needs before it can start.
@@ -270,6 +351,157 @@ pub fn tunnel_conflict(a: &Tunnel, b: &Tunnel) -> Option<String> {
     (binding_a == binding_b).then_some(binding_a)
 }
 
+// ---------------------------------------------------------------------------
+// VPN profiles owned by controlcenter (`vpn.toml`)
+// ---------------------------------------------------------------------------
+
+/// A WireGuard peer. Unless `config_path` points at a config someone else
+/// manages, these fields are the source of truth and the `.conf` handed to
+/// `wg-quick` is generated from them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WireguardProfile {
+    /// Also the interface name, so it has to be a valid one.
+    pub name: String,
+    /// An externally managed `.conf` to use as-is. Empty = generate one.
+    #[serde(default)]
+    pub config_path: String,
+    /// CLEARTEXT, like the ssh password — vpn.toml is written 0600.
+    #[serde(default)]
+    pub private_key: String,
+    /// This end's address inside the tunnel, e.g. "10.0.0.2/24".
+    #[serde(default)]
+    pub address: String,
+    /// Needs resolvconf/openresolv on PATH; empty = leave DNS alone.
+    #[serde(default)]
+    pub dns: String,
+    /// 0 = let the kernel pick.
+    #[serde(default)]
+    pub listen_port: u16,
+    /// 0 = default.
+    #[serde(default)]
+    pub mtu: u16,
+    #[serde(default)]
+    pub peer_public_key: String,
+    #[serde(default)]
+    pub preshared_key: String,
+    /// "host:port" of the peer.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default = "default_allowed_ips")]
+    pub allowed_ips: String,
+    /// 0 = off. 25 is the usual value behind NAT.
+    #[serde(default)]
+    pub persistent_keepalive: u16,
+}
+
+pub fn default_allowed_ips() -> String {
+    "0.0.0.0/0, ::/0".to_string()
+}
+
+/// An OpenVPN connection, backed by a `.ovpn` file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenvpnProfile {
+    /// Also the name of the directory the imported copy lives in.
+    pub name: String,
+    /// The `.ovpn` this profile came from.
+    pub config_path: String,
+    /// Copy the config and every certificate it names into controlcenter's own
+    /// directory, so the profile keeps working once the download folder is gone.
+    /// False runs `config_path` where it sits.
+    #[serde(default = "yes")]
+    pub import: bool,
+    /// Empty = the config does not use user/password auth.
+    #[serde(default)]
+    pub username: String,
+    /// CLEARTEXT. Fed to openvpn on stdin, never on the command line.
+    #[serde(default)]
+    pub password: String,
+    /// Extra openvpn flags, whitespace separated.
+    #[serde(default)]
+    pub extra_args: String,
+}
+
+impl Default for OpenvpnProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            config_path: String::new(),
+            import: true,
+            username: String::new(),
+            password: String::new(),
+            extra_args: String::new(),
+        }
+    }
+}
+
+/// A named set of `tailscale up` flags. Tailscale has no profile concept of its
+/// own, so a profile here is the state `up` is asked to put the node in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailscaleProfile {
+    pub name: String,
+    /// Headscale or another coordination server. Empty = Tailscale's own.
+    #[serde(default)]
+    pub login_server: String,
+    /// Exit node by IP or name. Empty = none.
+    #[serde(default)]
+    pub exit_node: String,
+    #[serde(default)]
+    pub exit_node_allow_lan: bool,
+    #[serde(default = "yes")]
+    pub accept_routes: bool,
+    #[serde(default = "yes")]
+    pub accept_dns: bool,
+    #[serde(default)]
+    pub ssh: bool,
+    #[serde(default)]
+    pub shields_up: bool,
+    /// Empty = leave the machine name alone.
+    #[serde(default)]
+    pub hostname: String,
+    /// Comma separated CIDRs to advertise as a subnet router.
+    #[serde(default)]
+    pub advertise_routes: String,
+    #[serde(default)]
+    pub advertise_exit_node: bool,
+    #[serde(default)]
+    pub extra_args: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for TailscaleProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            login_server: String::new(),
+            exit_node: String::new(),
+            exit_node_allow_lan: false,
+            accept_routes: true,
+            accept_dns: true,
+            ssh: false,
+            shields_up: false,
+            hostname: String::new(),
+            advertise_routes: String::new(),
+            advertise_exit_node: false,
+            extra_args: String::new(),
+        }
+    }
+}
+
+/// Everything in `vpn.toml`. NetBird is absent on purpose: its profiles live in
+/// netbird itself and are only ever read.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VpnConfig {
+    #[serde(default)]
+    pub wireguard: Vec<WireguardProfile>,
+    #[serde(default)]
+    pub openvpn: Vec<OpenvpnProfile>,
+    #[serde(default)]
+    pub tailscale: Vec<TailscaleProfile>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +520,52 @@ mod tests {
             requires_vpn: String::new(),
             depends_on: String::new(),
         }
+    }
+
+    #[test]
+    fn an_unqualified_requirement_is_netbirds_the_way_it_always_was() {
+        let r = parse_vpn_requirement("work").unwrap();
+        assert_eq!(r.provider, Some(ProviderId::Netbird));
+        assert_eq!(r.profile.as_deref(), Some("work"));
+        assert_eq!(r.canonical(), "netbird:work");
+    }
+
+    #[test]
+    fn a_bare_star_means_any_provider_at_all() {
+        let r = parse_vpn_requirement("*").unwrap();
+        assert_eq!(r.provider, None);
+        assert_eq!(r.profile, None);
+        assert_eq!(r.canonical(), "*");
+        assert_eq!(r.label(), "any VPN");
+    }
+
+    #[test]
+    fn a_provider_can_be_named_with_or_without_a_profile() {
+        let any = parse_vpn_requirement("netbird:*").unwrap();
+        assert_eq!(any.provider, Some(ProviderId::Netbird));
+        assert_eq!(any.profile, None);
+        assert_eq!(any.canonical(), "netbird:*");
+
+        let one = parse_vpn_requirement("wireguard:home").unwrap();
+        assert_eq!(one.provider, Some(ProviderId::Wireguard));
+        assert_eq!(one.profile.as_deref(), Some("home"));
+        assert_eq!(one.label(), "wireguard: home");
+    }
+
+    #[test]
+    fn nothing_required_parses_to_nothing() {
+        assert!(parse_vpn_requirement("").is_none());
+        assert!(parse_vpn_requirement("   ").is_none());
+        assert_eq!(canonical_vpn_requirement(""), "");
+        assert_eq!(vpn_requirement_label(""), "\u{2014}");
+    }
+
+    #[test]
+    fn an_unknown_prefix_is_a_profile_name_not_a_dropped_requirement() {
+        // A netbird profile really can contain a colon.
+        let r = parse_vpn_requirement("acme:prod").unwrap();
+        assert_eq!(r.provider, Some(ProviderId::Netbird));
+        assert_eq!(r.profile.as_deref(), Some("acme:prod"));
     }
 
     #[test]
