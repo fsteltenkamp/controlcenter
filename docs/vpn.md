@@ -21,7 +21,7 @@ installed, what is already waiting on it.
 
 Profiles are netbird's own, so they are listed and switched but never edited here — `a`,
 `e` and `d` say so instead. Only one profile is active at a time, so switching prompts as
-a conflict.
+a conflict when something is riding on the profile going down.
 
 ## WireGuard
 
@@ -93,7 +93,8 @@ stored profiles, since tailscale cannot report a name. If the daemon socket is r
 the panel says to run `sudo tailscale set --operator=$USER` rather than escalating the
 poll.
 
-Only one profile is active at a time, so switching prompts as a conflict.
+Only one profile is active at a time, so switching prompts as a conflict when something is
+riding on the profile going down.
 
 ## Root
 

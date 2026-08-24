@@ -2498,22 +2498,17 @@ fn render_conflict_prompt(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     lines.push(Line::from(""));
-    if blocking.is_empty() {
+    // A prompt is only raised when something is in the way, so this list is
+    // never empty.
+    lines.push(Line::from(Span::styled(
+        " These are disconnected first:",
+        Style::default().fg(DIM()),
+    )));
+    for b in blocking.iter().take(4) {
         lines.push(Line::from(Span::styled(
-            " Nothing else is using it right now.",
-            Style::default().fg(DIM()),
+            format!("   {b}"),
+            Style::default().fg(TEXT()),
         )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            " These are disconnected first:",
-            Style::default().fg(DIM()),
-        )));
-        for b in blocking.iter().take(4) {
-            lines.push(Line::from(Span::styled(
-                format!("   {b}"),
-                Style::default().fg(TEXT()),
-            )));
-        }
     }
     // Only worth saying when there is more to the plan than this one step.
     if let Some(act) = app.activation.as_ref().filter(|a| a.total > 1) {

@@ -68,7 +68,9 @@ follows it through everything that requires it.
 ## Conflicts
 
 A step that cannot coexist with something already running prompts before touching it, and
-accepting (`y`) evicts what is in the way:
+accepting (`y` or Enter) evicts what is in the way and then goes on with the step. The
+prompt is the same wherever the step came from — a tunnel, an SSH or RDP connection
+pulling a VPN up behind it, or a profile switched by hand on the VPN tab:
 
 | Step | Conflicts with | Accepting |
 | --- | --- | --- |
@@ -78,6 +80,10 @@ accepting (`y`) evicts what is in the way:
 
 Only NetBird and Tailscale can hold one profile at a time, so only they conflict.
 WireGuard interfaces and OpenVPN sessions coexist, and several can be up at once.
+
+A prompt only appears when something running would actually be cut. Switching to another
+profile of the same client while nothing is riding on the old one is simply what you asked
+for, so it happens without a question.
 
 Declining cancels the plan and leaves everything as it was. Two members of one group
 fighting over a port is a broken config rather than a question, so the later one is

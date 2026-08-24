@@ -885,6 +885,33 @@ pub struct Catalog<'a> {
 }
 
 impl Catalog<'_> {
+    /// The running tunnels and RDP sessions that ride on exactly this VPN
+    /// requirement — what taking it down would cut. `tunnel_up` and `rdp_up`
+    /// answer for the two lists separately, because a tunnel and an RDP
+    /// connection may share a name.
+    fn riders_of(
+        &self,
+        req: &str,
+        tunnel_up: &dyn Fn(&str) -> bool,
+        rdp_up: &dyn Fn(&str) -> bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let want = canonical_vpn_requirement(req);
+        let matches = |r: &str| canonical_vpn_requirement(r) == want;
+        let tunnels = self
+            .tunnels
+            .iter()
+            .filter(|t| matches(&t.requires_vpn) && tunnel_up(&t.name))
+            .map(|t| t.name.clone())
+            .collect();
+        let rdp = self
+            .rdp_conns
+            .iter()
+            .filter(|c| matches(&c.requires_vpn) && rdp_up(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        (tunnels, rdp)
+    }
+
     /// What the named connection needs before it can start.
     fn requires_of(&self, step: &Step) -> Requires {
         match step {
@@ -1030,6 +1057,11 @@ pub struct Activation {
     /// Tunnels this plan started. A later step fighting one of these is a
     /// broken config, not something worth a prompt.
     started: Vec<String>,
+    /// The step whose conflict the user has already accepted. What stood in
+    /// the way is gone, but the resource it held can take a moment to come
+    /// free — a VPN profile only switches once the client says so — and
+    /// without this the same step would be asked about again on every tick.
+    approved: Option<Step>,
 }
 
 impl Activation {
@@ -2495,6 +2527,17 @@ impl App {
             .get(id)
             .selected_profile()
             .map(|p| p.name.clone());
+        // Switching an exclusive client's profile here cuts whatever rides on
+        // the one going down, exactly as it does inside a dependency plan, so
+        // it asks with the same prompt rather than pulling the rug silently.
+        let step = Step::Vpn(match &profile {
+            Some(p) => format!("{}:{p}", id.slug()),
+            None => id.slug().to_string(),
+        });
+        if let Some(prompt) = self.step_conflict(&step) {
+            self.conflict = Some(prompt);
+            return;
+        }
         if id == ProviderId::Openvpn {
             match profile {
                 Some(name) => self.start_openvpn(&name),
@@ -3837,6 +3880,7 @@ impl App {
             target,
             done: 0,
             started: Vec::new(),
+            approved: None,
         });
         self.advance_activation();
     }
@@ -4062,20 +4106,16 @@ impl App {
                 }
                 // Switching profiles cuts anything that asked for the old one.
                 let old = format!("{}:{current}", id.slug());
-                let requires_old =
-                    |req: &str| canonical_vpn_requirement(req) == old;
-                let stop_tunnels: Vec<String> = self
-                    .tunnels
-                    .iter()
-                    .filter(|t| requires_old(&t.requires_vpn) && self.active.contains_key(&t.name))
-                    .map(|t| t.name.clone())
-                    .collect();
-                let stop_rdp: Vec<String> = self
-                    .rdp_conns
-                    .iter()
-                    .filter(|c| requires_old(&c.requires_vpn) && self.rdp_running(&c.name))
-                    .map(|c| c.name.clone())
-                    .collect();
+                let (stop_tunnels, stop_rdp) = self.catalog().riders_of(
+                    &old,
+                    &|name| self.active.contains_key(name),
+                    &|name| self.rdp_running(name),
+                );
+                // Nothing rides on the profile going down, so the switch is
+                // simply what was asked for: do it rather than ask again.
+                if stop_tunnels.is_empty() && stop_rdp.is_empty() {
+                    return None;
+                }
                 Some(ConflictPrompt {
                     step: step.clone(),
                     resource: format!("the active {} profile", id.slug()),
@@ -4197,11 +4237,16 @@ impl App {
 
             if !step.is_terminal() && self.step_state(&step) == StepState::Ready {
                 act.steps.pop_front();
+                act.approved = None;
                 act.done += 1;
                 continue;
             }
 
-            if let Some(prompt) = self.step_conflict(&step) {
+            // A conflict the user has already accepted is not asked about
+            // again: what blocked the step is gone, even if the resource it
+            // held has not come free yet.
+            let approved = act.approved.as_ref() == Some(&step);
+            if let Some(prompt) = self.step_conflict(&step).filter(|_| !approved) {
                 // Two steps of one plan fighting each other is a broken config;
                 // say so and move on instead of asking to undo our own work.
                 let self_inflicted = prompt
@@ -4219,6 +4264,7 @@ impl App {
                     );
                     self.flash(msg, true);
                     act.steps.pop_front();
+                    act.approved = None;
                     act.done += 1;
                     continue;
                 }
@@ -4233,6 +4279,7 @@ impl App {
             match outcome {
                 StartOutcome::Started => {
                     act.steps.pop_front();
+                    act.approved = None;
                     if step.is_terminal() {
                         act.done += 1;
                     } else {
@@ -4253,7 +4300,9 @@ impl App {
         }
     }
 
-    /// Accept or refuse the conflict prompt; accepting resumes the plan.
+    /// Accept or refuse the conflict prompt. Accepting clears what is in the
+    /// way and then goes on with the step itself: a plan carries on where a
+    /// plan raised it, and the step is started on its own where a tab did.
     fn resolve_conflict(&mut self, accept: bool) {
         let Some(c) = self.conflict.take() else {
             return;
@@ -4278,12 +4327,27 @@ impl App {
                 a.stop();
             }
         }
-        if let Some(note) = c.note {
-            evicted.push(note);
+        if let Some(note) = &c.note {
+            evicted.push(note.clone());
         }
         if !evicted.is_empty() {
             self.flash(format!("for {}: {}", c.step.describe(), evicted.join(", ")), false);
         }
+        let Some(act) = self.activation.as_mut() else {
+            // Raised straight from a tab, so there is no plan to resume.
+            match self.start_step(&c.step) {
+                StartOutcome::Started => {}
+                StartOutcome::Retry => {
+                    let msg = format!("{} is not ready yet — try again", c.step.describe());
+                    self.flash(msg, true);
+                }
+                StartOutcome::Failed(why) => {
+                    self.flash(format!("{}: {why}", c.step.describe()), true)
+                }
+            }
+            return;
+        };
+        act.approved = Some(c.step);
         self.advance_activation();
     }
 
@@ -4776,6 +4840,20 @@ mod tests {
         }
     }
 
+    fn rdp_conn(name: &str, vpn: &str) -> RdpConnection {
+        RdpConnection {
+            name: name.into(),
+            group: String::new(),
+            host: "10.0.0.1".into(),
+            port: 3389,
+            domain: String::new(),
+            username: "user".into(),
+            extra_args: String::new(),
+            depends_on: String::new(),
+            requires_vpn: vpn.into(),
+        }
+    }
+
     fn names(steps: &[Step]) -> Vec<String> {
         steps.iter().map(Step::short).collect()
     }
@@ -5093,6 +5171,44 @@ mod tests {
             .build_plan(vec![Step::Ssh("login".into())])
             .unwrap_err();
         assert!(err.contains("'deleted'"), "{err}");
+    }
+
+    #[test]
+    fn only_what_is_up_and_asks_for_the_profile_counts_as_a_rider() {
+        let ts = vec![
+            tunnel("up-on-home", "netbird:home", ""),
+            tunnel("down-on-home", "netbird:home", ""),
+            tunnel("on-work", "netbird:work", ""),
+        ];
+        let conns = vec![rdp_conn("desk", "netbird:home"), rdp_conn("other", "")];
+        let cat = Catalog {
+            tunnels: &ts,
+            ssh_hosts: &[],
+            rdp_conns: &conns,
+        };
+        let (tunnels, rdp) =
+            cat.riders_of("netbird:home", &|n| n == "up-on-home", &|n| n == "desk");
+        assert_eq!(tunnels, ["up-on-home"]);
+        assert_eq!(rdp, ["desk"]);
+    }
+
+    #[test]
+    fn a_legacy_bare_profile_name_rides_on_the_same_netbird_profile() {
+        // "home" is how a requirement was written before there was more than
+        // one client, so it must count against netbird:home.
+        let ts = vec![tunnel("legacy", "home", "")];
+        let cat = catalog(&ts, &[]);
+        let (tunnels, _) = cat.riders_of("netbird:home", &|_| true, &|_| true);
+        assert_eq!(tunnels, ["legacy"]);
+    }
+
+    #[test]
+    fn nothing_rides_on_a_profile_no_one_asks_for() {
+        // The switch then goes through without a prompt.
+        let ts = vec![tunnel("a", "netbird:work", "")];
+        let cat = catalog(&ts, &[]);
+        let (tunnels, rdp) = cat.riders_of("netbird:home", &|_| true, &|_| true);
+        assert!(tunnels.is_empty() && rdp.is_empty());
     }
 
     #[test]
