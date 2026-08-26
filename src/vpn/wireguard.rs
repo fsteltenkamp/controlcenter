@@ -316,6 +316,7 @@ pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<WireguardProfile>) {
                 active: up.contains(&p.interface()),
                 name: p.name.clone(),
                 detail: p.summary(),
+                foreign: None,
             })
             .collect();
 
@@ -359,12 +360,14 @@ fn action(tx: Sender<VpnMsg>, desc: String, argv: Vec<String>, stored: Vec<Wireg
     });
 }
 
+/// Bring a profile up. Returns the command line it launched, for the log; the
+/// config it needs is written first, and a failure there means nothing ran.
 pub fn connect(
     tx: Sender<VpnMsg>,
     profile: WireguardProfile,
     dir: &Path,
     stored: Vec<WireguardProfile>,
-) {
+) -> Vec<String> {
     let desc = format!("bringing up '{}'", profile.name);
     let path = match write_conf(&profile, dir) {
         Ok(p) => p,
@@ -374,7 +377,7 @@ pub fn connect(
                 desc,
                 error: Some(e),
             });
-            return;
+            return Vec::new();
         }
     };
     let argv = vec![
@@ -382,7 +385,9 @@ pub fn connect(
         "up".to_string(),
         path.to_string_lossy().into_owned(),
     ];
+    let ran = vec![as_root(&argv)];
     action(tx, desc, argv, stored);
+    ran
 }
 
 pub fn disconnect(
@@ -390,7 +395,7 @@ pub fn disconnect(
     profile: WireguardProfile,
     dir: &Path,
     stored: Vec<WireguardProfile>,
-) {
+) -> Vec<String> {
     // `wg-quick down` also accepts a bare interface name, which is what we want
     // when the config was never written or has since been deleted.
     let path = conf_path(&profile, dir);
@@ -400,7 +405,14 @@ pub fn disconnect(
         profile.interface()
     };
     let argv = vec!["wg-quick".to_string(), "down".to_string(), target];
-    action(tx, format!("taking down '{}'", profile.name), argv, stored)
+    let ran = vec![as_root(&argv)];
+    action(tx, format!("taking down '{}'", profile.name), argv, stored);
+    ran
+}
+
+/// How the log writes a command that went through the escalation helper.
+fn as_root(argv: &[String]) -> String {
+    format!("{} (as root)", argv.join(" "))
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 use crate::browser::FileBrowser;
 use crate::config::{self, AppConfig, Paths};
+use crate::logs::{Entry, Journal, LogTarget, Ring};
 use crate::rdp::{self, ActiveRdp, RdpStatus};
+use crate::report;
 use crate::ssh::{self, SessionOutcome};
 use crate::theme::{self, Theme};
 use crate::tunnel::{self, ActiveTunnel, Status};
@@ -11,7 +13,8 @@ use crate::types::{
 };
 use crate::ui;
 use crate::vpn::openvpn::{self, ActiveOvpn, OvpnStatus};
-use crate::vpn::{self, wireguard, ProviderId, VpnEnv, VpnMsg, VpnProfile, VpnStatus};
+use crate::vpn::scan::{self, Foreign, LinkKind, Scan};
+use crate::vpn::{self, privileged, wireguard, ProviderId, VpnEnv, VpnMsg, VpnProfile, VpnStatus};
 use crate::Tui;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -21,6 +24,13 @@ use std::time::{Duration, Instant};
 
 pub const THROUGHPUT_HISTORY: usize = 120;
 const VPN_REFRESH_SECS: u64 = 5;
+/// How often the machine is swept for VPN connections controlcenter is not
+/// holding. The same clock as a status poll: an orphan is only interesting
+/// while the user is looking at a connection that will not stay up.
+const SCAN_SECS: u64 = 5;
+/// How often the sudo ticket is refreshed, when there is one. Comfortably
+/// inside sudo's default five-minute timeout.
+const TICKET_REFRESH: Duration = Duration::from_secs(120);
 /// How long a dependent connection waits for its tunnel to come up.
 const DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bringing a VPN up may sit through a browser login, so it gets much longer.
@@ -112,8 +122,6 @@ pub enum FormMode {
     Add,
     Edit(usize),
     DeleteConfirm(usize),
-    /// Full-screen view of the selected tunnel's ssh output.
-    Logs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,8 +611,6 @@ pub enum RdpMode {
         collected: Vec<Step>,
         input: String,
     },
-    /// Full-screen log view of the selected session.
-    Logs,
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +856,22 @@ impl Step {
             Self::Tunnel(n) => format!("tun {n}"),
             Self::Ssh(n) => format!("ssh {n}"),
             Self::Rdp { name, .. } => format!("rdp {name}"),
+        }
+    }
+
+    /// The log this step's news belongs in. A VPN requirement that names no
+    /// provider is nobody's in particular, so it goes to the program's.
+    pub fn log_target(&self) -> LogTarget {
+        match self {
+            Self::Vpn(req) => match parse_vpn_requirement(req).and_then(|r| {
+                r.provider.map(|p| (p, r.profile.unwrap_or_default()))
+            }) {
+                Some((provider, profile)) => LogTarget::Vpn(provider, profile),
+                None => LogTarget::Program,
+            },
+            Self::Tunnel(n) => LogTarget::Tunnel(n.clone()),
+            Self::Ssh(n) => LogTarget::Ssh(n.clone()),
+            Self::Rdp { name, .. } => LogTarget::Rdp(name.clone()),
         }
     }
 
@@ -1137,12 +1159,27 @@ impl ProviderState {
         self.profiles.get(self.selected)
     }
 
-    /// The profile that is up, as the provider reports it.
+    /// The profile that is up, as the provider reports it. A connection
+    /// controlcenter is not holding never speaks for the client: it is
+    /// reported so it can be dealt with, not counted as this client being up.
     pub fn active_profile(&self) -> Option<&str> {
-        self.status
-            .active_profile
-            .as_deref()
-            .or_else(|| self.profiles.iter().find(|p| p.active).map(|p| p.name.as_str()))
+        self.status.active_profile.as_deref().or_else(|| {
+            self.profiles
+                .iter()
+                .find(|p| p.active && p.is_stored())
+                .map(|p| p.name.as_str())
+        })
+    }
+
+    /// The rows that are stored profiles, i.e. the ones `a`, `e`, `d` and `p`
+    /// mean anything on.
+    pub fn stored(&self) -> impl Iterator<Item = &VpnProfile> {
+        self.profiles.iter().filter(|p| p.is_stored())
+    }
+
+    /// The connections found on the machine that this client is not holding.
+    pub fn foreign(&self) -> impl Iterator<Item = &VpnProfile> {
+        self.profiles.iter().filter(|p| !p.is_stored())
     }
 
     fn clamp_selection(&mut self) {
@@ -1565,8 +1602,19 @@ pub enum VpnMode {
         provider: ProviderId,
         edit: Option<usize>,
     },
-    /// Full-screen log of the selected OpenVPN session.
-    Logs,
+}
+
+/// The log pane, which is the same popup on every tab: it shows what
+/// controlcenter did about one connection merged with what the process it
+/// started printed, and it is the only place a report is exported from.
+///
+/// There is one of these rather than one per tab, because a log is a log — see
+/// [`LogTarget`] for what a pane can be about.
+pub struct LogPane {
+    pub target: LogTarget,
+    /// How many lines back from the newest the view is scrolled. 0 follows the
+    /// tail, which is what a log that is still being written wants.
+    pub scroll: usize,
 }
 
 /// Whether a key closes a popup that only displays something — a log, the
@@ -1619,6 +1667,19 @@ impl PanicSummary {
     }
 }
 
+/// What quitting would leave behind, while it asks what to do about it.
+///
+/// Only OpenVPN sessions: a tunnel is an ssh child that goes when the terminal
+/// does, an RDP or SSH session is a window the user can see, but an OpenVPN
+/// session is a *root* process started through pkexec, and once controlcenter
+/// is gone nothing is left that knows how to reach it. Left running it keeps
+/// holding the server's slot, and the next attempt at the same profile is
+/// thrown off it every couple of minutes by the one still there.
+pub struct QuitPrompt {
+    /// `profile — state`, one line each.
+    pub sessions: Vec<String>,
+}
+
 struct ReconnectState {
     next_at: Instant,
     attempts: u32,
@@ -1637,6 +1698,8 @@ pub struct App {
     pub show_keys: bool,
     /// What `x` is about to tear down, while it asks whether to.
     pub panic: Option<PanicSummary>,
+    /// What quitting would leave running as root, while it asks whether to.
+    pub quit_prompt: Option<QuitPrompt>,
     pub theme: Theme,
     pub status_msg: Option<(String, bool, Instant)>,
     pub paths: Paths,
@@ -1649,6 +1712,17 @@ pub struct App {
     pub vpn_mode: VpnMode,
     /// OpenVPN sessions, owned the same way RDP sessions are.
     pub ovpn_active: HashMap<String, ActiveOvpn>,
+    /// What the last sweep of the machine found: every VPN process and tunnel
+    /// device, whoever started it. Subtracting the sessions above is what
+    /// [`App::foreign_for`] does.
+    pub scan: Scan,
+    scan_at: Instant,
+    /// A sweep is on a thread and has not reported back yet.
+    scan_pending: bool,
+    /// Processes that have already been sent a `SIGTERM` from here, so a second
+    /// attempt on one that ignored it can escalate.
+    termed: std::collections::HashSet<u32>,
+    ticket_at: Instant,
     pub rdp_conns: Vec<RdpConnection>,
     pub rdp_active: HashMap<String, ActiveRdp>,
     pub rdp_rows: Vec<RowItem>,
@@ -1673,6 +1747,11 @@ pub struct App {
     pub ssh_windows: HashMap<String, Vec<ssh::WindowSession>>,
     /// Where a session opens: its own window, or this terminal.
     pub ssh_launcher: ssh::Launch,
+    /// The log pane, whichever tab opened it.
+    pub log_pane: Option<LogPane>,
+    /// Everything controlcenter has done this run, for the log panes and the
+    /// reports they export.
+    pub journal: Journal,
     /// The file picker, open over whichever form asked for it.
     pub browser: Option<FileBrowser>,
     /// Plan currently being executed, if any.
@@ -1722,6 +1801,7 @@ impl App {
             show_help: false,
             show_keys: false,
             panic: None,
+            quit_prompt: None,
             theme,
             status_msg: None,
             paths,
@@ -1732,6 +1812,12 @@ impl App {
             vpn_form: VpnForm::empty(ProviderId::Wireguard),
             vpn_mode: VpnMode::None,
             ovpn_active: HashMap::new(),
+            scan: Scan::default(),
+            // Far enough in the past that the first tick sweeps.
+            scan_at: Instant::now() - Duration::from_secs(SCAN_SECS * 2),
+            scan_pending: false,
+            termed: std::collections::HashSet::new(),
+            ticket_at: Instant::now(),
             rdp_conns,
             rdp_active: HashMap::new(),
             rdp_rows: Vec::new(),
@@ -1749,6 +1835,8 @@ impl App {
             ssh_last: HashMap::new(),
             ssh_windows: HashMap::new(),
             ssh_launcher: ssh::resolve_launch(&app_config_terminal),
+            log_pane: None,
+            journal: Journal::default(),
             browser: None,
             activation: None,
             conflict: None,
@@ -1880,6 +1968,182 @@ impl App {
         self.status_msg = Some((msg.into(), is_error, Instant::now()));
     }
 
+    // -----------------------------------------------------------------------
+    // Log panes
+    //
+    // One pane, opened from every tab with `l` and exported with `s`. What it
+    // shows is what controlcenter did about a connection merged with what the
+    // process it started printed — the two halves of any answer to "why did
+    // that not come up".
+    // -----------------------------------------------------------------------
+
+    /// Record something in the log of the connection it is about, without
+    /// saying it in the status bar. The mechanics go here — a command line, an
+    /// exit code — while what the user has to read now goes through
+    /// [`Self::report`].
+    fn note(&mut self, target: LogTarget, msg: impl Into<String>) {
+        self.journal.note(target, msg);
+    }
+
+    /// Say it in the status bar *and* keep it in the log of what it is about,
+    /// so it outlives the few seconds a flash lasts.
+    fn report(&mut self, target: LogTarget, msg: impl Into<String>, is_error: bool) {
+        let msg = msg.into();
+        if is_error {
+            self.journal.fail(target, msg.clone());
+        } else {
+            self.journal.note(target, msg.clone());
+        }
+        self.flash(msg, is_error);
+    }
+
+    /// The line buffers a pane on `target` shows. An SSH host has none: its
+    /// session runs in a terminal window of its own, and its output stays
+    /// there — what controlcenter knows about it is in the journal instead.
+    fn rings_for(&self, target: &LogTarget) -> Vec<&Ring> {
+        let mut rings: Vec<&Ring> = Vec::new();
+        for (name, a) in &self.active {
+            if target.covers(&LogTarget::Tunnel(name.clone())) {
+                rings.push(&a.stderr_log);
+            }
+        }
+        for (name, a) in &self.rdp_active {
+            if target.covers(&LogTarget::Rdp(name.clone())) {
+                rings.push(&a.log);
+            }
+        }
+        for (name, a) in &self.ovpn_active {
+            if target.covers(&LogTarget::Vpn(ProviderId::Openvpn, name.clone())) {
+                rings.push(&a.log);
+            }
+        }
+        rings
+    }
+
+    /// What a pane shows, oldest first.
+    pub fn log_lines(&self, target: &LogTarget) -> Vec<Entry> {
+        let mut lines = self.journal.entries_for(target);
+        for ring in self.rings_for(target) {
+            lines.extend(ring.all());
+        }
+        lines.sort_by_key(|e| e.at);
+        lines
+    }
+
+    /// What `l` and `s` act on with a tab in front: the connection under the
+    /// cursor, or the whole program on the Dashboard, which watches everything
+    /// and owns nothing.
+    fn selection_target(&self) -> Result<LogTarget, String> {
+        let entry = |what: &str| Err(format!("a group has no log of its own — pick {what}"));
+        match self.tab {
+            Tab::Dashboard => Ok(LogTarget::Program),
+            Tab::Vpn => {
+                let id = self.vpn.current_id();
+                Ok(match self.vpn.current().selected_profile() {
+                    Some(p) => LogTarget::Vpn(id, p.name.clone()),
+                    None => LogTarget::vpn(id),
+                })
+            }
+            Tab::Tunnels => match self.rows.get(self.selected) {
+                Some(RowItem::Item(i)) => Ok(LogTarget::Tunnel(self.tunnels[*i].name.clone())),
+                Some(RowItem::Group(_)) => entry("a tunnel"),
+                None => Err("no tunnel is configured yet".into()),
+            },
+            Tab::Ssh => match self.selected_ssh_host() {
+                Some(i) => Ok(LogTarget::Ssh(self.ssh_hosts[i].name.clone())),
+                None if self.ssh_rows.is_empty() => Err("no ssh host is configured yet".into()),
+                None => entry("a host"),
+            },
+            Tab::Rdp => match self.selected_rdp_conn() {
+                Some(i) => Ok(LogTarget::Rdp(self.rdp_conns[i].name.clone())),
+                None if self.rdp_rows.is_empty() => {
+                    Err("no rdp connection is configured yet".into())
+                }
+                None => entry("a connection"),
+            },
+        }
+    }
+
+    /// `l` on any tab.
+    fn open_log(&mut self) {
+        match self.selection_target() {
+            Ok(target) => {
+                self.log_pane = Some(LogPane {
+                    target,
+                    scroll: 0,
+                })
+            }
+            Err(why) => self.flash(why, true),
+        }
+    }
+
+    /// The pane is modal and means the same thing wherever it was opened, so
+    /// its keys are handled here rather than by the tab underneath it.
+    fn on_log_key(&mut self, key: KeyEvent) {
+        let Some(pane) = &self.log_pane else {
+            return;
+        };
+        let last = self.log_lines(&pane.target).len().saturating_sub(1);
+        let scroll_by = |app: &mut Self, delta: isize| {
+            if let Some(p) = &mut app.log_pane {
+                p.scroll = p.scroll.saturating_add_signed(delta).min(last);
+            }
+        };
+        match key.code {
+            KeyCode::Char('c') => self.clear_log(),
+            KeyCode::Char('s') => self.export_log(),
+            KeyCode::Up => scroll_by(self, 1),
+            KeyCode::Down => scroll_by(self, -1),
+            KeyCode::PageUp => scroll_by(self, 10),
+            KeyCode::PageDown => scroll_by(self, -10),
+            _ if closes_view(key) => self.log_pane = None,
+            _ => {}
+        }
+    }
+
+    /// `c` in the pane: throw away what is in it, on both sides of the merge.
+    fn clear_log(&mut self) {
+        let Some(target) = self.log_pane.as_ref().map(|p| p.target.clone()) else {
+            return;
+        };
+        for ring in self.rings_for(&target) {
+            ring.clear();
+        }
+        self.journal.clear_for(&target);
+        if let Some(pane) = &mut self.log_pane {
+            pane.scroll = 0;
+        }
+    }
+
+    /// `s`: write the report out and say where it went. It is deliberately far
+    /// more than the pane shows — the whole configuration, every command line
+    /// and everything controlcenter did — because the file is read somewhere
+    /// else, by someone or something without the program in front of them.
+    fn export_log(&mut self) {
+        let target = match self.log_pane.as_ref().map(|p| p.target.clone()) {
+            Some(t) => t,
+            None => match self.selection_target() {
+                Ok(t) => t,
+                Err(why) => {
+                    self.flash(why, true);
+                    return;
+                }
+            },
+        };
+        // Every file of one export shares a name, so the report can link to
+        // the logs written beside it.
+        let stem = report::file_stem(&target, std::time::SystemTime::now());
+        let written = report::build(self, &target, &stem);
+        match report::write(&self.paths.reports_dir, &stem, &written) {
+            Ok(path) => self.report(
+                target,
+                format!("report written to {}", path.display()),
+                false,
+            ),
+            Err(e) => self.report(target, format!("report failed: {e}"), true),
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         // The help and keybind overlays only display: any key closes them, and
         // the key for the other one swaps straight over to it.
@@ -1897,6 +2161,24 @@ impl App {
                     self.show_help = false;
                     self.show_keys = false;
                 }
+            }
+            return;
+        }
+        // The quit prompt is modal over everything: nothing else can matter
+        // while the question is whether the program is still going to be here.
+        if self.quit_prompt.is_some() {
+            match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Enter => {
+                    self.quit_prompt = None;
+                    self.stop_all_openvpn();
+                    self.should_quit = true;
+                }
+                KeyCode::Char('k') | KeyCode::Char('K') => {
+                    self.quit_prompt = None;
+                    self.leave_openvpn_running();
+                    self.should_quit = true;
+                }
+                _ => self.quit_prompt = None,
             }
             return;
         }
@@ -1925,6 +2207,12 @@ impl App {
             self.on_browser_key(key);
             return;
         }
+        // The log pane is one popup for the whole program, so it is handled
+        // before anything that belongs to a single tab.
+        if self.log_pane.is_some() {
+            self.on_log_key(key);
+            return;
+        }
         match self.form_mode.clone() {
             FormMode::Add | FormMode::Edit(_) => {
                 self.on_form_key(key);
@@ -1937,14 +2225,6 @@ impl App {
                         self.form_mode = FormMode::None;
                     }
                     _ => self.form_mode = FormMode::None,
-                }
-                return;
-            }
-            FormMode::Logs => {
-                if key.code == KeyCode::Char('c') {
-                    self.clear_tunnel_log();
-                } else if closes_view(key) {
-                    self.form_mode = FormMode::None;
                 }
                 return;
             }
@@ -1967,11 +2247,15 @@ impl App {
         // the same thing everywhere are handled here, and only what is left
         // reaches the tab under the cursor.
         match key.code {
-            // No popup left to close, so q closes the application itself.
-            KeyCode::Char('q') => self.should_quit = true,
+            // No popup left to close, so q closes the application itself —
+            // once it has settled what happens to anything running as root.
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => {}
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('k') => self.show_keys = true,
+            // Exporting is the same act everywhere: write down what happened
+            // to whatever is selected, in full.
+            KeyCode::Char('s') => self.export_log(),
             KeyCode::Char('t') => {
                 self.theme = theme::next(self.theme.name);
                 self.app_config.ui.theme = self.theme.name.to_string();
@@ -2011,7 +2295,14 @@ impl App {
                 st.profiles
                     .iter()
                     .filter(|p| p.active)
-                    .map(|p| format!("{}:{}", st.id.slug(), p.name))
+                    .map(|p| {
+                        let name = format!("{}:{}", st.id.slug(), p.name);
+                        if p.is_stored() {
+                            name
+                        } else {
+                            format!("{name} (not started here)")
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -2050,6 +2341,10 @@ impl App {
         self.activation = None;
         self.conflict = None;
         self.reconnect.clear();
+        self.note(
+            LogTarget::Program,
+            format!("panic: taking down {}", summary.lines().join(", ")),
+        );
 
         for name in self.active.keys().cloned().collect::<Vec<_>>() {
             self.stop_tunnel(&name);
@@ -2068,7 +2363,8 @@ impl App {
         for id in ProviderId::ALL {
             self.vpn_disconnect_all(id);
         }
-        self.flash(
+        self.report(
+            LogTarget::Program,
             format!("disconnected everything: {}", summary.lines().join(", ")),
             false,
         );
@@ -2076,15 +2372,27 @@ impl App {
 
     /// Take down whatever of this client is up. WireGuard and OpenVPN can hold
     /// several profiles at once, so each one gets its own call.
+    ///
+    /// Connections controlcenter is not holding go too. The panic button means
+    /// "nothing is left up", and an orphan is exactly the thing most likely to
+    /// still be there afterwards holding the link open.
     fn vpn_disconnect_all(&mut self, id: ProviderId) {
+        let foreign: Vec<Foreign> = self
+            .vpn
+            .get(id)
+            .foreign()
+            .filter_map(|p| p.foreign.clone())
+            .collect();
+        for target in foreign {
+            self.spawn_foreign_stop(id, target);
+        }
         if !self.vpn.get(id).installed {
             return;
         }
         let active: Vec<String> = self
             .vpn
             .get(id)
-            .profiles
-            .iter()
+            .stored()
             .filter(|p| p.active)
             .map(|p| p.name.clone())
             .collect();
@@ -2115,16 +2423,18 @@ impl App {
                     self.vpn.get_mut(id).error = None;
                     self.refresh_provider(id);
                 }
+                self.refresh_scan();
                 self.flash("refreshing every VPN client", false);
             }
             KeyCode::Char('c') => self.clear_finished_everywhere(),
+            // The dashboard watches everything, so its log is everything.
+            KeyCode::Char('l') => self.open_log(),
             KeyCode::Enter
             | KeyCode::Char(' ')
             | KeyCode::Char('a')
             | KeyCode::Char('e')
             | KeyCode::Char('d')
-            | KeyCode::Char('p')
-            | KeyCode::Char('l') => self.flash(
+            | KeyCode::Char('p') => self.flash(
                 "the dashboard only watches — act on the VPN, Tunnels, SSH or RDP tab",
                 false,
             ),
@@ -2217,23 +2527,10 @@ impl App {
                 "tunnels authenticate with a key or an agent — no password is stored",
                 false,
             ),
-            KeyCode::Char('l') => match self.selected_active_tunnel() {
-                Some(_) => self.form_mode = FormMode::Logs,
-                None => self.flash("no ssh output — this tunnel is not running", true),
-            },
+            KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_tunnels(),
             _ => {}
         }
-    }
-
-    /// The tunnel under the cursor, when there is a running ssh behind it to
-    /// show output for.
-    pub fn selected_active_tunnel(&self) -> Option<&str> {
-        let Some(RowItem::Item(i)) = self.rows.get(self.selected) else {
-            return None;
-        };
-        let name = self.tunnels.get(*i)?.name.as_str();
-        self.active.contains_key(name).then_some(name)
     }
 
     /// `r` on the Tunnels tab: stop and start again what is under the cursor —
@@ -2280,15 +2577,6 @@ impl App {
     }
 
     /// `c` in the tunnel log view: throw away what ssh has said so far.
-    fn clear_tunnel_log(&mut self) {
-        let Some(name) = self.selected_active_tunnel().map(str::to_string) else {
-            return;
-        };
-        if let Some(active) = self.active.get(&name) {
-            active.stderr_log.lock().unwrap().clear();
-        }
-    }
-
     // -----------------------------------------------------------------------
     // VPN
     // -----------------------------------------------------------------------
@@ -2340,14 +2628,18 @@ impl App {
             KeyCode::Char('a') => self.open_vpn_form(None),
             KeyCode::Char('e') => {
                 let idx = self.vpn.current().selected;
-                if self.vpn_profile_count() > 0 {
+                if self.selected_foreign().is_some() {
+                    self.foreign_row_note("edit");
+                } else if self.vpn_profile_count() > 0 {
                     self.open_vpn_form(Some(idx));
                 }
             }
             KeyCode::Char('d') => {
                 let provider = self.vpn.current_id();
                 let idx = self.vpn.current().selected;
-                if !provider.manages_profiles() {
+                if self.selected_foreign().is_some() {
+                    self.foreign_row_note("delete");
+                } else if !provider.manages_profiles() {
                     self.flash("netbird profiles are managed by netbird itself", true);
                 } else if self.vpn_profile_count() > 0 {
                     self.vpn_mode = VpnMode::DeleteConfirm { provider, idx };
@@ -2357,23 +2649,11 @@ impl App {
                 let id = self.vpn.current_id();
                 self.vpn.get_mut(id).error = None;
                 self.refresh_provider(id);
+                self.refresh_scan();
                 self.flash(format!("refreshing {}", id.slug()), false);
             }
             KeyCode::Char('p') => self.clear_vpn_password(),
-            KeyCode::Char('l') => {
-                let id = self.vpn.current_id();
-                if id == ProviderId::Openvpn {
-                    self.vpn_mode = VpnMode::Logs;
-                } else {
-                    self.flash(
-                        format!(
-                            "{} keeps no log here — only openvpn runs as a child process",
-                            id.slug()
-                        ),
-                        true,
-                    );
-                }
-            }
+            KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_vpn_finished(),
             _ => {}
         }
@@ -2384,6 +2664,10 @@ impl App {
     /// neither NetBird nor Tailscale holds credentials here.
     fn clear_vpn_password(&mut self) {
         let id = self.vpn.current_id();
+        if self.selected_foreign().is_some() {
+            self.foreign_row_note("forget a password for");
+            return;
+        }
         if id != ProviderId::Openvpn {
             self.flash(format!("{} profiles store no password", id.slug()), false);
             return;
@@ -2435,13 +2719,6 @@ impl App {
         );
     }
 
-    /// `c` in the openvpn log view: throw away what the session has said so far.
-    fn clear_vpn_log(&mut self) {
-        if let Some((_, session)) = self.selected_ovpn() {
-            session.log.lock().unwrap().clear();
-        }
-    }
-
     /// Fill a provider's profile list straight from `vpn.toml`.
     ///
     /// These profiles are controlcenter's own, so they are listed whether or not
@@ -2458,6 +2735,7 @@ impl App {
                     name: w.name.clone(),
                     active: false,
                     detail: w.summary(),
+                    foreign: None,
                 })
                 .collect(),
             ProviderId::Openvpn => {
@@ -2472,9 +2750,13 @@ impl App {
                     name: t.name.clone(),
                     active: false,
                     detail: String::new(),
+                    foreign: None,
                 })
                 .collect(),
-            ProviderId::Netbird => return,
+            ProviderId::Netbird => {
+                self.merge_foreign(id);
+                return;
+            }
         };
         // Carry the live state over: seeding runs on every poll, and dropping
         // the active flags until the background refresh lands would make the
@@ -2483,13 +2765,14 @@ impl App {
         state.profiles = seeded
             .into_iter()
             .map(|mut p| {
-                if let Some(known) = state.profiles.iter().find(|k| k.name == p.name) {
+                if let Some(known) = state.profiles.iter().find(|k| k.name == p.name && k.is_stored()) {
                     p.active = known.active;
                 }
                 p
             })
             .collect();
         state.clamp_selection();
+        self.merge_foreign(id);
     }
 
     fn refresh_provider(&mut self, id: ProviderId) {
@@ -2506,7 +2789,16 @@ impl App {
     }
 
     /// Enter on a profile: bring it up, or take it down if it already is.
+    ///
+    /// On a connection controlcenter is not holding there is only one thing it
+    /// can mean. Bringing one "up" is not ours to do — it is already up, and it
+    /// belongs to something else.
     fn vpn_toggle_selected(&mut self) {
+        if let Some(target) = self.selected_foreign() {
+            let id = self.vpn.current_id();
+            self.stop_foreign(id, target);
+            return;
+        }
         let state = self.vpn.current();
         let already_up = state.selected_profile().map(|p| p.active).unwrap_or(false);
         if already_up {
@@ -2514,6 +2806,22 @@ impl App {
         } else {
             self.vpn_connect_selected();
         }
+    }
+
+    /// Why a profile key does nothing on a row that is not a stored profile.
+    /// Every key means the same thing on every tab, so the ones that cannot
+    /// apply here say why rather than going quiet.
+    fn foreign_row_note(&mut self, what: &str) {
+        let name = self
+            .vpn
+            .current()
+            .selected_profile()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        self.flash(
+            format!("'{name}' was not started here — there is no profile to {what}; Enter stops it"),
+            false,
+        );
     }
 
     fn vpn_connect_selected(&mut self) {
@@ -2580,6 +2888,7 @@ impl App {
             return;
         }
         let profile = profile.map(str::to_string);
+        let target = LogTarget::Vpn(id, profile.clone().unwrap_or_default());
         let tx = self.vpn_tx.clone();
         let result = {
             let env = self.vpn_env();
@@ -2590,15 +2899,18 @@ impl App {
             }
         };
         match result {
-            Ok(()) => {
+            Ok(ran) => {
                 let state = self.vpn.get_mut(id);
                 state.error = None;
                 state.busy = Some(desc.clone());
+                for cmd in ran {
+                    self.note(target.clone(), format!("ran: {cmd}"));
+                }
                 self.flash(format!("{}: {desc}…", id.slug()), false);
             }
             Err(e) => {
                 self.vpn.get_mut(id).error = Some(e.clone());
-                self.flash(format!("{}: {e}", id.slug()), true);
+                self.report(target, format!("{}: {e}", id.slug()), true);
             }
         }
     }
@@ -2624,14 +2936,17 @@ impl App {
             self.flash(format!("openvpn profile '{name}' no longer exists"), true);
             return;
         };
+        let target = LogTarget::Vpn(ProviderId::Openvpn, name.to_string());
         match crate::vpn::openvpn::spawn(&profile, &self.paths.openvpn_dir, &self.paths.run_dir) {
             Ok(session) => {
+                let cmd = report::command_line(&session.argv);
                 self.ovpn_active.insert(name.to_string(), session);
+                self.note(target, format!("starting as root: {cmd}"));
                 self.flash(format!("openvpn: connecting '{name}'…"), false);
             }
             Err(e) => {
                 self.vpn.get_mut(ProviderId::Openvpn).error = Some(e.clone());
-                self.flash(format!("openvpn '{name}': {e}"), true);
+                self.report(target, format!("openvpn '{name}': {e}"), true);
             }
         }
         self.sync_openvpn();
@@ -2642,11 +2957,79 @@ impl App {
             self.flash(format!("openvpn '{name}' is not running"), true);
             return;
         };
+        let target = LogTarget::Vpn(ProviderId::Openvpn, name.to_string());
         match session.stop() {
-            Some(e) => self.flash(format!("openvpn '{name}': {e}"), true),
-            None => self.flash(format!("openvpn: '{name}' stopped"), false),
+            Some(e) => self.report(target, format!("openvpn '{name}': {e}"), true),
+            None => self.report(target, format!("openvpn: '{name}' stopped"), false),
         }
         self.sync_openvpn();
+    }
+
+    /// `q` with nothing left to close.
+    ///
+    /// Quitting is not free: an OpenVPN session runs as root, and controlcenter
+    /// is the only thing holding the pid that can stop it. Leaving one behind
+    /// is what puts an orphan on the machine, so the sessions still up get a
+    /// say in whether the program is allowed to walk away from them.
+    fn request_quit(&mut self) {
+        let mut live: Vec<String> = self
+            .ovpn_active
+            .iter()
+            .filter(|(_, s)| !matches!(s.status, OvpnStatus::Exited(_)))
+            .map(|(n, s)| format!("{n} — {}", s.status.label()))
+            .collect();
+        if live.is_empty() {
+            self.should_quit = true;
+            return;
+        }
+        live.sort();
+        match self.app_config.vpn.on_exit.trim().to_ascii_lowercase().as_str() {
+            "stop" => {
+                self.stop_all_openvpn();
+                self.should_quit = true;
+            }
+            "keep" => {
+                self.leave_openvpn_running();
+                self.should_quit = true;
+            }
+            _ => self.quit_prompt = Some(QuitPrompt { sessions: live }),
+        }
+    }
+
+    /// Take down every OpenVPN session controlcenter is holding.
+    fn stop_all_openvpn(&mut self) {
+        let names: Vec<String> = self.ovpn_active.keys().cloned().collect();
+        for name in names {
+            self.stop_openvpn(&name);
+        }
+    }
+
+    /// Quit with the sessions left up, and write down that this is what
+    /// happened — the next run will find them as orphans, and the log is where
+    /// it says where they came from.
+    fn leave_openvpn_running(&mut self) {
+        let names: Vec<String> = self
+            .ovpn_active
+            .iter()
+            .filter(|(_, s)| !matches!(s.status, OvpnStatus::Exited(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in &names {
+            let pid = self.ovpn_active[name].root_pid();
+            self.note(
+                LogTarget::Vpn(ProviderId::Openvpn, name.clone()),
+                match pid {
+                    Some(pid) => format!(
+                        "left running as root on exit (pid {pid}); stop it with `sudo kill {pid}`"
+                    ),
+                    None => "left running as root on exit".to_string(),
+                },
+            );
+        }
+        self.note(
+            LogTarget::Program,
+            format!("quit with {} openvpn session(s) left running", names.len()),
+        );
     }
 
     /// OpenVPN has no daemon to poll: its state is the sessions being held, so
@@ -2664,6 +3047,7 @@ impl App {
                     .get(&o.name)
                     .map(|s| s.status.label())
                     .unwrap_or_else(|| o.summary(&self.paths.openvpn_dir)),
+                foreign: None,
             })
             .collect();
 
@@ -2708,12 +3092,16 @@ impl App {
         state.status = status;
         state.error = error;
         state.last_refresh = Instant::now();
+        self.merge_foreign(ProviderId::Openvpn);
     }
 
     /// The files that came with the selected OpenVPN profile, so the panel can
     /// show what the profile actually consists of rather than just a path.
     pub fn openvpn_import_listing(&self) -> Option<(String, Vec<String>)> {
         let selected = self.vpn.get(ProviderId::Openvpn).selected_profile()?;
+        if !selected.is_stored() {
+            return None;
+        }
         let profile = self
             .vpn_cfg
             .openvpn
@@ -2731,10 +3119,246 @@ impl App {
         Some((profile.name.clone(), names))
     }
 
-    /// The session shown in the log view.
-    pub fn selected_ovpn(&self) -> Option<(&String, &ActiveOvpn)> {
-        let name = self.vpn.get(ProviderId::Openvpn).selected_profile()?;
-        self.ovpn_active.get_key_value(&name.name)
+    // -----------------------------------------------------------------------
+    // Connections controlcenter is not holding
+    //
+    // A session can outlive the program that started it — a crash, a kill, an
+    // exit while openvpn was up — and an orphan holding the server's slot is
+    // exactly what a profile that connects and drops every few minutes looks
+    // like from the inside. So the tab shows what is on the machine, not only
+    // what is in `ovpn_active`: [`crate::vpn::scan`] sweeps it, and everything
+    // below is that sweep minus what this process owns.
+    // -----------------------------------------------------------------------
+
+    /// Sweep the machine on a background thread. One at a time: a sweep reads
+    /// `/proc` and runs `ip` four times, and stacking those achieves nothing.
+    fn refresh_scan(&mut self) {
+        // A sweep that never reported back must not stop every later one. It
+        // cannot fail — `scan` returns its errors rather than panicking — but a
+        // flag that can only be cleared by a message is a flag worth a deadline.
+        if self.scan_pending && self.scan_at.elapsed() < Duration::from_secs(SCAN_SECS * 6) {
+            return;
+        }
+        self.scan_pending = true;
+        self.scan_at = Instant::now();
+        scan::spawn(self.vpn_tx.clone());
+    }
+
+    /// Ask for a sweep on the next tick rather than in the middle of whatever
+    /// is happening now — used after an action that should change the picture.
+    fn scan_soon(&mut self) {
+        self.scan_at = Instant::now() - Duration::from_secs(SCAN_SECS);
+    }
+
+    /// The client a tunnel device belongs to, where that can be told.
+    ///
+    /// A device is not labelled with its owner, so the only honest way to
+    /// attribute one is by what the clients themselves say: NetBird reports the
+    /// address it was given, Tailscale reports its own, and a WireGuard profile
+    /// names the interface it creates. A device that matches none of those is
+    /// left unattributed rather than guessed at.
+    pub fn claimant(&self, link: &scan::Link) -> Option<ProviderId> {
+        if self
+            .vpn_cfg
+            .wireguard
+            .iter()
+            .any(|w| w.interface() == link.name)
+        {
+            return Some(ProviderId::Wireguard);
+        }
+        // A session controlcenter is holding says in its own log which device
+        // it got, and an openvpn that was told which one to use says so on its
+        // command line. Those are the only direct links between the two halves
+        // of the sweep there are.
+        if self
+            .ovpn_active
+            .values()
+            .any(|s| s.device().as_deref() == Some(link.name.as_str()))
+        {
+            return Some(ProviderId::Openvpn);
+        }
+        if self
+            .scan
+            .processes_of(ProviderId::Openvpn)
+            .any(|p| p.dev() == Some(link.name.as_str()))
+        {
+            return Some(ProviderId::Openvpn);
+        }
+        // Otherwise the only evidence is what the clients report about
+        // themselves: NetBird and Tailscale each name the address they were
+        // given. Only the fields that are *about* an address are compared —
+        // a client's last log line can easily quote the same address a leaked
+        // device is still holding, and matching that would hide exactly the
+        // device this is here to find.
+        let bare = |a: &str| a.split('/').next().unwrap_or(a).to_string();
+        let addrs: Vec<String> = link.addrs.iter().map(|a| bare(a)).collect();
+        // "NetBird IP", "Tailscale IP", "Address", "Interface" — and not a
+        // key that merely happens to contain those two letters.
+        let addressy = |k: &str| {
+            let k = k.to_ascii_lowercase();
+            k == "ip" || k.ends_with(" ip") || k.contains("address") || k.contains("interface")
+        };
+        self.vpn
+            .providers
+            .iter()
+            .find(|state| {
+                state.status.connected
+                    && state.status.fields.iter().any(|(k, v)| {
+                        addressy(k)
+                            && (v == &link.name || addrs.iter().any(|a| v.contains(a.as_str())))
+                    })
+            })
+            .map(|state| state.id)
+    }
+
+    /// Every tunnel device the sweep found, with whatever client accounts for
+    /// it. The status pane shows these as evidence: a device nothing accounts
+    /// for is a tunnel that is up and that nothing here can name.
+    pub fn tunnel_devices(&self) -> Vec<(scan::Link, Option<ProviderId>)> {
+        self.scan
+            .tunnels()
+            .map(|l| (l.clone(), self.claimant(l)))
+            .collect()
+    }
+
+    /// The connections this client has on the machine that controlcenter is not
+    /// holding a session for.
+    ///
+    /// OpenVPN is the one that leaks, because its connection is a root process
+    /// that outlives us; a process is ours if we are holding a session that is
+    /// writing its pid file, which keeps a session that has not written the
+    /// file yet from being reported as its own orphan.
+    fn foreign_for(&self, id: ProviderId) -> Vec<Foreign> {
+        let mut out = Vec::new();
+        match id {
+            ProviderId::Openvpn => {
+                let live: Vec<&ActiveOvpn> = self
+                    .ovpn_active
+                    .values()
+                    .filter(|s| !matches!(s.status, OvpnStatus::Exited(_)))
+                    .collect();
+                for p in self.scan.processes_of(ProviderId::Openvpn) {
+                    let held = live.iter().any(|s| {
+                        s.root_pid() == Some(p.pid)
+                            || p.pid_file()
+                                .is_some_and(|f| std::path::Path::new(f) == s.pid_file())
+                    });
+                    if !held {
+                        out.push(Foreign::Process(p.clone()));
+                    }
+                }
+                // What the process scan cannot see: the devices of sessions
+                // that are already gone. See [`scan::leaked_ovpn_devices`].
+                let ours: Vec<String> = live.iter().filter_map(|s| s.device()).collect();
+                let unaccounted = !out.is_empty();
+                out.extend(
+                    scan::leaked_ovpn_devices(&self.scan, &ours, unaccounted)
+                        .into_iter()
+                        .map(Foreign::Interface),
+                );
+            }
+            ProviderId::Wireguard => {
+                for link in self.scan.tunnels() {
+                    if link.kind == LinkKind::Wireguard && self.claimant(link).is_none() {
+                        out.push(Foreign::Interface(link.clone()));
+                    }
+                }
+            }
+            // NetBird and Tailscale are daemons: their own status already
+            // reports the machine rather than this process, so there is nothing
+            // here they could be holding without knowing it.
+            ProviderId::Netbird | ProviderId::Tailscale => {}
+        }
+        out
+    }
+
+    /// Put the foreign rows at the end of a client's profile list. Called
+    /// wherever that list is rebuilt, and idempotent, so the two can happen in
+    /// either order.
+    fn merge_foreign(&mut self, id: ProviderId) {
+        let run_dir = self.paths.run_dir.clone();
+        let rows: Vec<VpnProfile> = self
+            .foreign_for(id)
+            .into_iter()
+            .map(|f| VpnProfile {
+                name: f.name(),
+                // It is up: that is the entire point of reporting it.
+                active: true,
+                detail: f.detail(&run_dir),
+                foreign: Some(f),
+            })
+            .collect();
+        let state = self.vpn.get_mut(id);
+        state.profiles.retain(|p| p.is_stored());
+        state.profiles.extend(rows);
+        state.clamp_selection();
+    }
+
+    /// How many connections controlcenter is not holding, across every client.
+    pub fn foreign_count(&self) -> usize {
+        self.vpn
+            .providers
+            .iter()
+            .map(|state| state.foreign().count())
+            .sum()
+    }
+
+    /// The row under the cursor, when it is a connection controlcenter is not
+    /// holding.
+    fn selected_foreign(&self) -> Option<Foreign> {
+        self.vpn.current().selected_profile()?.foreign.clone()
+    }
+
+    /// Take down something controlcenter did not start.
+    ///
+    /// Runs on a thread like every other VPN action, and reports back through
+    /// the same channel. A second attempt on the same process sends `SIGKILL`:
+    /// the first one has already been ignored, and an openvpn that will not
+    /// leave keeps the server's slot for as long as it stays.
+    fn stop_foreign(&mut self, id: ProviderId, target: Foreign) {
+        if let Some(busy) = &self.vpn.get(id).busy {
+            self.flash(format!("{} is busy ({busy})", id.slug()), true);
+            return;
+        }
+        self.spawn_foreign_stop(id, target);
+    }
+
+    /// The same without the busy guard, for the panic button: "take everything
+    /// down" cannot stop at the first client that is already doing something.
+    fn spawn_foreign_stop(&mut self, id: ProviderId, target: Foreign) {
+        // A process that has already been asked once and is still here gets
+        // the signal it cannot ignore.
+        let force = match &target {
+            Foreign::Process(p) => {
+                let again = self.termed.contains(&p.pid);
+                self.termed.insert(p.pid);
+                again
+            }
+            Foreign::Interface(_) => false,
+        };
+        let argv = target.stop_argv(force);
+        let name = target.name();
+        let desc = if force {
+            format!("killing '{name}' — it ignored SIGTERM")
+        } else {
+            format!("stopping '{name}', which was not started here")
+        };
+        let log_target = LogTarget::Vpn(id, name);
+        self.note(
+            log_target,
+            format!("as root: {}", report::command_line(&argv)),
+        );
+        self.vpn.get_mut(id).busy = Some(desc.clone());
+        self.flash(format!("{}: {desc}…", id.slug()), false);
+        let tx = self.vpn_tx.clone();
+        std::thread::spawn(move || {
+            let error = privileged::run(&argv).err();
+            let _ = tx.send(VpnMsg::ActionDone {
+                provider: id,
+                desc,
+                error,
+            });
+        });
     }
 
     // ----- profile forms ----------------------------------------------------
@@ -2767,13 +3391,6 @@ impl App {
     fn on_vpn_modal_key(&mut self, key: KeyEvent) {
         match self.vpn_mode.clone() {
             VpnMode::None => {}
-            VpnMode::Logs => {
-                if key.code == KeyCode::Char('c') {
-                    self.clear_vpn_log();
-                } else if closes_view(key) {
-                    self.vpn_mode = VpnMode::None;
-                }
-            }
             VpnMode::DeleteConfirm { provider, idx } => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -3106,15 +3723,7 @@ impl App {
                 "the RDP password is asked for on connect and never stored",
                 false,
             ),
-            KeyCode::Char('l') => {
-                if let Some(i) = self.selected_rdp_conn() {
-                    if self.rdp_active.contains_key(&self.rdp_conns[i].name) {
-                        self.rdp_mode = RdpMode::Logs;
-                    } else {
-                        self.flash("no session (and no logs) for this connection", true);
-                    }
-                }
-            }
+            KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => {
                 // Clear a finished session entry (keeps running ones).
                 if let Some(i) = self.selected_rdp_conn() {
@@ -3243,13 +3852,6 @@ impl App {
                 }
                 _ => {}
             },
-            RdpMode::Logs => {
-                if key.code == KeyCode::Char('c') {
-                    self.clear_rdp_log();
-                } else if closes_view(key) {
-                    self.rdp_mode = RdpMode::None;
-                }
-            }
         }
     }
 
@@ -3314,16 +3916,6 @@ impl App {
     }
 
     /// `c` in the RDP log view: throw away what the session has said so far.
-    fn clear_rdp_log(&mut self) {
-        let Some(i) = self.selected_rdp_conn() else {
-            return;
-        };
-        let name = self.rdp_conns[i].name.clone();
-        if let Some(active) = self.rdp_active.get(&name) {
-            active.log.lock().unwrap().clear();
-        }
-    }
-
     fn spawn_rdp(&mut self, name: &str, password: &str) {
         let Some(conn) = self.rdp_conns.iter().find(|c| c.name == name).cloned() else {
             self.flash(format!("rdp connection '{name}' is gone"), true);
@@ -3333,12 +3925,15 @@ impl App {
         if let Some(mut old) = self.rdp_active.remove(&conn.name) {
             old.stop();
         }
+        let target = LogTarget::Rdp(conn.name.clone());
         match rdp::spawn(&conn, password) {
             Ok(active) => {
+                let cmd = report::command_line(&active.argv);
                 self.rdp_active.insert(conn.name.clone(), active);
+                self.note(target, format!("starting: {cmd}"));
                 self.flash(format!("connecting to '{}'", conn.name), false);
             }
-            Err(e) => self.flash(format!("'{}': {e:#}", conn.name), true),
+            Err(e) => self.report(target, format!("'{}': {e:#}", conn.name), true),
         }
     }
 
@@ -3445,32 +4040,9 @@ impl App {
             // another one — the same thing Enter does.
             KeyCode::Char('r') => self.open_selected_ssh(),
             KeyCode::Char('p') => self.clear_stored_password(),
-            KeyCode::Char('l') => self.show_ssh_outcome(),
+            KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_ssh(),
             _ => {}
-        }
-    }
-
-    /// `l` on the SSH tab. The session runs in a terminal window of its own, so
-    /// its output is there rather than here; what controlcenter knows is how
-    /// the last one ended.
-    fn show_ssh_outcome(&mut self) {
-        let Some(i) = self.selected_ssh_host() else {
-            return;
-        };
-        let name = self.ssh_hosts[i].name.clone();
-        match self.ssh_last.get(&name) {
-            Some(outcome) => {
-                let label = outcome.label();
-                self.flash(
-                    format!("'{name}': {label} — a session's output stays in its own window"),
-                    false,
-                )
-            }
-            None => self.flash(
-                "sessions run in a terminal window of their own — no log is kept here",
-                false,
-            ),
         }
     }
 
@@ -3678,13 +4250,21 @@ impl App {
         let Some(host) = self.ssh_hosts.iter().find(|h| h.name == name).cloned() else {
             return Ok(());
         };
+        let target = LogTarget::Ssh(host.name.clone());
         if !host.password.is_empty() && !self.sshpass_installed {
-            self.flash(
+            self.report(
+                target,
                 format!("'{}' has a stored password but sshpass is not on PATH", host.name),
                 true,
             );
             return Ok(());
         }
+        // The session's own output goes to its window or to this terminal, so
+        // the command line is the one thing about it worth keeping here.
+        self.note(
+            target.clone(),
+            format!("opening in {}: {}", self.ssh_launcher.label(), ssh::command_preview(&host)),
+        );
 
         match self.ssh_launcher.clone() {
             ssh::Launch::Window(term) => {
@@ -3696,9 +4276,9 @@ impl App {
                             .push(session);
                         self.ssh_last.remove(&host.name);
                         let msg = format!("'{}' opened in a new {} window", host.name, term.name());
-                        self.flash(msg, false);
+                        self.report(target, msg, false);
                     }
-                    Err(e) => self.flash(format!("'{}': {e:#}", host.name), true),
+                    Err(e) => self.report(target, format!("'{}': {e:#}", host.name), true),
                 }
                 return Ok(());
             }
@@ -3712,11 +4292,16 @@ impl App {
 
         match result {
             Ok(outcome) => {
-                let msg = format!("'{}' session {}", host.name, outcome.label());
+                let msg = format!(
+                    "'{}' session {} after {}",
+                    host.name,
+                    outcome.label(),
+                    ui::fmt_duration(outcome.duration)
+                );
                 self.ssh_last.insert(host.name.clone(), outcome);
-                self.flash(msg, outcome.failed());
+                self.report(target, msg, outcome.failed());
             }
-            Err(e) => self.flash(format!("'{}': {e:#}", host.name), true),
+            Err(e) => self.report(target, format!("'{}': {e:#}", host.name), true),
         }
         Ok(())
     }
@@ -3740,6 +4325,14 @@ impl App {
         }
         self.ssh_windows.retain(|_, v| !v.is_empty());
         for (name, outcome) in finished {
+            self.journal.note(
+                LogTarget::Ssh(name.clone()),
+                format!(
+                    "session {} after {}",
+                    outcome.label(),
+                    ui::fmt_duration(outcome.duration)
+                ),
+            );
             self.ssh_last.insert(name, outcome);
         }
     }
@@ -3845,12 +4438,13 @@ impl App {
 
     /// The chain a connection would run through, for the details panels.
     pub fn chain_of(&self, step: Step) -> Result<Vec<String>, String> {
-        Ok(self
-            .catalog()
-            .build_plan(vec![step])?
-            .iter()
-            .map(Step::short)
-            .collect())
+        Ok(self.plan_for(step)?.iter().map(Step::short).collect())
+    }
+
+    /// The steps a connection would be brought up through, itself last. What
+    /// the details panels show as a chain, and what a report scopes itself to.
+    pub fn plan_for(&self, step: Step) -> Result<Vec<Step>, String> {
+        self.catalog().build_plan(vec![step])
     }
 
     /// Start a plan for the given targets, or report why it cannot be built.
@@ -3869,10 +4463,17 @@ impl App {
         let steps = match self.catalog().build_plan(targets) {
             Ok(s) => s,
             Err(e) => {
-                self.flash(format!("{target}: {e}"), true);
+                self.report(LogTarget::Program, format!("{target}: {e}"), true);
                 return;
             }
         };
+        self.note(
+            LogTarget::Program,
+            format!(
+                "activating {target}: {}",
+                steps.iter().map(Step::short).collect::<Vec<_>>().join(" → ")
+            ),
+        );
         self.activation = Some(Activation {
             total: steps.len(),
             steps: steps.into(),
@@ -3912,7 +4513,9 @@ impl App {
             Some(name) => {
                 // WireGuard and OpenVPN can hold several at once, so the profile
                 // list is the truth there, not a single "active" field.
-                state.profiles.iter().any(|p| p.active && &p.name == name)
+                state
+                    .stored()
+                    .any(|p| p.active && &p.name == name)
                     || state.active_profile() == Some(name.as_str())
             }
         }
@@ -4045,11 +4648,15 @@ impl App {
                     let env = self.vpn_env();
                     vpn::connect(id, tx, env, profile.as_deref())
                 };
+                let target = LogTarget::Vpn(id, profile.unwrap_or_default());
                 match result {
-                    Ok(()) => {
+                    Ok(ran) => {
                         let state = self.vpn.get_mut(id);
                         state.error = None;
                         state.busy = Some(desc);
+                        for cmd in ran {
+                            self.note(target.clone(), format!("ran: {cmd}"));
+                        }
                         StartOutcome::Started
                     }
                     Err(e) => StartOutcome::Failed(e),
@@ -4197,6 +4804,16 @@ impl App {
 
     /// Drive the plan as far as it will go without blocking.
     fn advance_activation(&mut self) {
+        /// News about one step of a plan. A plan for a single connection is
+        /// named after that connection, so saying both would say it twice.
+        fn plan_msg(act: &Activation, step: &Step, what: &str) -> String {
+            if act.target == step.describe() {
+                format!("{} {what}", step.describe())
+            } else {
+                format!("{}: {} {what}", act.target, step.describe())
+            }
+        }
+
         if self.conflict.is_some() {
             return;
         }
@@ -4216,13 +4833,13 @@ impl App {
                         return;
                     }
                     StepState::Waiting => {
-                        let msg = format!("{}: {} timed out", act.target, step.describe());
-                        self.flash(msg, true);
+                        let msg = plan_msg(&act, &step, "timed out");
+                        self.report(step.log_target(), msg, true);
                         return;
                     }
                     StepState::Failed(why) => {
-                        let msg = format!("{}: {} failed — {why}", act.target, step.describe());
-                        self.flash(msg, true);
+                        let msg = plan_msg(&act, &step, &format!("failed — {why}"));
+                        self.report(step.log_target(), msg, true);
                         return;
                     }
                 }
@@ -4231,7 +4848,7 @@ impl App {
 
             let Some(step) = act.steps.front().cloned() else {
                 let msg = format!("{} started", act.target);
-                self.flash(msg, false);
+                self.report(LogTarget::Program, msg, false);
                 return;
             };
 
@@ -4262,7 +4879,7 @@ impl App {
                         prompt.resource,
                         prompt.stop_tunnels.join(", ")
                     );
-                    self.flash(msg, true);
+                    self.report(step.log_target(), msg, true);
                     act.steps.pop_front();
                     act.approved = None;
                     act.done += 1;
@@ -4293,7 +4910,7 @@ impl App {
                 }
                 StartOutcome::Failed(why) => {
                     let msg = format!("{}: {why}", act.target);
-                    self.flash(msg, true);
+                    self.report(step.log_target(), msg, true);
                     return;
                 }
             }
@@ -4315,7 +4932,11 @@ impl App {
             } else {
                 format!(" — {} stays", blocking.join(", "))
             };
-            self.flash(format!("{} cancelled{detail}", c.step.describe()), true);
+            self.report(
+                c.step.log_target(),
+                format!("{} cancelled{detail}", c.step.describe()),
+                true,
+            );
             return;
         }
         let mut evicted = c.blocking();
@@ -4331,7 +4952,8 @@ impl App {
             evicted.push(note.clone());
         }
         if !evicted.is_empty() {
-            self.flash(format!("for {}: {}", c.step.describe(), evicted.join(", ")), false);
+            let msg = format!("for {}: {}", c.step.describe(), evicted.join(", "));
+            self.report(c.step.log_target(), msg, false);
         }
         let Some(act) = self.activation.as_mut() else {
             // Raised straight from a tab, so there is no plan to resume.
@@ -4339,10 +4961,11 @@ impl App {
                 StartOutcome::Started => {}
                 StartOutcome::Retry => {
                     let msg = format!("{} is not ready yet — try again", c.step.describe());
-                    self.flash(msg, true);
+                    self.report(c.step.log_target(), msg, true);
                 }
                 StartOutcome::Failed(why) => {
-                    self.flash(format!("{}: {why}", c.step.describe()), true)
+                    let msg = format!("{}: {why}", c.step.describe());
+                    self.report(c.step.log_target(), msg, true)
                 }
             }
             return;
@@ -4633,12 +5256,15 @@ impl App {
 
     fn start_tunnel(&mut self, idx: usize) {
         let t = self.tunnels[idx].clone();
+        let target = LogTarget::Tunnel(t.name.clone());
         match tunnel::spawn(&t) {
             Ok(active) => {
+                let cmd = report::command_line(&active.argv);
                 self.reconnect.remove(&t.name);
                 self.active.insert(t.name.clone(), active);
+                self.note(target, format!("starting: {cmd}"));
             }
-            Err(e) => self.flash(format!("'{}': {e:#}", t.name), true),
+            Err(e) => self.report(target, format!("'{}': {e:#}", t.name), true),
         }
     }
 
@@ -4646,28 +5272,71 @@ impl App {
         self.reconnect.remove(name);
         if let Some(mut t) = self.active.remove(name) {
             t.stop();
+            self.note(LogTarget::Tunnel(name.to_string()), "stopped");
         }
     }
 
     fn on_tick(&mut self) {
         let dt = self.last_tick.elapsed().as_secs_f64().max(0.5);
         let mut total_rate = 0u64;
-        for active in self.active.values_mut() {
+        // Polling needs the sessions mutably and recording needs the journal,
+        // so what changed is collected first and written down afterwards.
+        let mut changed: Vec<(LogTarget, String, bool)> = Vec::new();
+        for (name, active) in self.active.iter_mut() {
+            let before = active.status;
             active.poll();
             active.sample_rates(dt);
             total_rate += active.rate_tx + active.rate_rx;
+            if active.status != before {
+                let detail = match &active.error {
+                    Some(e) => format!("{} — {e}", active.status.label()),
+                    None => active.status.label().to_string(),
+                };
+                changed.push((
+                    LogTarget::Tunnel(name.clone()),
+                    detail,
+                    active.status == Status::Failed,
+                ));
+            }
         }
         if self.throughput_history.len() >= THROUGHPUT_HISTORY {
             self.throughput_history.pop_front();
         }
         self.throughput_history.push_back(total_rate);
 
-        for session in self.rdp_active.values_mut() {
+        for (name, session) in self.rdp_active.iter_mut() {
+            let before = session.status;
             session.poll();
+            if session.status != before {
+                changed.push((
+                    LogTarget::Rdp(name.clone()),
+                    session.status.label(),
+                    matches!(session.status, RdpStatus::Exited(c) if c != 0),
+                ));
+            }
         }
         self.poll_ssh_windows();
-        for session in self.ovpn_active.values_mut() {
+        for (name, session) in self.ovpn_active.iter_mut() {
+            let before = session.status;
             session.poll();
+            if session.status != before {
+                let detail = match session.fault() {
+                    Some(f) => format!("{} — {f}", session.status.label()),
+                    None => session.status.label(),
+                };
+                changed.push((
+                    LogTarget::Vpn(ProviderId::Openvpn, name.clone()),
+                    detail,
+                    matches!(session.status, OvpnStatus::Exited(c) if c != 0),
+                ));
+            }
+        }
+        for (target, detail, failed) in changed {
+            if failed {
+                self.journal.fail(target, detail);
+            } else {
+                self.journal.note(target, detail);
+            }
         }
         self.sync_openvpn();
 
@@ -4689,6 +5358,14 @@ impl App {
         for id in due {
             self.refresh_provider(id);
         }
+        // The sweep is nobody's client, so it runs on a clock of its own.
+        if self.scan_at.elapsed() >= Duration::from_secs(SCAN_SECS) {
+            self.refresh_scan();
+        }
+        if self.ticket_at.elapsed() >= TICKET_REFRESH {
+            self.ticket_at = Instant::now();
+            privileged::keep_warm();
+        }
 
         self.handle_reconnects();
         self.advance_activation();
@@ -4702,11 +5379,30 @@ impl App {
 
     fn drain_vpn(&mut self) {
         while let Ok(msg) = self.vpn_rx.try_recv() {
-            let id = msg.provider();
             match msg {
+                // What is on the machine belongs to no one client, so it is
+                // merged into every one of them.
+                VpnMsg::Scanned(found) => {
+                    self.scan_pending = false;
+                    if let Some(e) = &found.error {
+                        self.note(LogTarget::Program, format!("scanning for VPN connections: {e}"));
+                    }
+                    self.scan = found;
+                    for id in ProviderId::ALL {
+                        self.merge_foreign(id);
+                    }
+                    // A process that has gone can never need a SIGKILL, and its
+                    // pid will eventually belong to something else.
+                    let live: Vec<u32> =
+                        self.scan.processes.iter().map(|p| p.pid).collect();
+                    self.termed.retain(|pid| live.contains(pid));
+                }
                 VpnMsg::Refreshed {
-                    profiles, status, ..
+                    provider: id,
+                    profiles,
+                    status,
                 } => {
+                    let mut listing_failed = None;
                     let state = self.vpn.get_mut(id);
                     match profiles {
                         Ok(p) => {
@@ -4714,19 +5410,42 @@ impl App {
                             state.clamp_selection();
                             state.error = None;
                         }
-                        Err(e) => state.error = Some(e),
+                        Err(e) => {
+                            state.error = Some(e.clone());
+                            listing_failed = Some(e);
+                        }
                     }
                     state.status = status;
                     state.last_refresh = Instant::now();
+                    self.merge_foreign(id);
+                    // A poll that failed is worth keeping: it is usually the
+                    // reason a step later times out waiting for this client.
+                    if let Some(e) = listing_failed {
+                        self.journal.fail(LogTarget::vpn(id), format!("status: {e}"));
+                    }
                 }
-                VpnMsg::ActionDone { desc, error, .. } => {
+                VpnMsg::ActionDone {
+                    provider: id,
+                    desc,
+                    error,
+                } => {
                     self.vpn.get_mut(id).busy = None;
+                    // Whatever it was, the machine is not what it was.
+                    self.scan_soon();
                     match error {
                         Some(e) => {
                             self.vpn.get_mut(id).error = Some(e.clone());
-                            self.flash(format!("{} {desc} failed: {e}", id.slug()), true);
+                            self.report(
+                                LogTarget::vpn(id),
+                                format!("{} {desc} failed: {e}", id.slug()),
+                                true,
+                            );
                         }
-                        None => self.flash(format!("{}: {desc} done", id.slug()), false),
+                        None => self.report(
+                            LogTarget::vpn(id),
+                            format!("{}: {desc} done", id.slug()),
+                            false,
+                        ),
                     }
                 }
             }
@@ -4780,7 +5499,11 @@ impl App {
                     }
                     self.active.insert(name.clone(), fresh);
                     self.reconnect.remove(&name);
-                    self.flash(format!("reconnecting '{name}'"), false);
+                    self.report(
+                        LogTarget::Tunnel(name.clone()),
+                        format!("reconnecting '{name}' (attempt {attempts})"),
+                        false,
+                    );
                 }
                 Err(_) => {
                     self.reconnect.insert(
@@ -4907,10 +5630,40 @@ mod tests {
                     name: (*n).to_string(),
                     active: false,
                     detail: String::new(),
+                    foreign: None,
                 })
                 .collect();
         }
         view
+    }
+
+    #[test]
+    fn a_connection_controlcenter_is_not_holding_never_speaks_for_the_client() {
+        let mut view = view_with(&[(ProviderId::Openvpn, &["work"])]);
+        let state = &mut view.providers[ProviderId::Openvpn.index()];
+        state.profiles.push(VpnProfile {
+            name: "orphan".into(),
+            // It is up — that is why it is listed at all.
+            active: true,
+            detail: "pid 4242 · root · not started here".into(),
+            foreign: Some(scan::Foreign::Process(scan::Process {
+                pid: 4242,
+                provider: ProviderId::Openvpn,
+                argv: vec!["/usr/bin/openvpn".into(), "--config".into(), "/etc/x.ovpn".into()],
+                uid: 0,
+                age_secs: Some(60),
+            })),
+        });
+        // The client is not "on" the orphan's profile: nothing here brought it
+        // up, so nothing here may report it as the profile that is active.
+        assert_eq!(state.active_profile(), None);
+        assert_eq!(state.stored().count(), 1);
+        assert_eq!(state.foreign().count(), 1);
+        assert_eq!(state.foreign().next().unwrap().name, "orphan");
+
+        // And once one of ours really is up, that is the one that answers.
+        state.profiles[0].active = true;
+        assert_eq!(state.active_profile(), Some("work"));
     }
 
     #[test]

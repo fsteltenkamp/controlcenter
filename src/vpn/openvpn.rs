@@ -8,16 +8,15 @@
 //! signal it: `child.kill()` only ever reaches pkexec. That is why openvpn is
 //! started with `--writepid` and stopped by an escalated `kill`.
 
-use super::privileged;
+use super::{privileged, scan};
+use crate::logs::Ring;
 use crate::types::OpenvpnProfile;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
-
-const LOG_CAP: usize = 400;
+use std::time::{Duration, Instant};
 
 /// openvpn says this once, and only once the tunnel is actually usable.
 const CONNECTED_MARKER: &str = "Initialization Sequence Completed";
@@ -45,30 +44,33 @@ pub struct ActiveOvpn {
     child: Child,
     pub status: OvpnStatus,
     pub started_at: Instant,
-    pub log: Arc<Mutex<Vec<String>>>,
+    pub log: Arc<Ring>,
+    /// The command line the session was started with, for the log pane and the
+    /// report it exports. openvpn runs as root, so this is what pkexec was
+    /// handed rather than a shell command anyone could repeat.
+    pub argv: Vec<String>,
     /// Set once openvpn reports the tunnel is up.
     connected: Arc<Mutex<bool>>,
     /// Set when openvpn reports something the user has to fix, e.g. bad
     /// credentials — otherwise a wrong password just looks like "exited (1)".
     fault: Arc<Mutex<Option<String>>>,
+    /// The interface openvpn said it opened. Read as the log goes past rather
+    /// than searched for afterwards — see [`ActiveOvpn::device`].
+    device: Arc<Mutex<Option<String>>>,
     /// Where openvpn wrote the pid of the process that actually holds the tunnel.
     pid_file: PathBuf,
-}
-
-fn push_log(log: &Arc<Mutex<Vec<String>>>, line: String) {
-    let mut log = log.lock().unwrap();
-    if log.len() >= LOG_CAP {
-        log.remove(0);
-    }
-    log.push(line);
+    /// The `.ovpn` this session is running. Kept so the process can still be
+    /// found when the pid file cannot be read — see [`ActiveOvpn::holders`].
+    config: PathBuf,
 }
 
 /// Tail the child's output, and pick the two lines out of it that mean something.
 fn tail_lines(
     reader: impl Read + Send + 'static,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Ring>,
     connected: Arc<Mutex<bool>>,
     fault: Arc<Mutex<Option<String>>>,
+    device: Arc<Mutex<Option<String>>>,
 ) {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
@@ -82,7 +84,10 @@ fn tail_lines(
             if let Some(fatal) = fault_in(trimmed) {
                 *fault.lock().unwrap() = Some(fatal);
             }
-            push_log(&log, trimmed.to_string());
+            if let Some(dev) = device_in_line(trimmed) {
+                *device.lock().unwrap() = Some(dev.to_string());
+            }
+            log.push(trimmed);
         }
     });
 }
@@ -435,8 +440,8 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
     let pid_file = pid_file_for(&p.name, run_dir);
     let _ = std::fs::remove_file(&pid_file);
 
-    let args = build_args(p, &config, &pid_file);
-    let mut cmd = privileged::command(&args)?;
+    let argv = build_args(p, &config, &pid_file);
+    let mut cmd = privileged::command(&argv)?;
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -452,15 +457,17 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
         // Dropping stdin closes the pipe so openvpn cannot sit on a further prompt.
     }
 
-    let log = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new(Ring::new("openvpn"));
     let connected = Arc::new(Mutex::new(false));
     let fault = Arc::new(Mutex::new(None));
+    let device = Arc::new(Mutex::new(None));
     if let Some(stdout) = child.stdout.take() {
         tail_lines(
             stdout,
             Arc::clone(&log),
             Arc::clone(&connected),
             Arc::clone(&fault),
+            Arc::clone(&device),
         );
     }
     if let Some(stderr) = child.stderr.take() {
@@ -469,6 +476,7 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
             Arc::clone(&log),
             Arc::clone(&connected),
             Arc::clone(&fault),
+            Arc::clone(&device),
         );
     }
 
@@ -477,9 +485,12 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
         status: OvpnStatus::Connecting,
         started_at: Instant::now(),
         log,
+        argv,
         connected,
         fault,
+        device,
         pid_file,
+        config,
     })
 }
 
@@ -492,7 +503,7 @@ impl ActiveOvpn {
         if let Ok(Some(status)) = self.child.try_wait() {
             let code = status.code().unwrap_or(-1);
             self.status = OvpnStatus::Exited(code);
-            push_log(&self.log, format!("── openvpn exited ({code}) ──"));
+            self.log.push(format!("── openvpn exited ({code}) ──"));
             let _ = std::fs::remove_file(&self.pid_file);
             return;
         }
@@ -510,8 +521,15 @@ impl ActiveOvpn {
         self.fault.lock().unwrap().clone()
     }
 
+    /// The file openvpn was told to write its pid into. Identifies the session
+    /// from the outside: a process carrying this `--writepid` is this session,
+    /// whether or not it has got round to writing the file yet.
+    pub fn pid_file(&self) -> &Path {
+        &self.pid_file
+    }
+
     /// The pid openvpn wrote, i.e. the root process actually holding the tunnel.
-    fn root_pid(&self) -> Option<u32> {
+    pub fn root_pid(&self) -> Option<u32> {
         std::fs::read_to_string(&self.pid_file)
             .ok()?
             .trim()
@@ -519,17 +537,46 @@ impl ActiveOvpn {
             .ok()
     }
 
+    /// Every process holding this session's tunnel.
+    ///
+    /// Normally exactly one, and normally the pid `--writepid` left behind. The
+    /// pid file is not enough on its own: openvpn writes it a moment after it
+    /// starts, so a session cancelled during connect has none, and a session
+    /// that restarted itself can leave a stale one. `/proc` is asked as well
+    /// and anything running this session's config, or writing this session's
+    /// pid file, is counted — the whole point of stopping is that nothing is
+    /// left behind, so this errs towards finding one process too many rather
+    /// than one too few.
+    pub fn holders(&self) -> Vec<u32> {
+        let mut pids: Vec<u32> = Vec::new();
+        if let Some(pid) = self.root_pid().filter(|p| alive(*p)) {
+            pids.push(pid);
+        }
+        for p in scan::scan().processes_of(crate::vpn::ProviderId::Openvpn) {
+            let same_config = p.config().is_some_and(|c| Path::new(c) == self.config);
+            let same_pid_file = p.pid_file().is_some_and(|f| Path::new(f) == self.pid_file);
+            if (same_config || same_pid_file) && !pids.contains(&p.pid) {
+                pids.push(p.pid);
+            }
+        }
+        pids
+    }
+
     /// Stop the session. The tunnel process runs as root, so killing our own
-    /// child would only take down pkexec and leave the tunnel up; the pid from
-    /// `--writepid` is signalled through the escalation helper instead. That is
-    /// a second polkit prompt, and there is no way around it without a
-    /// management socket.
+    /// child would only take down pkexec and leave the tunnel up; the pids are
+    /// signalled through the escalation helper instead.
+    ///
+    /// A `SIGTERM` that is not obeyed is followed by a `SIGKILL`: an openvpn
+    /// left running is not a cosmetic failure, it keeps holding the server's
+    /// slot and the next connection to the same profile gets thrown off it
+    /// every couple of minutes by the one that is still there.
     pub fn stop(&mut self) -> Option<String> {
         let mut err = None;
-        if let Some(pid) = self.root_pid() {
-            if let Err(e) =
-                privileged::run(&["kill".to_string(), "-TERM".to_string(), pid.to_string()])
-            {
+        let pids = self.holders();
+        for pid in &pids {
+            let argv = kill_argv(*pid, false);
+            self.log.push(format!("── stopping: {} ──", argv.join(" ")));
+            if let Err(e) = privileged::run(&argv) {
                 err = Some(e);
             }
         }
@@ -537,6 +584,12 @@ impl ActiveOvpn {
         // half-dead session in the list.
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        for pid in pids {
+            if let Some(e) = wait_out_or_kill(pid, &self.log) {
+                err = Some(e);
+            }
+        }
         let _ = std::fs::remove_file(&self.pid_file);
         if !matches!(self.status, OvpnStatus::Exited(_)) {
             self.status = OvpnStatus::Exited(-1);
@@ -544,15 +597,88 @@ impl ActiveOvpn {
         err
     }
 
-    pub fn recent_log(&self, n: usize) -> Vec<String> {
-        let log = self.log.lock().unwrap();
-        log.iter().rev().take(n).rev().cloned().collect()
-    }
-
     /// The last line worth showing next to the status.
     pub fn last_line(&self) -> Option<String> {
-        self.log.lock().unwrap().last().cloned()
+        self.log.last_text()
     }
+
+    /// The interface this session is using.
+    ///
+    /// There is nowhere else to get it: `dev tun` in the config asks for the
+    /// first free number rather than a name, and a device is not labelled with
+    /// the process that opened it. openvpn does say which one it got, and the
+    /// last thing it said is the one it is on — a reconnect can move it.
+    /// Without this a live session's device would look like a leaked one.
+    pub fn device(&self) -> Option<String> {
+        self.device.lock().unwrap().clone()
+    }
+}
+
+/// The interface named in a line of openvpn output, in any of the ways openvpn
+/// has of naming it.
+fn device_in_line(line: &str) -> Option<&str> {
+    let after = |marker: &str| {
+        line.split_once(marker)
+            .map(|(_, rest)| rest.trim_start())
+            .and_then(|rest| rest.split([' ', ',']).next())
+            .filter(|name| !name.is_empty())
+    };
+    // DCO: "net_iface_new: add tun2 type ovpn", "DCO device tun2 opened",
+    // "ovpn-dco device [tun2] opened". Without it: "TUN/TAP device tun0
+    // opened", and on a soft restart "Preserving previous TUN/TAP instance:
+    // tun2".
+    for marker in [
+        "net_iface_new: add ",
+        "DCO device ",
+        "TUN/TAP device ",
+        "Preserving previous TUN/TAP instance: ",
+    ] {
+        if let Some(name) = after(marker) {
+            return Some(name);
+        }
+    }
+    line.split_once("device [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+}
+
+/// Signalling a pid, built in one place so a report shows what actually ran.
+pub fn kill_argv(pid: u32, force: bool) -> Vec<String> {
+    vec![
+        "kill".to_string(),
+        if force { "-KILL" } else { "-TERM" }.to_string(),
+        pid.to_string(),
+    ]
+}
+
+/// Is the process still there? `/proc` rather than `kill -0`, because a root
+/// process cannot be signalled from here just to ask.
+fn alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// How long a `SIGTERM` is given before the session is killed outright.
+/// openvpn tears its interface down and exits well inside this; anything that
+/// does not is stuck, and stuck is the case this whole path exists for.
+const TERM_GRACE: Duration = Duration::from_millis(1500);
+
+/// Wait for a signalled process to go, and kill it if it will not.
+fn wait_out_or_kill(pid: u32, log: &Ring) -> Option<String> {
+    let deadline = Instant::now() + TERM_GRACE;
+    while Instant::now() < deadline {
+        if !alive(pid) {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let argv = kill_argv(pid, true);
+    log.push(format!("── {pid} ignored SIGTERM: {} ──", argv.join(" ")));
+    if let Err(e) = privileged::run(&argv) {
+        return Some(format!("pid {pid} would not stop: {e}"));
+    }
+    thread::sleep(Duration::from_millis(200));
+    alive(pid).then(|| format!("pid {pid} is still running after SIGKILL"))
 }
 
 #[cfg(test)]
@@ -797,6 +923,20 @@ verb 3
             .collect();
         assert_eq!(missing, ["client.crt", "client.key", "ta.key"]);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_device_a_session_is_on_is_read_out_of_every_way_openvpn_names_it() {
+        let dev = |l: &str| device_in_line(l).map(str::to_string);
+        assert_eq!(dev("2026-08-26 14:17:28 net_iface_new: add tun2 type ovpn"), Some("tun2".into()));
+        assert_eq!(dev("2026-08-26 14:17:28 DCO device tun2 opened"), Some("tun2".into()));
+        assert_eq!(dev("2026-08-26 14:17:28 ovpn-dco device [tun2] opened"), Some("tun2".into()));
+        assert_eq!(dev("Mon Aug 24 TUN/TAP device tun0 opened"), Some("tun0".into()));
+        assert_eq!(
+            dev("2026-08-26 14:20:23 Preserving previous TUN/TAP instance: tun2"),
+            Some("tun2".into())
+        );
+        assert_eq!(dev("2026-08-26 14:17:28 Initialization Sequence Completed"), None);
     }
 
     #[test]

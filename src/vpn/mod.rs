@@ -8,6 +8,7 @@
 pub mod netbird;
 pub mod openvpn;
 pub mod privileged;
+pub mod scan;
 pub mod tailscale;
 pub mod wireguard;
 
@@ -99,6 +100,18 @@ pub struct VpnProfile {
     pub active: bool,
     /// Short summary shown next to the name — an endpoint, a remote, an exit node.
     pub detail: String,
+    /// Set when the row is not a stored profile at all but a connection found
+    /// on the machine that controlcenter is not holding: an orphan of an
+    /// earlier run, or something else's. It can be stopped and nothing else.
+    pub foreign: Option<scan::Foreign>,
+}
+
+impl VpnProfile {
+    /// Whether the row is a stored profile, i.e. whether the profile keys mean
+    /// anything on it.
+    pub fn is_stored(&self) -> bool {
+        self.foreign.is_none()
+    }
 }
 
 /// A provider's current state. `fields` is an ordered, untyped key/value list so
@@ -140,14 +153,8 @@ pub enum VpnMsg {
         desc: String,
         error: Option<String>,
     },
-}
-
-impl VpnMsg {
-    pub fn provider(&self) -> ProviderId {
-        match self {
-            Self::Refreshed { provider, .. } | Self::ActionDone { provider, .. } => *provider,
-        }
-    }
+    /// What is on the machine, whoever started it. Belongs to no one client.
+    Scanned(scan::Scan),
 }
 
 /// Files controlcenter generates for a VPN hold private keys and certificates,
@@ -208,21 +215,25 @@ pub fn refresh(p: ProviderId, tx: Sender<VpnMsg>, env: VpnEnv<'_>) {
 
 /// Bring `profile` up. `None` means "just connect", for providers that already
 /// know which profile they are on. OpenVPN is started by the app, not here.
+///
+/// The command lines that were actually launched come back, so the log pane can
+/// record what ran rather than what would have run.
 pub fn connect(
     p: ProviderId,
     tx: Sender<VpnMsg>,
     env: VpnEnv<'_>,
     profile: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     match p {
-        ProviderId::Netbird => {
-            netbird::connect(tx, profile);
-            Ok(())
-        }
+        ProviderId::Netbird => Ok(netbird::connect(tx, profile)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
-            wireguard::connect(tx, prof, env.wireguard_dir, env.cfg.wireguard.clone());
-            Ok(())
+            Ok(wireguard::connect(
+                tx,
+                prof,
+                env.wireguard_dir,
+                env.cfg.wireguard.clone(),
+            ))
         }
         ProviderId::Tailscale => {
             let name = profile.ok_or("pick a tailscale profile first")?;
@@ -232,8 +243,11 @@ pub fn connect(
                 .iter()
                 .find(|t| t.name == name)
                 .ok_or_else(|| format!("tailscale profile '{name}' no longer exists"))?;
-            tailscale::connect(tx, prof.clone(), env.cfg.tailscale.clone());
-            Ok(())
+            Ok(tailscale::connect(
+                tx,
+                prof.clone(),
+                env.cfg.tailscale.clone(),
+            ))
         }
         ProviderId::Openvpn => Err("openvpn sessions are started by the app".into()),
     }
@@ -245,21 +259,19 @@ pub fn disconnect(
     tx: Sender<VpnMsg>,
     env: VpnEnv<'_>,
     profile: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     match p {
-        ProviderId::Netbird => {
-            netbird::disconnect(tx);
-            Ok(())
-        }
+        ProviderId::Netbird => Ok(netbird::disconnect(tx)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
-            wireguard::disconnect(tx, prof, env.wireguard_dir, env.cfg.wireguard.clone());
-            Ok(())
+            Ok(wireguard::disconnect(
+                tx,
+                prof,
+                env.wireguard_dir,
+                env.cfg.wireguard.clone(),
+            ))
         }
-        ProviderId::Tailscale => {
-            tailscale::disconnect(tx, env.cfg.tailscale.clone());
-            Ok(())
-        }
+        ProviderId::Tailscale => Ok(tailscale::disconnect(tx, env.cfg.tailscale.clone())),
         ProviderId::Openvpn => Err("openvpn sessions are stopped by the app".into()),
     }
 }

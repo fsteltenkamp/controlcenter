@@ -15,9 +15,11 @@ file lives.
 | `vpn.toml` | WireGuard, OpenVPN and Tailscale profiles — may hold a key or a password | 0600 |
 | `wireguard/` | generated `.conf` files handed to `wg-quick` | 0700 |
 | `openvpn/<name>/` | imported `.ovpn` files and their certificates | 0700 |
+| `reports/` | reports exported from a log pane with `s` | 0700, files 0600 |
 
 NetBird is absent from `vpn.toml` on purpose: its profiles live in netbird and are only
-read.
+read. `reports/` is written to rather than read, and appears the first time you export
+one — see [logs.md](logs.md).
 
 ## config.toml
 
@@ -27,9 +29,29 @@ theme = "dark"                     # dark, dracula, nord, gruvbox — `t` cycles
 
 [ssh]
 terminal = "auto"                  # auto | inline | a terminal command line
+
+[vpn]
+sudo = "ask"                       # ask | auto | never
+on_exit = "ask"                    # ask | stop | keep
 ```
 
 `ssh.terminal` is explained in [connections.md](connections.md#ssh-sessions).
+
+`vpn.sudo` decides whether controlcenter takes a sudo ticket on your terminal before the
+TUI starts, so that taking a VPN down later needs no polkit dialog:
+
+| | |
+| --- | --- |
+| `ask` | ask for a password when there is no valid ticket (the default) |
+| `auto` | use a ticket that is already there, never ask |
+| `never` | leave sudo alone; every escalation goes through polkit |
+
+Nothing is asked for when no client that needs root is installed. `--sudo <mode>`
+overrides it for one run. See [vpn.md](vpn.md#root).
+
+`vpn.on_exit` decides what happens to OpenVPN sessions still up when you quit — `ask`
+(the default), `stop`, or `keep`. They run as root, so once controlcenter is gone nothing
+that is left knows how to reach them; `keep` is how orphans are made on purpose.
 
 ## tunnels.toml
 

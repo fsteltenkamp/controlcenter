@@ -17,7 +17,7 @@ cargo build --release
 | | | |
 | --- | --- | --- |
 | 1 | **Dashboard** | everything that is up: VPN state, tunnel counts and traffic, running RDP sessions, and the aggregate throughput sparkline |
-| 2 | **VPN** | NetBird, WireGuard, OpenVPN and Tailscale side by side — clients on the left, their profiles in the middle, status on the right |
+| 2 | **VPN** | NetBird, WireGuard, OpenVPN and Tailscale side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
 | 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running |
 | 5 | **RDP** | `xfreerdp3` sessions, running in the background with a log view |
@@ -39,11 +39,12 @@ Every key means the same thing on every tab. Only what it acts on changes.
 | `r` | reconnect / reload |
 | `p` | remove the stored password |
 | `l` | log |
+| `s` | save a report to a file |
 | `c` | clear — the log, or the entries that have finished |
 | `x` | **disconnect everything** — the panic button, from any tab |
 | `t` | cycle the colour theme |
 | `?` | help — `k` for the keys |
-| `q` | close what is focused; quits the application once nothing is left to close |
+| `q` | close what is focused; quits the application once nothing is left to close — asking first if that would leave an OpenVPN session running as root |
 
 Moving about:
 
@@ -51,7 +52,7 @@ Moving about:
 | --- | --- |
 | `1`–`5` | jump to a tab |
 | `Tab` / `Shift+Tab` | next / previous tab |
-| `↑` `↓` | move the selection |
+| `↑` `↓` | move the selection · scroll a log (`PgUp` `PgDn` by a screen) |
 | `←` `→` | switch pane (VPN) · change the field under the cursor (forms) |
 | `Esc` | cancel a form, close a popup |
 | `y` | confirm in a prompt |
@@ -64,26 +65,56 @@ moving.
 
 | | VPN | Tunnels | SSH | RDP |
 | --- | --- | --- | --- | --- |
-| `Enter` | connect the profile | start the tunnel | open a session | connect |
+| `Enter` | connect the profile, or stop a `◆` | start the tunnel | open a session | connect |
 | `a` `e` `d` | profile | tunnel | host | connection |
 | `r` | refresh this client now | restart it | open another session | reconnect |
 | `p` | forget an OpenVPN password | — keys only | forget the stored password | — never stored |
-| `l` | the OpenVPN session log | what ssh has printed | — it is in the window | the xfreerdp log |
+| `l` | the profile's log | the tunnel's log | the host's log | the connection's log |
+| `s` | a report about it | a report about it | a report about it | a report about it |
 | `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions |
 
 NetBird profiles are netbird's own, so `a` `e` `d` say so instead of editing them.
 Reconnecting an RDP session asks for the password again, because nothing keeps a copy.
 
+### Connections that are not ours
+
+The VPN tab lists what is up on the **machine**, not only what this program started. A
+session can outlive controlcenter — a crash, a `kill -9`, an exit while it was connected —
+and what is left is a root process, or the tun device it abandoned still holding the
+address, that nothing here is holding any more. The next connection to the same server
+then fights it for the slot and drops every few minutes.
+
+Those show up as `◆` rows under the client they belong to, saying what they are and how
+long they have been there. `Enter` takes one away — again to kill a process that ignored
+`SIGTERM` — and `x` takes them down with everything else. `controlcenter --vpn-scan`
+prints the same sweep from a shell. See [docs/vpn.md](docs/vpn.md).
+
 On a **group header** every one of these acts on all the members at once, as a single
-plan. On the **Dashboard** `r` refreshes every VPN client and `c` clears every finished
-entry everywhere; the keys that need something selected say which tab owns it.
+plan. On the **Dashboard** `r` refreshes every VPN client, `c` clears every finished entry
+everywhere, and `l` and `s` act on the whole program rather than on one connection; the
+keys that need something selected say which tab owns it.
+
+### Logs and reports
+
+`l` opens the same log pane on every tab: what controlcenter did about the thing under the
+cursor — the plan, the command line, the exit code — merged with what the process it
+started printed, each line stamped with the time.
+
+`s` writes a **report** to `~/.config/controlcenter/reports/` and says where it went. The
+report is more than the pane: the connection in full, every link of the chain it needs, the
+command line each one runs, everything controlcenter did about them, and the pane's whole
+log — and nothing it does not depend on. The chain's own logs go in a `.log` file beside
+it. On the Dashboard it covers the whole program instead. It is meant to be read away from
+here: sent to someone, or handed to an AI, to work out what went wrong. Passwords never
+appear; see [docs/logs.md](docs/logs.md).
 
 ### The panic button
 
 `x` works from any tab. It lists what is up and asks, then takes down every tunnel, RDP
-session, SSH window and VPN profile, abandons any activation in flight and stops
-auto-reconnect — nothing comes back on its own. Taking a VPN down needs root, so expect a
-polkit prompt for each one.
+session, SSH window and VPN profile — including the ones controlcenter did not start —
+abandons any activation in flight and stops auto-reconnect, so nothing comes back on its
+own. Taking a VPN down needs root: silent with a sudo ticket, otherwise a polkit prompt
+for each one.
 
 ### Popups
 
@@ -109,6 +140,12 @@ of you, and falls back to `sudo -n` when there is no agent to answer — a bare 
 ssh session. If neither works it says so instead of hanging. Status polling never
 escalates.
 
+A polkit dialog is the wrong thing to stand between you and a connection you are trying
+to take *down*: dismiss it, or have no agent to show it, and a root openvpn is left
+running that nothing on the machine can reach. So before the TUI starts — while the
+terminal is still yours — controlcenter runs `sudo -v` once, and every stop after that is
+silent. Set `vpn.sudo = "never"` in `config.toml`, or pass `--sudo never`, to skip it.
+
 ## Configuration
 
 Everything is edited in the TUI and stored as TOML under `~/.config/controlcenter/`, so
@@ -121,5 +158,6 @@ file lives.
   SSH sessions and passwords work
 - [docs/vpn.md](docs/vpn.md) — how each of the four VPN clients is driven, and what
   importing an OpenVPN profile does
+- [docs/logs.md](docs/logs.md) — the log pane, and what an exported report contains
 - [docs/configuration.md](docs/configuration.md) — every config file, field by field
 - [AGENTS.md](AGENTS.md) — instructions for AI agents working on this repository

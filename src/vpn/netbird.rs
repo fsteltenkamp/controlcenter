@@ -38,6 +38,7 @@ fn parse_profiles(raw: &str) -> Vec<VpnProfile> {
                 active: !rest.trim().is_empty(),
                 name,
                 detail: String::new(),
+                foreign: None,
             })
         })
         .collect()
@@ -123,16 +124,21 @@ pub fn connect_cmds(profile: Option<&str>) -> Vec<Vec<String>> {
     }
 }
 
-pub fn connect(tx: Sender<VpnMsg>, profile: Option<&str>) {
+/// Bring a profile up. Returns the command lines it launched, for the log.
+pub fn connect(tx: Sender<VpnMsg>, profile: Option<&str>) -> Vec<String> {
     let desc = match profile {
         Some(p) => format!("switching to profile '{p}'"),
         None => "connecting".to_string(),
     };
-    action(tx, desc, connect_cmds(profile));
+    let cmds = connect_cmds(profile);
+    let ran = cmds.iter().map(|c| format!("netbird {}", c.join(" "))).collect();
+    action(tx, desc, cmds);
+    ran
 }
 
-pub fn disconnect(tx: Sender<VpnMsg>) {
+pub fn disconnect(tx: Sender<VpnMsg>) -> Vec<String> {
     action(tx, "disconnecting".into(), vec![vec!["down".into()]]);
+    vec!["netbird down".to_string()]
 }
 
 #[cfg(test)]

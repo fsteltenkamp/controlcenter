@@ -110,7 +110,9 @@ Which terminal is used is `ssh.terminal` in `config.toml`:
   without one, `sh -c <command>` is appended
 
 The window runs ssh through `sh`, and on a non-zero exit it waits for Enter before closing
-so the error stays readable.
+so the error stays readable. Its output belongs to that window, so `l` on the SSH tab shows
+what controlcenter knows instead: the command line it ran, where the session opened, and
+how it ended — see [logs.md](logs.md).
 
 ## Passwords
 

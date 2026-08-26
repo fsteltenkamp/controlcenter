@@ -1,7 +1,9 @@
 mod app;
 mod browser;
 mod config;
+mod logs;
 mod rdp;
+mod report;
 mod ssh;
 mod theme;
 mod tunnel;
@@ -29,6 +31,13 @@ struct Cli {
     /// Print the resolved config paths and exit
     #[arg(long)]
     config_paths: bool,
+    /// Print every VPN connection on this machine and exit
+    #[arg(long)]
+    vpn_scan: bool,
+    /// Whether to take a sudo ticket before starting: ask, auto or never.
+    /// Overrides `vpn.sudo` in config.toml for this run.
+    #[arg(long, value_name = "ask|auto|never")]
+    sudo: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -45,6 +54,12 @@ fn main() -> Result<()> {
         println!("wireguard  : {}", paths.wireguard_dir.display());
         println!("openvpn    : {}", paths.openvpn_dir.display());
         println!("runtime    : {}", paths.run_dir.display());
+        println!("reports    : {}", paths.reports_dir.display());
+        return Ok(());
+    }
+
+    if cli.vpn_scan {
+        print_vpn_scan();
         return Ok(());
     }
 
@@ -60,11 +75,80 @@ fn main() -> Result<()> {
     let vpn_cfg = config::load_vpn(&paths.vpn_file)?;
     let app_config = config::load_app_config(&paths.config_file)?;
 
+    escalation_warm_up(&cli, &app_config);
+
     let mut terminal = init_terminal()?;
     let res = app::App::new(tunnels, rdp_conns, ssh_hosts, vpn_cfg, paths, app_config)
         .run(&mut terminal);
     restore_terminal(&mut terminal)?;
     res
+}
+
+/// `--vpn-scan`: what is on this machine, before the TUI is involved at all.
+///
+/// The same sweep the VPN tab runs, printed once. It is the fastest way to
+/// answer "is something already holding this tunnel" from a shell, and it needs
+/// no root — see [`vpn::scan`].
+fn print_vpn_scan() {
+    let scan = vpn::scan::scan();
+    if let Some(e) = &scan.error {
+        eprintln!("controlcenter: {e}");
+    }
+    println!("processes");
+    if scan.processes.is_empty() {
+        println!("  none");
+    }
+    for p in &scan.processes {
+        println!(
+            "  {:<8} pid {:<8} {}{}",
+            p.provider.slug(),
+            p.pid,
+            if p.root() { "root " } else { "" },
+            p.label()
+        );
+        println!("           {}", report::redact(&report::command_line(&p.argv)));
+    }
+    println!("\ntunnel devices");
+    let devices: Vec<_> = scan.tunnels().collect();
+    if devices.is_empty() {
+        println!("  none");
+    }
+    for link in devices {
+        println!("  {:<10} {}", link.name, link.detail());
+    }
+}
+
+/// Settle the question of root *before* the TUI takes the screen.
+///
+/// Taking a VPN down needs root, and the escalation that is always available
+/// once the alternate screen is up — a polkit dialog — is also the one that can
+/// be dismissed, or that never appears at all on a bare tty. A dismissed prompt
+/// there leaves a root openvpn running that nothing left on the machine knows
+/// how to reach. So this is the one moment where a password prompt can simply
+/// be typed at, and controlcenter uses it: with a sudo ticket in hand, stopping
+/// a connection later is silent and cannot fail for want of an agent.
+///
+/// Nothing is asked for when no client that needs root is installed, and
+/// nothing here handles a password: `sudo` prompts, on the user's own terminal.
+fn escalation_warm_up(cli: &Cli, app_config: &config::AppConfig) {
+    let mode = vpn::privileged::Warmup::from_str(
+        cli.sudo.as_deref().unwrap_or(&app_config.vpn.sudo),
+    );
+    let wanted = vpn::ProviderId::ALL
+        .into_iter()
+        .any(|p| p.needs_root() && vpn::installed(p));
+    if !wanted || mode == vpn::privileged::Warmup::Never {
+        return;
+    }
+    if vpn::privileged::will_ask(mode) {
+        println!(
+            "controlcenter: taking a sudo ticket so VPN sessions can be stopped without a \
+             dialog (set vpn.sudo = \"never\" in config.toml to skip this)."
+        );
+    }
+    if let Some(line) = vpn::privileged::warm_up(mode).line() {
+        println!("{line}");
+    }
 }
 
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;

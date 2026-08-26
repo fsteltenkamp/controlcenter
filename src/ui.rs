@@ -1,8 +1,9 @@
 use crate::app::{
-    App, FormField, FormMode, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab, VpnMode,
-    VpnPane, FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
+    App, FormField, FormMode, LogPane, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab,
+    VpnMode, VpnPane, FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
 };
 use crate::browser::FileBrowser;
+use crate::logs;
 use crate::rdp::RdpStatus;
 use crate::ssh;
 use crate::theme::{self, Theme};
@@ -87,7 +88,6 @@ pub fn render(f: &mut Frame, app: &App) {
         FormMode::None => {}
         FormMode::Add | FormMode::Edit(_) => render_form_overlay(f, app, area),
         FormMode::DeleteConfirm(i) => render_delete_confirm(f, app, area, *i),
-        FormMode::Logs => render_tunnel_logs_overlay(f, app, area),
     }
 
     match &app.rdp_mode {
@@ -99,7 +99,6 @@ pub fn render(f: &mut Frame, app: &App) {
             collected,
             input,
         } => render_rdp_password_overlay(f, app, area, pending, collected.len(), input),
-        RdpMode::Logs => render_rdp_logs_overlay(f, app, area),
     }
 
     match &app.ssh_mode {
@@ -116,7 +115,11 @@ pub fn render(f: &mut Frame, app: &App) {
             render_vpn_delete_confirm(f, app, area, *provider, *idx)
         }
         VpnMode::SecretWarning { .. } => render_vpn_secret_warning(f, app, area),
-        VpnMode::Logs => render_vpn_logs_overlay(f, app, area),
+    }
+
+    // One log pane for the whole program, over whichever tab opened it.
+    if let Some(pane) = &app.log_pane {
+        render_log_overlay(f, app, pane, area);
     }
 
     // The file picker covers the form that opened it.
@@ -132,6 +135,12 @@ pub fn render(f: &mut Frame, app: &App) {
     // The panic button asks over the top of anything else on screen.
     if app.panic.is_some() {
         render_panic_prompt(f, app, area);
+    }
+
+    // And quitting asks over the top of that: it is the one question whose
+    // answer decides whether any of the rest is still here afterwards.
+    if app.quit_prompt.is_some() {
+        render_quit_prompt(f, app, area);
     }
 
     if app.show_help {
@@ -358,6 +367,13 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
                     break;
                 }
             }
+        }
+        let strays = app.foreign_count();
+        if strays > 0 {
+            nb_lines.push(Line::from(Span::styled(
+                format!(" ◆ {strays} not started here"),
+                Style::default().fg(WARN()),
+            )));
         }
         if let Some(err) = app.vpn.providers.iter().find_map(|p| p.error.as_ref()) {
             nb_lines.push(Line::from(Span::styled(
@@ -846,7 +862,7 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(DIM()),
                     )));
                     for l in recent {
-                        lines.push(Line::from(Span::styled(l, Style::default().fg(DIM()))));
+                        lines.push(Line::from(Span::styled(l.text, Style::default().fg(DIM()))));
                     }
                 }
             } else {
@@ -957,20 +973,30 @@ fn render_vpn_profiles(f: &mut Frame, app: &App, area: Rect) {
         .profiles
         .iter()
         .map(|p| {
-            let dot = if p.active {
+            // A row controlcenter is not holding is up, but it is not one of
+            // ours: a different mark, so the list never reads as if the program
+            // started something it cannot account for.
+            let dot = if !p.is_stored() {
+                Span::styled("◆ ", Style::default().fg(WARN()))
+            } else if p.active {
                 Span::styled("● ", Style::default().fg(OK()))
             } else {
                 Span::styled("○ ", Style::default().fg(DIM()))
             };
-            let name_style = if p.active {
+            let name_style = if !p.is_stored() {
+                Style::default().fg(WARN())
+            } else if p.active {
                 Style::default().fg(TEXT()).bold()
             } else {
                 Style::default().fg(TEXT())
             };
             let mut spans = vec![Span::raw(" "), dot, Span::styled(p.name.clone(), name_style)];
-            let needed_by = app
-                .vpn_dependents_of(&format!("{}:{}", provider.id.slug(), p.name))
-                .len();
+            let needed_by = if p.is_stored() {
+                app.vpn_dependents_of(&format!("{}:{}", provider.id.slug(), p.name))
+                    .len()
+            } else {
+                0
+            };
             if needed_by > 0 {
                 spans.push(Span::styled(
                     format!("  {needed_by} dep(s)"),
@@ -979,7 +1005,7 @@ fn render_vpn_profiles(f: &mut Frame, app: &App, area: Rect) {
             }
             if !p.detail.is_empty() {
                 spans.push(Span::styled(
-                    format!("  {}", truncate(&p.detail, 24)),
+                    format!("  {}", truncate(&p.detail, if p.is_stored() { 24 } else { 40 })),
                     Style::default().fg(DIM()),
                 ));
             }
@@ -1120,7 +1146,59 @@ fn render_vpn_status(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    if let Some(p) = provider.selected_profile() {
+    // What is on the machine that this client is not holding, and every tunnel
+    // device found — the two halves of "is something else already up".
+    let not_ours: Vec<&crate::vpn::VpnProfile> = provider.foreign().collect();
+    if !not_ours.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {} connection(s) controlcenter is not holding:", not_ours.len()),
+            Style::default().fg(WARN()),
+        )));
+        for p in &not_ours {
+            lines.push(Line::from(vec![
+                Span::styled("   ◆ ", Style::default().fg(WARN())),
+                Span::styled(p.name.clone(), Style::default().fg(TEXT())),
+                Span::styled(format!("  {}", p.detail), Style::default().fg(DIM())),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "   Enter stops one; press it again to kill what ignored SIGTERM.",
+            Style::default().fg(DIM()),
+        )));
+    }
+
+    let devices = app.tunnel_devices();
+    if !devices.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " tunnel devices on this machine:",
+            Style::default().fg(DIM()),
+        )));
+        for (link, owner) in &devices {
+            let owner = match owner {
+                Some(id) => format!("{}", id.slug()),
+                None => "unaccounted for".to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("   {:<10}", link.name), Style::default().fg(TEXT())),
+                Span::styled(
+                    format!("{:<16}", link.detail()),
+                    Style::default().fg(DIM()),
+                ),
+                Span::styled(
+                    owner.clone(),
+                    Style::default().fg(if owner == "unaccounted for" {
+                        WARN()
+                    } else {
+                        DIM()
+                    }),
+                ),
+            ]));
+        }
+    }
+
+    if let Some(p) = provider.selected_profile().filter(|p| p.is_stored()) {
         let want = format!("{}:{}", provider.id.slug(), p.name);
         let dependents = app.vpn_dependents_of(&want);
         let any = app.vpn_dependents_of(crate::types::VPN_ANY);
@@ -1175,11 +1253,15 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
         ],
         ProviderId::Wireguard => vec![
             " Enter runs wg-quick up on the selected profile; Enter again takes it down.",
+            " ◆ marks an interface no stored profile accounts for; Enter runs wg-quick down.",
             " Several interfaces can be up at once, so profiles never conflict.",
             " Connecting asks for root through polkit.",
         ],
         ProviderId::Openvpn => vec![
             " Enter starts the session; l shows its log.",
+            " ◆ marks something controlcenter is not holding: an openvpn process",
+            " that outlived an earlier run, or a tun device its session left behind",
+            " still holding the address. Enter takes one away; that is all it does.",
             " Saving a profile copies the .ovpn and every certificate it names",
             " into controlcenter, so it survives the download folder being cleaned up.",
             " Disconnecting asks for root a second time: the process runs as root",
@@ -1191,37 +1273,6 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
             " Connecting asks for root through polkit.",
         ],
     }
-}
-
-/// Full-screen view of the selected OpenVPN session's log.
-fn render_vpn_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let rect = centered_rect(area.width.saturating_sub(8), area.height.saturating_sub(4), area);
-    f.render_widget(Clear, rect);
-    let (title, lines) = match app.selected_ovpn() {
-        Some((name, session)) => {
-            let rows = rect.height.saturating_sub(2) as usize;
-            let lines: Vec<Line> = session
-                .recent_log(rows)
-                .into_iter()
-                .map(|l| Line::from(Span::styled(format!(" {l}"), Style::default().fg(TEXT()))))
-                .collect();
-            (format!(" openvpn '{name}' log "), lines)
-        }
-        None => (
-            " openvpn log ".to_string(),
-            vec![Line::from(Span::styled(
-                " no session running for the selected profile",
-                Style::default().fg(DIM()),
-            ))],
-        ),
-    };
-    let para = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT()))
-            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
-    );
-    f.render_widget(para, rect);
 }
 
 /// The add/edit form. All three editable providers share it, driven by their
@@ -1533,7 +1584,7 @@ fn render_rdp(f: &mut Frame, app: &App, area: Rect) {
                         ]));
                         for l in recent {
                             lines.push(Line::from(Span::styled(
-                                truncate(&l, 60),
+                                truncate(&l.text, 60),
                                 Style::default().fg(DIM()),
                             )));
                         }
@@ -1889,11 +1940,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Tab::Dashboard => &[
                 ("1-5/tab", "tab"),
                 ("r", "reload"),
+                ("l", "log"),
+                ("s", "report"),
                 ("c", "clear"),
                 ("x", "panic"),
                 ("t", "theme"),
                 ("?", "help"),
-                ("k", "keys"),
                 ("q", "quit"),
             ],
             Tab::Vpn => &[
@@ -1902,6 +1954,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("r", "refresh"),
                 ("p", "password"),
                 ("l", "log"),
+                ("s", "report"),
                 ("x", "panic"),
                 ("?", "help"),
                 ("k", "keys"),
@@ -1911,6 +1964,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("a/e/d", "tunnel"),
                 ("r", "restart"),
                 ("l", "log"),
+                ("s", "report"),
                 ("c", "clear"),
                 ("x", "panic"),
                 ("?", "help"),
@@ -1921,16 +1975,18 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("a/e/d", "host"),
                 ("r", "new session"),
                 ("p", "password"),
+                ("l", "log"),
+                ("s", "report"),
                 ("c", "clear"),
                 ("x", "panic"),
                 ("?", "help"),
-                ("k", "keys"),
             ],
             Tab::Rdp => &[
                 ("↵", "connect/disconnect"),
                 ("a/e/d", "connection"),
                 ("r", "reconnect"),
                 ("l", "log"),
+                ("s", "report"),
                 ("c", "clear"),
                 ("x", "panic"),
                 ("?", "help"),
@@ -2185,54 +2241,15 @@ fn render_rdp_password_overlay(
     f.render_widget(para, rect);
 }
 
-fn render_rdp_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
-    let rect = centered_rect(area.width.saturating_sub(8).max(40), area.height.saturating_sub(4).max(10), area);
-    f.render_widget(Clear, rect);
-
-    let mut lines: Vec<Line> = Vec::new();
-    let name = app
-        .selected_rdp_conn()
-        .map(|i| app.rdp_conns[i].name.clone())
-        .unwrap_or_default();
-    match app.rdp_active.get(&name) {
-        Some(a) => {
-            let n = rect.height.saturating_sub(3) as usize;
-            for l in a.recent_log(n) {
-                lines.push(Line::from(Span::styled(l, Style::default().fg(TEXT()))));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    " no output yet",
-                    Style::default().fg(DIM()),
-                )));
-            }
-        }
-        None => lines.push(Line::from(Span::styled(
-            " no session",
-            Style::default().fg(DIM()),
-        ))),
-    }
-    lines.push(Line::from(Span::styled(
-        " Esc/q/l close",
-        Style::default().fg(DIM()),
-    )));
-
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BORDER()))
-            .title(Span::styled(
-                format!(" xfreerdp log · {name} "),
-                Style::default().fg(ACCENT()).bold(),
-            )),
-    );
-    f.render_widget(para, rect);
-}
-
-/// Full-screen view of what ssh has printed for the selected tunnel. Tunnels
-/// run with `BatchMode=yes`, so this is where a refused key or a dead host ends
-/// up saying so.
-fn render_tunnel_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
+/// The one log pane. Every tab opens this, and only what it is about changes:
+/// what controlcenter did merged with what the process it started printed,
+/// newest last.
+///
+/// Entries are of uneven height once they wrap, so the visible ones are walked
+/// backwards from the newest until the box is full. That keeps `scroll` a count
+/// of entries — what the arrow keys move — rather than of drawn rows, which
+/// depend on how wide the terminal happens to be.
+fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
     let rect = centered_rect(
         area.width.saturating_sub(8).max(40),
         area.height.saturating_sub(4).max(10),
@@ -2240,41 +2257,155 @@ fn render_tunnel_logs_overlay(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(Clear, rect);
 
-    let name = app.selected_active_tunnel().unwrap_or_default().to_string();
+    let entries = app.log_lines(&pane.target);
+    let inner = rect.width.saturating_sub(2) as usize;
+    // Two borders and the footer.
+    let rows = rect.height.saturating_sub(3) as usize;
+    let newest = entries.len().saturating_sub(pane.scroll);
+
     let mut lines: Vec<Line> = Vec::new();
-    match app.active.get(&name) {
-        Some(a) => {
-            let n = rect.height.saturating_sub(3) as usize;
-            for l in a.recent_stderr(n) {
-                lines.push(Line::from(Span::styled(l, Style::default().fg(TEXT()))));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    " nothing yet — a quiet tunnel says nothing",
-                    Style::default().fg(DIM()),
-                )));
-            }
+    for entry in entries[..newest].iter().rev() {
+        let block = log_entry_lines(entry, inner);
+        if !lines.is_empty() && lines.len() + block.len() > rows {
+            break;
         }
-        None => lines.push(Line::from(Span::styled(
-            " no running tunnel",
+        for line in block.into_iter().rev() {
+            lines.insert(0, line);
+        }
+        if lines.len() >= rows {
+            break;
+        }
+    }
+    lines.truncate(rows);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " nothing logged yet — a quiet connection says nothing",
             Style::default().fg(DIM()),
-        ))),
+        )));
+    }
+    while lines.len() < rows {
+        lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        " c clears · Esc/q/l close",
+        " s report · c clear · ↑↓ scroll · Esc/q/l close",
         Style::default().fg(DIM()),
     )));
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    let title = match pane.scroll {
+        0 => format!(" log · {} ", pane.target.title()),
+        n => format!(" log · {} · {n} back ", pane.target.title()),
+    };
+    let para = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER()))
-            .title(Span::styled(
-                format!(" ssh log · {name} "),
-                Style::default().fg(ACCENT()).bold(),
-            )),
+            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
     );
     f.render_widget(para, rect);
+}
+
+/// One entry as it is drawn: a time, who said it, and the text under a hanging
+/// indent so a wrapped line still lines up under its own column.
+fn log_entry_lines(entry: &logs::Entry, width: usize) -> Vec<Line<'static>> {
+    let prefix = format!(" {} {:<11} ", logs::clock(entry.at), entry.source);
+    let indent = prefix.chars().count();
+    let color = if entry.error {
+        DANGER()
+    } else if entry.source == logs::SELF {
+        TEXT()
+    } else {
+        DIM()
+    };
+    wrap_text(&entry.text, width.saturating_sub(indent).max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let head = if i == 0 {
+                prefix.clone()
+            } else {
+                " ".repeat(indent)
+            };
+            Line::from(vec![
+                Span::styled(head, Style::default().fg(DIM())),
+                Span::styled(chunk, Style::default().fg(color)),
+            ])
+        })
+        .collect()
+}
+
+/// Break a line to fit the pane. Log output is long — a command line, a stack
+/// of ssh options — and the interesting half is usually the end of it, so it
+/// wraps rather than being cut off at the border.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        // A word wider than the pane — a long path — is cut, because there is
+        // nowhere to break it.
+        if word.chars().count() > width {
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            let mut rest = word;
+            while rest.chars().count() > width {
+                let cut = rest
+                    .char_indices()
+                    .nth(width)
+                    .map(|(i, _)| i)
+                    .unwrap_or(rest.len());
+                out.push(rest[..cut].to_string());
+                rest = &rest[cut..];
+            }
+            line = rest.to_string();
+            continue;
+        }
+        let joined = if line.is_empty() {
+            word.chars().count()
+        } else {
+            line.chars().count() + 1 + word.chars().count()
+        };
+        if joined > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn a_line_breaks_between_words_and_never_loses_one() {
+        let text = "ssh -N -o BatchMode=yes bastion";
+        let lines = wrap_text(text, 16);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines.iter().all(|l| l.chars().count() <= 16), "{lines:?}");
+        assert_eq!(lines.join(" "), text);
+    }
+
+    #[test]
+    fn a_word_wider_than_the_pane_is_cut_rather_than_left_to_overflow() {
+        // A long path has nowhere to break.
+        let lines = wrap_text("/very/long/path/to/a/config.ovpn", 10);
+        assert!(lines.iter().all(|l| l.chars().count() <= 10), "{lines:?}");
+        assert_eq!(lines.concat(), "/very/long/path/to/a/config.ovpn");
+    }
+
+    #[test]
+    fn an_empty_line_still_draws_as_one_row() {
+        assert_eq!(wrap_text("", 20), vec![String::new()]);
+    }
 }
 
 /// The panic button's confirmation: what is up, and that it all goes.
@@ -2319,6 +2450,58 @@ fn render_panic_prompt(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(DANGER()))
             .title(Span::styled(" panic ", Style::default().fg(DANGER()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+/// What quitting would leave running as root, and the two ways out of it.
+fn render_quit_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(q) = &app.quit_prompt else {
+        return;
+    };
+    let rect = centered_rect(72, (q.sessions.len() + 9) as u16, area);
+    f.render_widget(Clear, rect);
+
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            " {} openvpn session(s) are still up:",
+            q.sessions.len()
+        ),
+        Style::default().fg(TEXT()).bold(),
+    ))];
+    for item in &q.sessions {
+        lines.push(Line::from(Span::styled(
+            format!("   {item}"),
+            Style::default().fg(WARN()),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " They run as root. Once controlcenter is gone nothing is left that",
+        Style::default().fg(DIM()),
+    )));
+    lines.push(Line::from(Span::styled(
+        " knows how to reach them, and the next connection to the same profile",
+        Style::default().fg(DIM()),
+    )));
+    lines.push(Line::from(Span::styled(
+        " will be fighting the one still there for the server's slot.",
+        Style::default().fg(DIM()),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled(" s/enter ", Style::default().fg(OK()).bold()),
+        Span::styled("stop and quit  ", Style::default().fg(DIM())),
+        Span::styled("k ", Style::default().fg(WARN()).bold()),
+        Span::styled("keep and quit  ", Style::default().fg(DIM())),
+        Span::styled("any key ", Style::default().fg(ACCENT()).bold()),
+        Span::styled("stay", Style::default().fg(DIM())),
+    ]));
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(" quit ", Style::default().fg(WARN()).bold())),
     );
     f.render_widget(para, rect);
 }
@@ -2579,6 +2762,18 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         text("a step that cannot coexist with what is already running asks"),
         text("first — y evicts what is in the way, anything else cancels"),
         Line::from(""),
+        section("connections that are not ours"),
+        text("the VPN tab lists what is on the machine, not only what this"),
+        text("program started: a ◆ row is an openvpn process or an interface"),
+        text("controlcenter is not holding — an orphan of an earlier run, or"),
+        text("someone else's. Enter stops one; x takes them down with the rest"),
+        Line::from(""),
+        section("logs and reports"),
+        text("l opens the log of whatever is selected: what controlcenter did"),
+        text("about it, merged with what the process it started printed."),
+        text("s writes a report — that log plus every connection, command"),
+        text("line and VPN state — to a file you can hand to someone else"),
+        Line::from(""),
         section("config"),
         text("TOML under ~/.config/controlcenter, editable by hand"),
         text("(controlcenter --config-paths says exactly where)"),
@@ -2627,12 +2822,15 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
     let lines = vec![
         section("acting on what is selected"),
         entry("enter space", "connect · disconnect if it is already up"),
+        entry("", "on a ◆ VPN row: stop a connection controlcenter is"),
+        entry("", "not holding — again to kill one that ignored SIGTERM"),
         entry("a", "add"),
         entry("e", "edit"),
         entry("d", "delete"),
         entry("r", "reconnect · reload"),
         entry("p", "remove the stored password"),
         entry("l", "log"),
+        entry("s", "save a report to a file — everything, not just this log"),
         entry("c", "clear — the log, or entries that have finished"),
         Line::from(""),
         section("everywhere"),
@@ -2649,11 +2847,12 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("t", "cycle the colour theme"),
         entry("?", "help · k these keys"),
         entry("q", "close what is focused, and the application once"),
-        entry("", "nothing is left to close"),
+        entry("", "nothing is left to close — asks first if an openvpn"),
+        entry("", "session would be left running as root"),
         Line::from(""),
         section("moving about"),
         entry("1-5 tab", "switch tab (shift+tab goes back)"),
-        entry("↑ ↓", "move the selection"),
+        entry("↑ ↓", "move the selection · scroll a log"),
         entry("← →", "switch pane · change the field under the cursor"),
         entry("esc", "cancel a form, close a popup"),
         entry("y", "confirm in a prompt"),
@@ -2661,11 +2860,11 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         Line::from(""),
         section("what each one acts on"),
         row("", "VPN", "TUNNELS", "SSH", "RDP"),
-        row("enter", "connect", "start/stop", "open session", "connect"),
+        row("enter", "connect · stop ◆", "start/stop", "open session", "connect"),
         row("a e d", "profile", "tunnel", "host", "connection"),
         row("r", "refresh", "restart", "new session", "reconnect"),
         row("p", "openvpn pw", "—", "stored pw", "never stored"),
-        row("l", "openvpn log", "ssh output", "—", "xfreerdp log"),
+        row("l", "profile log", "ssh output", "what it did", "xfreerdp log"),
         row("c", "errors", "failed", "last session", "finished"),
         Line::from(""),
         Line::from(vec![

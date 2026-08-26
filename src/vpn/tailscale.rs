@@ -235,6 +235,7 @@ pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) {
                 active: status.connected && active.as_deref() == Some(p.name.as_str()),
                 name: p.name.clone(),
                 detail: summarise(p),
+                foreign: None,
             })
             .collect();
         let _ = tx.send(VpnMsg::Refreshed {
@@ -261,13 +262,29 @@ fn action(tx: Sender<VpnMsg>, desc: String, args: Vec<String>, stored: Vec<Tails
     });
 }
 
-pub fn connect(tx: Sender<VpnMsg>, profile: TailscaleProfile, stored: Vec<TailscaleProfile>) {
+/// Bring a profile up. Returns the command line it launched, for the log.
+pub fn connect(
+    tx: Sender<VpnMsg>,
+    profile: TailscaleProfile,
+    stored: Vec<TailscaleProfile>,
+) -> Vec<String> {
     let desc = format!("bringing up '{}'", profile.name);
-    action(tx, desc, up_args(&profile), stored);
+    let args = up_args(&profile);
+    let ran = vec![as_root(&args)];
+    action(tx, desc, args, stored);
+    ran
 }
 
-pub fn disconnect(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) {
-    action(tx, "disconnecting".into(), vec!["down".into()], stored);
+pub fn disconnect(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) -> Vec<String> {
+    let args = vec!["down".to_string()];
+    let ran = vec![as_root(&args)];
+    action(tx, "disconnecting".into(), args, stored);
+    ran
+}
+
+/// How the log writes a command that went through the escalation helper.
+fn as_root(args: &[String]) -> String {
+    format!("tailscale {} (as root)", args.join(" "))
 }
 
 #[cfg(test)]

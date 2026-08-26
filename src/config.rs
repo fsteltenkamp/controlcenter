@@ -20,6 +20,8 @@ pub struct Paths {
     pub openvpn_dir: PathBuf,
     /// Short-lived files, e.g. the pid openvpn writes so it can be signalled.
     pub run_dir: PathBuf,
+    /// Reports exported from a log pane. Created the first time one is written.
+    pub reports_dir: PathBuf,
 }
 
 impl Paths {
@@ -34,6 +36,7 @@ impl Paths {
         let vpn_file = config_dir.join("vpn.toml");
         let wireguard_dir = config_dir.join("wireguard");
         let openvpn_dir = config_dir.join("openvpn");
+        let reports_dir = config_dir.join("reports");
         let run_dir = dirs
             .runtime_dir()
             .map(Path::to_path_buf)
@@ -49,6 +52,7 @@ impl Paths {
             wireguard_dir,
             openvpn_dir,
             run_dir,
+            reports_dir,
         })
     }
 
@@ -196,6 +200,50 @@ pub struct AppConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub ssh: SshConfig,
+    #[serde(default)]
+    pub vpn: VpnAppConfig,
+}
+
+/// How controlcenter handles the two things about a VPN that outlive it: the
+/// root it needs to take one down, and the sessions still up when it quits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnAppConfig {
+    /// Whether to take a sudo ticket on the terminal before the TUI starts:
+    ///   ask     ask for a password if there is no valid ticket (default)
+    ///   auto    use a ticket that is already there, never ask
+    ///   never   leave sudo alone; every escalation goes through polkit
+    ///
+    /// With a ticket, stopping a VPN is a silent `sudo -n` instead of a polkit
+    /// dialog per connection — which matters most for the dialog that gets
+    /// dismissed and leaves a root openvpn running that nothing can reach.
+    #[serde(default = "default_sudo")]
+    pub sudo: String,
+    /// What happens to OpenVPN sessions still up when you quit:
+    ///   ask     ask, every time (default)
+    ///   stop    take them down
+    ///   keep    leave them running
+    ///
+    /// An OpenVPN session is a root process; once controlcenter is gone,
+    /// nothing that is left knows how to reach it.
+    #[serde(default = "default_on_exit")]
+    pub on_exit: String,
+}
+
+impl Default for VpnAppConfig {
+    fn default() -> Self {
+        Self {
+            sudo: default_sudo(),
+            on_exit: default_on_exit(),
+        }
+    }
+}
+
+fn default_sudo() -> String {
+    "ask".to_string()
+}
+
+fn default_on_exit() -> String {
+    "ask".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
