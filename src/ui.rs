@@ -1951,6 +1951,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Tab::Vpn => &[
                 ("↵", "connect/disconnect"),
                 ("a/e/d", "profile"),
+                ("ctrl↑↓", "move"),
                 ("r", "refresh"),
                 ("p", "password"),
                 ("l", "log"),
@@ -1962,6 +1963,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Tab::Tunnels => &[
                 ("↵", "start/stop"),
                 ("a/e/d", "tunnel"),
+                ("ctrl↑↓", "move"),
                 ("r", "restart"),
                 ("l", "log"),
                 ("s", "report"),
@@ -1973,6 +1975,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Tab::Ssh => &[
                 ("↵", "open session"),
                 ("a/e/d", "host"),
+                ("ctrl↑↓", "move"),
                 ("r", "new session"),
                 ("p", "password"),
                 ("l", "log"),
@@ -1984,6 +1987,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Tab::Rdp => &[
                 ("↵", "connect/disconnect"),
                 ("a/e/d", "connection"),
+                ("ctrl↑↓", "move"),
                 ("r", "reconnect"),
                 ("l", "log"),
                 ("s", "report"),
@@ -2832,6 +2836,8 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("l", "log"),
         entry("s", "save a report to a file — everything, not just this log"),
         entry("c", "clear — the log, or entries that have finished"),
+        entry("ctrl+↑ ↓", "move it up or down — an entry inside its group, a"),
+        entry("", "group past the next one; the new order is saved"),
         Line::from(""),
         section("everywhere"),
         Line::from(vec![
@@ -2853,6 +2859,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         section("moving about"),
         entry("1-5 tab", "switch tab (shift+tab goes back)"),
         entry("↑ ↓", "move the selection · scroll a log"),
+        entry("pgup pgdn", "move the selection by ten · scroll a log by a screen"),
         entry("← →", "switch pane · change the field under the cursor"),
         entry("esc", "cancel a form, close a popup"),
         entry("y", "confirm in a prompt"),
@@ -2866,6 +2873,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         row("p", "openvpn pw", "—", "stored pw", "never stored"),
         row("l", "profile log", "ssh output", "what it did", "xfreerdp log"),
         row("c", "errors", "failed", "last session", "finished"),
+        row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move connection"),
         Line::from(""),
         Line::from(vec![
             Span::styled(" ? ", Style::default().fg(ACCENT()).bold()),

@@ -41,6 +41,7 @@ Every key means the same thing on every tab. Only what it acts on changes.
 | `l` | log |
 | `s` | save a report to a file |
 | `c` | clear — the log, or the entries that have finished |
+| `Ctrl+↑` `Ctrl+↓` | move what is selected up or down in the list — the new order is written to the config |
 | `x` | **disconnect everything** — the panic button, from any tab |
 | `t` | cycle the colour theme |
 | `?` | help — `k` for the keys |
@@ -52,7 +53,8 @@ Moving about:
 | --- | --- |
 | `1`–`5` | jump to a tab |
 | `Tab` / `Shift+Tab` | next / previous tab |
-| `↑` `↓` | move the selection · scroll a log (`PgUp` `PgDn` by a screen) |
+| `↑` `↓` | move the selection · scroll a log |
+| `PgUp` `PgDn` | move the selection ten rows · scroll a log by a screen |
 | `←` `→` | switch pane (VPN) · change the field under the cursor (forms) |
 | `Esc` | cancel a form, close a popup |
 | `y` | confirm in a prompt |
@@ -72,8 +74,14 @@ moving.
 | `l` | the profile's log | the tunnel's log | the host's log | the connection's log |
 | `s` | a report about it | a report about it | a report about it | a report about it |
 | `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions |
+| `Ctrl+↑` `Ctrl+↓` | the profile, in `vpn.toml` | the tunnel or its group | the host or its group | the connection or its group |
 
-NetBird profiles are netbird's own, so `a` `e` `d` say so instead of editing them.
+An entry moves inside its own group and a group header moves the whole group, so the
+list keeps the shape it is drawn in; `Ctrl+↑` `Ctrl+↓` on a group's first or last entry
+says so rather than moving it into the neighbouring group.
+
+NetBird profiles are netbird's own, so `a` `e` `d` `Ctrl+↑` `Ctrl+↓` say so instead of
+editing them.
 Reconnecting an RDP session asks for the password again, because nothing keeps a copy.
 
 ### Connections that are not ours

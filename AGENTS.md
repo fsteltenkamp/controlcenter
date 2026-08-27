@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 133 tests, all pure unit tests — no network, no root
+cargo test             # 139 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -47,6 +47,14 @@ changes. The table in the README is the contract. When adding a key:
   `render_status` in the same change
 - navigation is arrow keys only. `h` `j` `k` `l` are action keys; do not reintroduce vim
   bindings
+
+**A list's order is its file's order.** `build_rows` lays a list out as the ungrouped
+entries, then each group in order of first appearance, so `reorder` only makes moves that
+survive being drawn again: an entry moves among its own group's members, a group header
+moves the whole block. Anything that reorders saves the file in the same breath, or the
+order is gone at the next start. The VPN tab has no groups and no vec of its own — its
+rows are seeded from `vpn.toml` on every poll, so `move_named` moves the profile in the
+config and the list follows.
 
 **What is on the machine is not what we started.** `vpn/scan.rs` sweeps `/proc` and `ip`
 for VPN processes and tunnel devices; `App::foreign_for` subtracts the sessions this

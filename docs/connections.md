@@ -18,6 +18,23 @@ per member.
 
 VPN profiles have no groups: one profile per client is active anyway.
 
+## Order
+
+`Ctrl+↑` and `Ctrl+↓` move what is under the cursor, and the new order is written straight
+to the config file — the order of a list *is* the order of its file. (`PgUp` and `PgDn`
+stay navigation: they move the selection ten rows.)
+
+- on an entry, it moves within its own group. Ungrouped entries are a block of their own
+  at the top of the tab and move within that
+- on a group header, the whole group moves past the next one, members and all
+- at the top or bottom of a group, nothing happens and the status bar says so. Moving an
+  entry between groups is a change of `group`, so it is done in the form with `e`
+
+On the VPN tab the same keys move the selected profile in `vpn.toml`. NetBird's profiles
+are netbird's own and a `◆` row is not a stored profile at all, so neither one moves; the
+client list on the left is fixed, because that order is the order a plan brings clients up
+in.
+
 ## Dependencies
 
 Tunnels, SSH hosts and RDP connections each take two optional requirements, picked with

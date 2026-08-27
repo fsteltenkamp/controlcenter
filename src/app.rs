@@ -116,6 +116,123 @@ pub fn members_of<T>(items: &[T], group_of: impl Fn(&T) -> &str, group: &str) ->
         .collect()
 }
 
+/// Which way a reorder pushes the row under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
+}
+
+impl Move {
+    /// The end of the list this direction runs into, for the message a row
+    /// already sitting there gets.
+    fn edge(self) -> &'static str {
+        match self {
+            Self::Up => "first",
+            Self::Down => "last",
+        }
+    }
+
+    /// Where `at` goes in a list of `len`, or `None` at the end.
+    fn target(self, at: usize, len: usize) -> Option<usize> {
+        match self {
+            Self::Up => at.checked_sub(1),
+            Self::Down => (at + 1 < len).then_some(at + 1),
+        }
+    }
+}
+
+/// Move the row under the cursor one place. Only moves [`build_rows`] can lay
+/// out again are possible, which is what decides the two cases: an entry moves
+/// among the members of its own group — or among the ungrouped entries, which
+/// are a block of their own at the top — and a group header takes the whole
+/// group past the next one. Returns the row as it is after the move, so the
+/// cursor can follow it, or `None` when it was already at that end.
+pub fn reorder<T>(
+    items: &mut Vec<T>,
+    group_of: impl Fn(&T) -> &str,
+    row: &RowItem,
+    dir: Move,
+) -> Option<RowItem> {
+    match row {
+        RowItem::Item(i) => {
+            let i = *i;
+            let group = group_of(items.get(i)?).to_string();
+            let peers = members_of(items, &group_of, &group);
+            let at = peers.iter().position(|p| *p == i)?;
+            let to = dir.target(at, peers.len())?;
+            items.swap(peers[at], peers[to]);
+            Some(RowItem::Item(peers[to]))
+        }
+        RowItem::Group(g) => {
+            let mut order: Vec<String> = Vec::new();
+            for item in items.iter() {
+                let name = group_of(item);
+                if !name.is_empty() && !order.iter().any(|o| o == name) {
+                    order.push(name.to_string());
+                }
+            }
+            let at = order.iter().position(|o| o == g)?;
+            let to = dir.target(at, order.len())?;
+            order.swap(at, to);
+            // A group is a run of entries that need not be adjacent in the
+            // file, so the whole list is laid out again in the new group
+            // order. Nothing changes places inside a group, or among the
+            // ungrouped entries.
+            let mut blocks: Vec<Vec<T>> = order.iter().map(|_| Vec::new()).collect();
+            let mut ungrouped: Vec<T> = Vec::new();
+            for item in std::mem::take(items) {
+                match order.iter().position(|o| o == group_of(&item)) {
+                    Some(idx) => blocks[idx].push(item),
+                    None => ungrouped.push(item),
+                }
+            }
+            items.extend(ungrouped);
+            for block in blocks {
+                items.extend(block);
+            }
+            Some(RowItem::Group(g.clone()))
+        }
+    }
+}
+
+/// Move the entry called `name` one place in a flat list — the VPN tab's
+/// profiles, which have no groups. Returns where it landed.
+fn move_named<T>(
+    items: &mut [T],
+    name_of: impl Fn(&T) -> &str,
+    name: &str,
+    dir: Move,
+) -> Option<usize> {
+    let at = items.iter().position(|i| name_of(i) == name)?;
+    let to = dir.target(at, items.len())?;
+    items.swap(at, to);
+    Some(to)
+}
+
+/// How far `PgUp` and `PgDn` take the cursor. The lists are drawn by ratatui,
+/// which keeps the scroll offset to itself, so a page is a fixed step — the
+/// same ten lines the log pane scrolls by.
+const PAGE: usize = 10;
+
+/// Where the cursor lands a page away. Unlike the arrows this stops at the
+/// ends rather than wrapping: a jump of ten that came out at the other end of
+/// the list is one the eye cannot follow.
+fn page_to(at: usize, len: usize, dir: Move) -> usize {
+    match dir {
+        Move::Up => at.saturating_sub(PAGE),
+        Move::Down => (at + PAGE).min(len.saturating_sub(1)),
+    }
+}
+
+/// What to say when a row cannot go any further the way it was pushed.
+fn reorder_edge_note(row: &RowItem, dir: Move) -> String {
+    match row {
+        RowItem::Group(g) => format!("'{g}' is already the {} group", dir.edge()),
+        RowItem::Item(_) => format!("already the {} entry here", dir.edge()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormMode {
     None,
@@ -2427,6 +2544,14 @@ impl App {
                 self.flash("refreshing every VPN client", false);
             }
             KeyCode::Char('c') => self.clear_finished_everywhere(),
+            KeyCode::Up | KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.flash(
+                    "the dashboard only watches — reorder a list on its own tab",
+                    false,
+                )
+            }
             // The dashboard watches everything, so its log is everything.
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Enter
@@ -2490,11 +2615,23 @@ impl App {
 
     fn on_tunnels_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_tunnel(Move::Up)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_tunnel(Move::Down)
+            }
             KeyCode::Down if !self.rows.is_empty() => {
                 self.selected = (self.selected + 1) % self.rows.len();
             }
             KeyCode::Up if !self.rows.is_empty() => {
                 self.selected = (self.selected + self.rows.len() - 1) % self.rows.len();
+            }
+            KeyCode::PageUp => {
+                self.selected = page_to(self.selected, self.rows.len(), Move::Up);
+            }
+            KeyCode::PageDown => {
+                self.selected = page_to(self.selected, self.rows.len(), Move::Down);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected(),
             KeyCode::Char('a') => {
@@ -2530,6 +2667,25 @@ impl App {
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_tunnels(),
             _ => {}
+        }
+    }
+
+    /// Ctrl+↑/Ctrl+↓ on the Tunnels tab: move what is under the cursor one place
+    /// and write the list out. The order of the file is the order of the list,
+    /// so a reorder is a config change like any other.
+    fn move_selected_tunnel(&mut self, dir: Move) {
+        let Some(row) = self.rows.get(self.selected).cloned() else {
+            return;
+        };
+        match reorder(&mut self.tunnels, |t| &t.group, &row, dir) {
+            Some(moved) => {
+                self.rebuild_rows();
+                if let Some(at) = self.rows.iter().position(|r| *r == moved) {
+                    self.selected = at;
+                }
+                self.save_tunnels();
+            }
+            None => self.flash(reorder_edge_note(&row, dir), false),
         }
     }
 
@@ -2596,6 +2752,12 @@ impl App {
 
     fn on_vpn_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_vpn_profile(Move::Up)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_vpn_profile(Move::Down)
+            }
             KeyCode::Left => self.vpn.focus = VpnPane::Clients,
             KeyCode::Right => self.vpn.focus = VpnPane::Profiles,
             KeyCode::Down => match self.vpn.focus {
@@ -2624,6 +2786,8 @@ impl App {
                     }
                 }
             },
+            KeyCode::PageUp => self.page_vpn(Move::Up),
+            KeyCode::PageDown => self.page_vpn(Move::Down),
             KeyCode::Enter | KeyCode::Char(' ') => self.vpn_toggle_selected(),
             KeyCode::Char('a') => self.open_vpn_form(None),
             KeyCode::Char('e') => {
@@ -2657,6 +2821,80 @@ impl App {
             KeyCode::Char('c') => self.clear_vpn_finished(),
             _ => {}
         }
+    }
+
+    /// `PgUp` `PgDn` in whichever pane has the cursor.
+    fn page_vpn(&mut self, dir: Move) {
+        match self.vpn.focus {
+            VpnPane::Clients => {
+                let n = self.vpn.providers.len();
+                self.vpn.client_idx = page_to(self.vpn.client_idx, n, dir);
+            }
+            VpnPane::Profiles => {
+                let n = self.vpn_profile_count();
+                if n > 0 {
+                    let st = self.vpn.current_mut();
+                    st.selected = page_to(st.selected, n, dir);
+                }
+            }
+        }
+    }
+
+    /// Ctrl+↑/Ctrl+↓ on the VPN tab: move the selected profile one place in
+    /// `vpn.toml`. The profile list is seeded from that file on every poll and
+    /// every live refresh lists the stored profiles in the order it holds
+    /// them, so the file is the only place an order can be kept. Rows that are
+    /// not stored profiles are not in it: a `◆` connection was found on the
+    /// machine, and netbird's profiles live in netbird.
+    fn move_selected_vpn_profile(&mut self, dir: Move) {
+        if self.vpn.focus == VpnPane::Clients {
+            self.flash(
+                "the client list is fixed — a plan brings clients up in that order",
+                false,
+            );
+            return;
+        }
+        if self.selected_foreign().is_some() {
+            self.foreign_row_note("reorder");
+            return;
+        }
+        let id = self.vpn.current_id();
+        if !id.manages_profiles() {
+            self.flash("netbird profiles are managed by netbird itself", true);
+            return;
+        }
+        let Some(name) = self
+            .vpn
+            .current()
+            .selected_profile()
+            .map(|p| p.name.clone())
+        else {
+            return;
+        };
+        let moved = match id {
+            ProviderId::Wireguard => {
+                move_named(&mut self.vpn_cfg.wireguard, |p| &p.name, &name, dir)
+            }
+            ProviderId::Openvpn => {
+                move_named(&mut self.vpn_cfg.openvpn, |p| &p.name, &name, dir)
+            }
+            ProviderId::Tailscale => {
+                move_named(&mut self.vpn_cfg.tailscale, |p| &p.name, &name, dir)
+            }
+            ProviderId::Netbird => None,
+        };
+        let Some(to) = moved else {
+            self.flash(
+                format!("'{name}' is already the {} profile", dir.edge()),
+                false,
+            );
+            return;
+        };
+        self.save_vpn_cfg();
+        self.refresh_provider(id);
+        // Stored profiles keep the file's order and any ◆ row is appended
+        // after them, so the profile's place in the file is its row.
+        self.vpn.get_mut(id).selected = to;
     }
 
     /// `p` on the VPN tab: forget the password stored for the selected
@@ -3688,11 +3926,23 @@ impl App {
     fn on_rdp_key(&mut self, key: KeyEvent) {
         let count = self.rdp_rows.len();
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_rdp_conn(Move::Up)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_rdp_conn(Move::Down)
+            }
             KeyCode::Down if count > 0 => {
                 self.rdp_selected = (self.rdp_selected + 1) % count;
             }
             KeyCode::Up if count > 0 => {
                 self.rdp_selected = (self.rdp_selected + count - 1) % count;
+            }
+            KeyCode::PageUp => {
+                self.rdp_selected = page_to(self.rdp_selected, count, Move::Up);
+            }
+            KeyCode::PageDown => {
+                self.rdp_selected = page_to(self.rdp_selected, count, Move::Down);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle_selected_rdp(),
             KeyCode::Char('a') => {
@@ -3737,6 +3987,24 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Ctrl+↑/Ctrl+↓ on the RDP tab: move what is under the cursor one place and
+    /// write `rdp.toml` out.
+    fn move_selected_rdp_conn(&mut self, dir: Move) {
+        let Some(row) = self.rdp_rows.get(self.rdp_selected).cloned() else {
+            return;
+        };
+        match reorder(&mut self.rdp_conns, |c| &c.group, &row, dir) {
+            Some(moved) => {
+                self.rebuild_rdp_rows();
+                if let Some(at) = self.rdp_rows.iter().position(|r| *r == moved) {
+                    self.rdp_selected = at;
+                }
+                self.save_rdp_conns();
+            }
+            None => self.flash(reorder_edge_note(&row, dir), false),
         }
     }
 
@@ -4006,11 +4274,23 @@ impl App {
     fn on_ssh_key(&mut self, key: KeyEvent) {
         let count = self.ssh_rows.len();
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_ssh_host(Move::Up)
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_selected_ssh_host(Move::Down)
+            }
             KeyCode::Down if count > 0 => {
                 self.ssh_selected = (self.ssh_selected + 1) % count;
             }
             KeyCode::Up if count > 0 => {
                 self.ssh_selected = (self.ssh_selected + count - 1) % count;
+            }
+            KeyCode::PageUp => {
+                self.ssh_selected = page_to(self.ssh_selected, count, Move::Up);
+            }
+            KeyCode::PageDown => {
+                self.ssh_selected = page_to(self.ssh_selected, count, Move::Down);
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.open_selected_ssh(),
             KeyCode::Char('a') => {
@@ -4043,6 +4323,24 @@ impl App {
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_ssh(),
             _ => {}
+        }
+    }
+
+    /// Ctrl+↑/Ctrl+↓ on the SSH tab: move what is under the cursor one place and
+    /// write `ssh.toml` out.
+    fn move_selected_ssh_host(&mut self, dir: Move) {
+        let Some(row) = self.ssh_rows.get(self.ssh_selected).cloned() else {
+            return;
+        };
+        match reorder(&mut self.ssh_hosts, |h| &h.group, &row, dir) {
+            Some(moved) => {
+                self.rebuild_ssh_rows();
+                if let Some(at) = self.ssh_rows.iter().position(|r| *r == moved) {
+                    self.ssh_selected = at;
+                }
+                self.save_ssh_hosts();
+            }
+            None => self.flash(reorder_edge_note(&row, dir), false),
         }
     }
 
@@ -5880,6 +6178,10 @@ mod tests {
         assert_eq!(plan, conns);
     }
 
+    fn host_names(hosts: &[SshHost]) -> Vec<String> {
+        hosts.iter().map(|h| h.name.clone()).collect()
+    }
+
     fn grouped(name: &str, group: &str) -> SshHost {
         SshHost {
             group: group.into(),
@@ -5908,6 +6210,136 @@ mod tests {
             ]
         );
         assert_eq!(members_of(&hosts, |h| &h.group, "prod"), vec![0, 2]);
+    }
+
+    #[test]
+    fn an_entry_moves_among_its_own_group_and_leaves_the_rest_alone() {
+        let mut hosts = vec![
+            grouped("a", "prod"),
+            grouped("loose", ""),
+            grouped("b", "prod"),
+            grouped("c", "dev"),
+        ];
+        // "b" is the second member of prod; up puts it first.
+        let moved = reorder(&mut hosts, |h| &h.group, &RowItem::Item(2), Move::Up);
+        assert_eq!(moved, Some(RowItem::Item(0)));
+        assert_eq!(
+            host_names(&hosts),
+            vec!["b".to_string(), "loose".into(), "a".into(), "c".into()]
+        );
+    }
+
+    #[test]
+    fn an_entry_at_the_edge_of_its_group_does_not_leave_it() {
+        let mut hosts = vec![grouped("a", "prod"), grouped("b", "prod"), grouped("c", "dev")];
+        // Down from the last member of prod would land it in dev, which is a
+        // group change and not something a reorder may do.
+        assert_eq!(
+            reorder(&mut hosts, |h| &h.group, &RowItem::Item(1), Move::Down),
+            None
+        );
+        assert_eq!(host_names(&hosts), vec!["a".to_string(), "b".into(), "c".into()]);
+    }
+
+    #[test]
+    fn a_group_header_moves_the_whole_group_past_the_next_one() {
+        let mut hosts = vec![
+            grouped("a", "prod"),
+            grouped("loose", ""),
+            grouped("b", "prod"),
+            grouped("c", "dev"),
+        ];
+        let moved = reorder(
+            &mut hosts,
+            |h| &h.group,
+            &RowItem::Group("dev".into()),
+            Move::Up,
+        );
+        assert_eq!(moved, Some(RowItem::Group("dev".into())));
+        // Members keep their order, and the ungrouped entry stays on top.
+        assert_eq!(
+            host_names(&hosts),
+            vec!["loose".to_string(), "c".into(), "a".into(), "b".into()]
+        );
+        assert_eq!(
+            build_rows(&hosts, |h| &h.group),
+            vec![
+                RowItem::Item(0),
+                RowItem::Group("dev".into()),
+                RowItem::Item(1),
+                RowItem::Group("prod".into()),
+                RowItem::Item(2),
+                RowItem::Item(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_page_stops_at_the_ends_where_the_arrows_would_wrap() {
+        assert_eq!(page_to(0, 40, Move::Down), 10);
+        assert_eq!(page_to(35, 40, Move::Down), 39);
+        assert_eq!(page_to(3, 40, Move::Up), 0);
+        // A list shorter than a page, and an empty one, still land on a row
+        // that exists.
+        assert_eq!(page_to(2, 4, Move::Down), 3);
+        assert_eq!(page_to(0, 0, Move::Down), 0);
+    }
+
+    #[test]
+    fn the_first_group_has_nowhere_further_up_to_go() {
+        let mut hosts = vec![grouped("a", "prod"), grouped("c", "dev")];
+        assert_eq!(
+            reorder(
+                &mut hosts,
+                |h| &h.group,
+                &RowItem::Group("prod".into()),
+                Move::Up
+            ),
+            None
+        );
+        assert_eq!(host_names(&hosts), vec!["a".to_string(), "c".into()]);
+    }
+
+    #[test]
+    fn ungrouped_entries_reorder_among_themselves_and_stay_above_the_groups() {
+        let mut hosts = vec![grouped("a", "prod"), grouped("l1", ""), grouped("l2", "")];
+        let moved = reorder(&mut hosts, |h| &h.group, &RowItem::Item(2), Move::Up);
+        assert_eq!(moved, Some(RowItem::Item(1)));
+        assert_eq!(host_names(&hosts), vec!["a".to_string(), "l2".into(), "l1".into()]);
+        assert_eq!(
+            build_rows(&hosts, |h| &h.group),
+            vec![
+                RowItem::Item(1),
+                RowItem::Item(2),
+                RowItem::Group("prod".into()),
+                RowItem::Item(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vpn_profile_moves_by_name_and_stops_at_the_end_of_the_list() {
+        let mut profiles = vec![
+            WireguardProfile {
+                name: "home".into(),
+                ..Default::default()
+            },
+            WireguardProfile {
+                name: "work".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            move_named(&mut profiles, |p| &p.name, "work", Move::Up),
+            Some(0)
+        );
+        assert_eq!(profiles[0].name, "work");
+        assert_eq!(move_named(&mut profiles, |p| &p.name, "work", Move::Up), None);
+        assert_eq!(
+            move_named(&mut profiles, |p| &p.name, "gone", Move::Down),
+            None
+        );
+        assert_eq!(profiles[0].name, "work");
     }
 
     #[test]
