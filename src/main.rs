@@ -2,6 +2,7 @@ mod app;
 mod browser;
 mod config;
 mod logs;
+mod platform;
 mod rdp;
 mod report;
 mod ssh;
@@ -41,6 +42,9 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    if let Some(code) = askpass() {
+        return Ok(code);
+    }
     let cli = Cli::parse();
 
     let paths = config::Paths::new()?;
@@ -65,6 +69,11 @@ fn main() -> Result<()> {
 
     if tunnel::which_ssh().is_none() {
         eprintln!("controlcenter: `ssh` was not found on PATH.");
+        if cfg!(windows) {
+            eprintln!(
+                "Install it with: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0"
+            );
+        }
         std::process::exit(2);
     }
 
@@ -82,6 +91,27 @@ fn main() -> Result<()> {
         .run(&mut terminal);
     restore_terminal(&mut terminal)?;
     res
+}
+
+/// Answer ssh's password prompt, when ssh is the one that started us.
+///
+/// ssh runs the program named by `SSH_ASKPASS` when it wants a password, hands
+/// it the prompt as an argument and reads one line back. Where `sshpass` is not
+/// installed — every Windows machine, since sshpass is built on pseudo-terminals
+/// and cannot exist there — that program is controlcenter itself, re-run with
+/// [`ssh::ASKPASS_ENV`] set. The password comes through the environment, the
+/// same way sshpass takes it, and never touches a command line.
+///
+/// This runs before the arguments are parsed, because the argument ssh passes
+/// is a prompt for a human and not a flag.
+fn askpass() -> Option<()> {
+    if std::env::var_os(ssh::ASKPASS_ENV).is_none() {
+        return None;
+    }
+    if let Ok(password) = std::env::var(ssh::PASSWORD_ENV) {
+        println!("{password}");
+    }
+    Some(())
 }
 
 /// `--vpn-scan`: what is on this machine, before the TUI is involved at all.

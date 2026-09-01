@@ -8,9 +8,13 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 139 tests, all pure unit tests — no network, no root
+cargo test             # 169 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
+
+Both systems are built and tested in CI (`.github/workflows/ci.yml`): Linux and Windows.
+A change to a `#[cfg(windows)]` path is not verified by a green build here — push it and
+read the Windows job.
 
 There is no test harness for the TUI itself. Anything drawn is verified by reading it;
 anything parsed, planned or rendered to a config file has unit tests next to it and should
@@ -20,7 +24,8 @@ keep having them.
 
 | file | holds |
 | --- | --- |
-| `src/main.rs` | CLI, terminal setup/teardown, and handing the terminal to an inline ssh session |
+| `src/main.rs` | CLI, terminal setup/teardown, handing the terminal to an inline ssh session, and the `SSH_ASKPASS` mode |
+| `src/platform.rs` | what differs between the systems and belongs to no one client: finding a binary, the null device, locking a file to its owner, looking up and stopping a process, whether we are elevated, and the Windows command-line and CSV parsers |
 | `src/app.rs` | all state and all key handling; the only place that decides what a key does |
 | `src/ui.rs` | all drawing; reads `App`, never mutates it |
 | `src/types.rs` | the config types, requirement parsing, conflict rules |
@@ -29,10 +34,10 @@ keep having them.
 | `src/report.rs` | the report `s` exports, and the redaction every line goes through |
 | `src/tunnel.rs` | spawning ssh, the counting relay, per-tunnel status |
 | `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline |
-| `src/rdp.rs` | xfreerdp3 sessions |
+| `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
 | `src/browser.rs` | the file picker |
 | `src/theme.rs` | the four colour themes |
-| `src/vpn/` | one module per client behind a shared interface in `mod.rs`, plus `privileged.rs` for pkexec/sudo and `scan.rs` for what is on the machine |
+| `src/vpn/` | one module per client behind a shared interface in `mod.rs`, plus `privileged.rs` for pkexec/sudo/elevation and `scan.rs` for what is on the machine |
 
 ## Conventions that matter here
 
@@ -81,6 +86,22 @@ dismissed. Do not make any of those quieter.
 focused. A popup that takes text (a form, a password prompt) is the exception: there `q`
 is a letter and only `Esc` closes.
 
+**One platform difference, in one place.** `platform.rs` holds what is true of the
+operating system and of no particular client; a client module holds what is true of its
+client on each system. Two rules keep the `#[cfg]`s from spreading:
+
+- a client module never asks which system it is on in order to find a binary, write a
+  private file, stop a process or check for root — it asks `platform`
+- a Windows code path that *parses* anything is written as a `#[cfg(any(windows, test))]`
+  function with its tests beside it, so the parsing is exercised on Linux too. That is
+  most of what the Windows halves are, and it is the only way any of it is checked before
+  it reaches a Windows machine. See `scan::parse_windows_processes`,
+  `wireguard::parse_services`, `platform::split_command_line`
+
+Where the two systems genuinely do different things — `wg-quick` against
+`wireguard.exe /installtunnelservice`, a pipe against a file only its owner can read —
+say so in the comment and say why, the same as any other decision.
+
 **Comments explain why, not what.** The existing comments are the house style: they
 justify a decision that would otherwise look arbitrary — why WireGuard is polled with `ip`
 rather than `wg show`, why openvpn is stopped through a pid file. Do not add comments that
@@ -111,11 +132,19 @@ next to it will be missing the step that explains the failure. Command lines com
 `build_args`-style function that spawning and reporting both call, so what a report shows
 is what actually ran.
 
-**Secrets never reach a command line.** Passwords go through the environment (`sshpass -e`)
-or a child's stdin (`xfreerdp /from-stdin`, `openvpn --auth-user-pass /dev/stdin`). Files
-that can hold one are written 0600, in 0700 directories — exported reports included. Do
-not add an argv path. Anything that leaves the program goes through `report::redact`
-first, because `extra_args` is free text and a user can type a password into it.
+**Secrets never reach a command line.** Passwords go through the environment (`sshpass -e`,
+`SSH_ASKPASS`) or a child's stdin (`xfreerdp /from-stdin`,
+`openvpn --auth-user-pass /dev/stdin`). Files that can hold one are written 0600, in 0700
+directories — exported reports included; on Windows the same rule is an ACL with the owner
+as its only entry, which is what `platform::restrict_file` writes. Do not add an argv path.
+Anything that leaves the program goes through `report::redact` first, because `extra_args`
+is free text and a user can type a password into it.
+
+Two clients cannot take a password any other way, and both are handled without weakening
+that rule rather than around it: mstsc reads a `.rdp` file, so the password goes in sealed
+with DPAPI to the current account, and openvpn on Windows reads a file, so one is written
+into the run directory and deleted once it has been read. Anything new that needs a file
+does the same: owner-only, in the run directory, swept.
 
 **Privilege escalation goes through `vpn/privileged.rs`.** `pkexec` first, `sudo -n` as
 the fallback, and a clear message when neither can work — unless `warm_up` took a sudo
@@ -123,6 +152,15 @@ ticket before the TUI started, in which case sudo goes first because it cannot b
 dismissed. That warm-up is the only place sudo is ever allowed to prompt, and it runs in
 `main` before the alternate screen, on the user's own terminal. Nothing else shells out to
 sudo, and status polling never escalates at all.
+
+Windows is a second implementation behind the same interface, in the same file. There is
+nothing to warm up: UAC settles the question before the process starts and cannot raise
+one afterwards. An elevated controlcenter runs the command itself; an unelevated one has
+`sudo --inline` where that exists and otherwise says so. Do not add a `runas` — a child in
+a window we cannot read and cannot signal is exactly the leaked VPN this file exists to
+prevent, and `privileged::command`, which streams openvpn's log, refuses rather than
+starting one. `ProviderId::needs_root` is what decides whether an action goes through this
+file at all, and it is platform-aware: Tailscale on Windows needs nothing.
 
 **Config is edited in the TUI and is hand-editable.** Adding a field means adding it to
 the type in `types.rs`, the form in `app.rs`, the panel in `ui.rs`, and

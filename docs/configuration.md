@@ -2,9 +2,13 @@
 
 Back to the [README](../README.md).
 
-Everything is edited in the TUI and stored as TOML under `~/.config/controlcenter/`, so
-you can also edit it by hand. `controlcenter --config-paths` prints exactly where each
-file lives.
+Everything is edited in the TUI and stored as TOML, so you can also edit it by hand.
+`controlcenter --config-paths` prints exactly where each file lives:
+
+| | |
+| --- | --- |
+| Linux | `~/.config/controlcenter/` |
+| Windows | `%APPDATA%\controlcenter\controlcenter\config\` |
 
 | file | holds | mode |
 | --- | --- | --- |
@@ -13,9 +17,14 @@ file lives.
 | `ssh.toml` | SSH hosts — may hold a password | 0600 |
 | `rdp.toml` | RDP connections | 0644 |
 | `vpn.toml` | WireGuard, OpenVPN and Tailscale profiles — may hold a key or a password | 0600 |
-| `wireguard/` | generated `.conf` files handed to `wg-quick` | 0700 |
+| `wireguard/` | generated `.conf` files handed to the WireGuard client | 0700 |
 | `openvpn/<name>/` | imported `.ovpn` files and their certificates | 0700 |
 | `reports/` | reports exported from a log pane with `s` | 0700, files 0600 |
+
+The modes are the Linux ones. Windows has no file modes, so the same rule is written as an
+ACL instead: `icacls <path> /inheritance:r /grant:r <you>:F` drops everything the parent
+directory granted — including the machine's administrators — and leaves your account as
+the only entry. A file that would be 0600 on Linux is yours alone on Windows too.
 
 NetBird is absent from `vpn.toml` on purpose: its profiles live in netbird and are only
 read. `reports/` is written to rather than read, and appears the first time you export
@@ -30,12 +39,23 @@ theme = "dark"                     # dark, dracula, nord, gruvbox — `t` cycles
 [ssh]
 terminal = "auto"                  # auto | inline | a terminal command line
 
+[rdp]
+client = "auto"                    # auto | freerdp | mstsc
+
 [vpn]
 sudo = "ask"                       # ask | auto | never
 on_exit = "ask"                    # ask | stop | keep
 ```
 
 `ssh.terminal` is explained in [connections.md](connections.md#ssh-sessions).
+
+`rdp.client` picks which client opens a session:
+
+| | |
+| --- | --- |
+| `auto` | the one this system ships — `mstsc` on Windows, `xfreerdp3` everywhere else (the default) |
+| `freerdp` | `xfreerdp3`, configured on its command line |
+| `mstsc` | Windows' own Remote Desktop Connection, configured through a `.rdp` file controlcenter writes |
 
 `vpn.sudo` decides whether controlcenter takes a sudo ticket on your terminal before the
 TUI starts, so that taking a VPN down later needs no polkit dialog:
@@ -48,6 +68,10 @@ TUI starts, so that taking a VPN down later needs no polkit dialog:
 
 Nothing is asked for when no client that needs root is installed. `--sudo <mode>`
 overrides it for one run. See [vpn.md](vpn.md#root).
+
+On Windows there is no ticket to take and the setting does nothing: a process is elevated
+or it is not, decided before it started. Start controlcenter as administrator to use
+WireGuard or OpenVPN there.
 
 `vpn.on_exit` decides what happens to OpenVPN sessions still up when you quit — `ask`
 (the default), `stop`, or `keep`. They run as root, so once controlcenter is gone nothing
@@ -113,14 +137,32 @@ host = "192.168.1.10"
 port = 3389
 domain = "CORP"                    # optional
 username = "admin"
-extra_args = "/f"                  # optional, passed to xfreerdp3 verbatim
+extra_args = "/f"                  # optional, passed to the client — see below
 requires_vpn = "*"                 # optional, see connections.md
 depends_on = "prod-db"             # optional, tunnel to bring up first
 ```
 
-Sessions launch as `xfreerdp3 /v:host:port /u:user [/d:domain] /dynamic-resolution
-/cert:ignore /from-stdin`, matching the classic rdp-wrap script, and keep running when you
-quit the TUI.
+With **freerdp**, sessions launch as `xfreerdp3 /v:host:port /u:user [/d:domain]
+/dynamic-resolution /cert:ignore /from-stdin`, matching the classic rdp-wrap script, and
+`extra_args` is appended to that command line verbatim.
+
+With **mstsc** there is no command line to append to: mstsc takes its settings in a `.rdp`
+file, so controlcenter writes one — host, port, user and domain, a window rather than the
+whole screen, and the certificate check relaxed the same way `/cert:ignore` relaxes it —
+into the runtime directory, hands mstsc the path, and deletes the file again once mstsc
+has read it. `extra_args` is read as a comma-separated list there, and each entry is
+either kind of thing:
+
+```toml
+extra_args = "/f, redirectclipboard:i:0, audiomode:i:2"
+```
+
+Anything shaped like a `.rdp` setting — `key:s:value`, `key:i:0`, `key:b:…` — goes into
+the file, replacing the generated line with the same key rather than fighting it.
+Everything else is passed to `mstsc` as a switch. A field written the freerdp way, with no
+commas at all, is still read as a run of switches.
+
+Sessions keep running when you quit the TUI, whichever client opened them.
 
 ## vpn.toml
 
@@ -133,7 +175,7 @@ name = "home"                      # also the interface name, so it must be a va
 config_path = ""                   # set this to use a .conf someone else maintains
 private_key = "…"                  # CLEARTEXT — `g` in the form generates a keypair
 address = "10.0.0.2/24"
-dns = ""                           # needs resolvconf or resolvectl on PATH
+dns = ""                           # on Linux, needs resolvconf or resolvectl on PATH
 listen_port = 0                    # 0 = let the kernel pick
 mtu = 0                            # 0 = default
 peer_public_key = "…"

@@ -9,7 +9,12 @@ use std::thread;
 const ME: ProviderId = ProviderId::Netbird;
 
 fn run(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("netbird")
+    let mut cmd = Command::new(crate::platform::program("netbird"));
+    #[cfg(windows)]
+    {
+        crate::platform::hidden(&mut cmd);
+    }
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| format!("running netbird: {e}"))?;

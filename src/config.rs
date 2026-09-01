@@ -18,7 +18,9 @@ pub struct Paths {
     /// One directory per imported OpenVPN profile: the `.ovpn` plus the
     /// certificates it ships with.
     pub openvpn_dir: PathBuf,
-    /// Short-lived files, e.g. the pid openvpn writes so it can be signalled.
+    /// Short-lived files: the pid openvpn writes so it can be signalled, and —
+    /// on the systems that need them — the credentials file openvpn reads and
+    /// the `.rdp` mstsc reads. Locked to its owner, and swept as they are used.
     pub run_dir: PathBuf,
     /// Reports exported from a log pane. Created the first time one is written.
     pub reports_dir: PathBuf,
@@ -58,9 +60,11 @@ impl Paths {
 
     pub fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.config_dir)?;
-        // These hold private keys and client certificates, so they are 0700
-        // even before a single file lands in them.
-        for dir in [&self.wireguard_dir, &self.openvpn_dir] {
+        // These hold private keys and client certificates — and, for the short
+        // while each one exists, the credentials file an OpenVPN reads and the
+        // `.rdp` mstsc reads — so they are locked to their owner even before a
+        // single file lands in them.
+        for dir in [&self.wireguard_dir, &self.openvpn_dir, &self.run_dir] {
             fs::create_dir_all(dir)?;
             restrict_dir(dir)?;
         }
@@ -148,30 +152,14 @@ pub fn save_ssh(path: &Path, hosts: &[SshHost]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+/// A file that can hold a password is readable by its owner and nobody else.
+/// What that takes differs per system; see [`crate::platform::restrict_file`].
 fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("locking down {}", path.display()))?;
-    Ok(())
+    crate::platform::restrict_file(path).map_err(|e| anyhow::anyhow!(e))
 }
 
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn restrict_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("locking down {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_dir(_path: &Path) -> Result<()> {
-    Ok(())
+    crate::platform::restrict_dir(path).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub fn load_vpn(path: &Path) -> Result<VpnConfig> {
@@ -201,7 +189,33 @@ pub struct AppConfig {
     #[serde(default)]
     pub ssh: SshConfig,
     #[serde(default)]
+    pub rdp: RdpConfig,
+    #[serde(default)]
     pub vpn: VpnAppConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RdpConfig {
+    /// Which client opens a session:
+    ///   auto     the one this system ships — mstsc on Windows, xfreerdp3
+    ///            everywhere else
+    ///   freerdp  xfreerdp3, configured on its command line
+    ///   mstsc    Windows' own Remote Desktop Connection, configured through a
+    ///            `.rdp` file controlcenter writes
+    #[serde(default = "default_rdp_client")]
+    pub client: String,
+}
+
+impl Default for RdpConfig {
+    fn default() -> Self {
+        Self {
+            client: default_rdp_client(),
+        }
+    }
+}
+
+fn default_rdp_client() -> String {
+    "auto".to_string()
 }
 
 /// How controlcenter handles the two things about a VPN that outlive it: the

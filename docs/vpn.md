@@ -15,6 +15,23 @@ poll runs in the background; the UI never blocks.
 | poll needs root | no | no | no | no |
 | connect | `profile select` + `up` | `wg-quick up <conf>` | `openvpn --config …` | `tailscale up --reset …` |
 
+### On Windows
+
+The clients are the same clients and the tab is the same tab; four things underneath it
+are not, and each is spelled out where it matters below.
+
+| | Windows |
+| --- | --- |
+| WireGuard needs | `wireguard.exe` and `wg.exe`, from the WireGuard for Windows installer |
+| WireGuard is driven with | `wireguard /installtunnelservice <conf>` and `/uninstalltunnelservice <name>` |
+| WireGuard is polled with | the `WireGuardTunnel$<name>` services, which is what installing one registers |
+| OpenVPN credentials go through | a file in the runtime directory, locked to you and deleted once openvpn has read it |
+| the sweep reads | `Win32_Process` and `Get-NetAdapter` rather than `/proc` and `ip` |
+| root is | being started as administrator — see [Root](#root) |
+
+controlcenter looks under `Program Files` as well as on `PATH`, so a client installed the
+normal way is found without anything being added to `PATH`.
+
 The status panel lists what requires the selected profile, and for a client that is not
 installed, what is already waiting on it. It also lists every connection found on the
 machine that controlcenter is *not* holding — see
@@ -35,11 +52,20 @@ counted as connected; one that no client accounts for at all is listed as **◆*
 be handed back to `wg-quick down`. Live handshake and transfer counters would need root,
 so the panel shows the byte counters `ip -s link` gives up for free instead.
 
+On Windows there is no `wg-quick`: the same generated `.conf` is handed to
+`wireguard.exe /installtunnelservice`, which registers a service that owns the tunnel, and
+`/uninstalltunnelservice <name>` takes it away again. The state is read from those
+services rather than from adapters, so a tunnel counts as up the moment it is installed
+and running, whether or not its adapter has appeared yet. Addresses and byte counters come
+from `Get-NetIPAddress` and `Get-NetAdapterStatistics`. Installing a tunnel is the one
+part that needs administrator; reading the state is not.
+
 Unless `config_path` points at a config someone else maintains, a WireGuard profile *is*
-the source of truth: the `.conf` handed to `wg-quick` is generated from the profile's
-fields into `~/.config/controlcenter/wireguard/<name>.conf` (0600, in a 0700 directory)
-and regenerated on every save. Nothing is ever written into root-owned `/etc/wireguard`,
-because `wg-quick` accepts a path.
+the source of truth: the `.conf` handed to the client is generated from the profile's
+fields into `wireguard/<name>.conf` in the config directory (0600, in a 0700 directory —
+on Windows, an ACL that leaves you as the only entry) and regenerated on every save.
+Nothing is ever written into root-owned `/etc/wireguard`, because both clients accept a
+path.
 
 `g` on the private key field in the form generates a keypair.
 
@@ -55,17 +81,29 @@ back. Credentials are written to the child's
 **stdin** (`--auth-user-pass /dev/stdin`), so they never appear in the process list or on
 disk.
 
+Windows has no `/dev/stdin` for a program to open, and openvpn there reads a console
+rather than a handed-down pipe. So on Windows the credentials go into a two-line file in
+the runtime directory instead — written with an ACL that leaves you as its only reader,
+in a directory with the same, and deleted twenty seconds after openvpn started, by which
+time it has read the file and kept what it found in memory. They are still never an
+argument, which is the part that matters: an argument is readable by every process on the
+machine for as long as the session lasts.
+
 Because the process runs as root, controlcenter cannot signal it directly — `kill` would
 only reach `pkexec` — so openvpn is started with `--writepid` and stopped by an escalated
 `kill`. **Disconnecting therefore asks for root a second time**, unless a sudo ticket was
-taken at startup, in which case it is silent — see [Root](#root).
+taken at startup, in which case it is silent — see [Root](#root). An elevated
+controlcenter on Windows owns the process outright and asks nothing.
 
 Stopping does not stop at asking. The pid file is not the only place the process is looked
-for: `/proc` is swept as well, so a session cancelled before openvpn got round to writing
-the file, or one that left a stale file behind, is still found. A `SIGTERM` that is not
-obeyed within a second and a half is followed by a `SIGKILL`. An openvpn left running is
-not a cosmetic failure — it keeps holding the server's slot, and the next connection to
-the same profile is thrown off it every couple of minutes by the one still there.
+for: the process list is swept as well, so a session cancelled before openvpn got round to
+writing the file, or one that left a stale file behind, is still found. A polite stop that
+is not obeyed within a second and a half is followed by a forceful one — `SIGTERM` then
+`SIGKILL`, and `taskkill /PID … /T` then the same with `/F` on Windows, where a console
+program with no window has nothing to ask politely and the forceful form is the one that
+does the work. An openvpn left running is not a cosmetic failure — it keeps holding the
+server's slot, and the next connection to the same profile is thrown off it every couple
+of minutes by the one still there.
 
 Quitting with sessions up asks what to do about them, because walking away has the same
 effect: **s** stops them, **k** leaves them running and writes down where they came from.
@@ -131,7 +169,8 @@ everything else, and `a`, `e`, `d` and `p` say why they do not apply. `controlce
 
 Two sources, because neither one is enough:
 
-**Processes**, from `/proc`. An OpenVPN connection *is* a process, so this is what can
+**Processes**, from `/proc` — from `Win32_Process` on Windows, which is the same list by
+another name. An OpenVPN connection *is* a process, so this is what can
 name one — by the `--config` it was started with, which for a profile controlcenter
 imported gives the profile's own name back — and the only thing that can stop it, by pid.
 It is also the only source that sees a client which is *failing* to connect: a session
@@ -139,12 +178,23 @@ stuck retrying holds no interface and still holds the server's slot. A process w
 `--writepid` points into controlcenter's run directory was started by a controlcenter that
 is no longer here, and the row says so.
 
-**Interfaces**, from `ip`. A tunnel actually carrying traffic has a device whoever made
-it. This is the catch-all, and for OpenVPN it is more than that: a killed openvpn does
+Windows withholds one thing from an unelevated reader: the command line of a process
+belonging to somebody else, or running elevated while controlcenter is not. Such a process
+is still listed and can still be stopped — that an openvpn is holding the server's slot is
+the half that matters — it just shows as its pid rather than by profile. Starting
+controlcenter as administrator gives it a name.
+
+**Interfaces**, from `ip` — from `Get-NetAdapter` on Windows. A tunnel actually carrying
+traffic has a device whoever made it. This is the catch-all, and for OpenVPN it is more than that: a killed openvpn does
 **not** take its device with it. The `ovpn` link outlives the process, keeps the address
 it was given, and is what the next connection collides with — openvpn logs `sitnl_send:
 rtnl: generic error (-17): File exists` and takes the next `tun` number instead. By then
 there is no process left to find it by, so the device is the only evidence there is.
+
+None of that applies on Windows, where an adapter is installed by the client's driver and
+is simply always there, connected or not: its being present says nothing about a leak. So
+only a WireGuard tunnel service is ever offered for removal there, and it goes back to
+`wireguard.exe`. The adapters are still listed, so what is up is visible.
 
 A device is only offered for removal once nothing is left that could still own it: while
 an OpenVPN process is running unaccounted for, a device it has not named is not a leak,
@@ -158,12 +208,16 @@ for* rather than guessed at. NetBird and Tailscale are daemons whose status alre
 reports the machine rather than this process, so nothing of theirs can be orphaned here.
 
 Nothing in the sweep escalates: reading `/proc/<pid>/cmdline` and listing links are both
-unprivileged. Only taking something down needs root.
+unprivileged, and so are the two PowerShell queries that replace them. Only taking
+something down needs root.
 
 ## Root
 
-WireGuard, OpenVPN and Tailscale need root to change the network. controlcenter never
-handles a password: it runs `pkexec`, so your polkit agent puts the prompt in front of
+WireGuard and OpenVPN need root to change the network, and so does Tailscale on Linux.
+
+### Linux
+
+controlcenter never handles a password: it runs `pkexec`, so your polkit agent puts the prompt in front of
 you, and falls back to `sudo -n` when there is no agent to answer — a bare tty, or an ssh
 session. If neither works it says so instead of hanging. Status polling never escalates,
 and neither does the sweep.
@@ -187,3 +241,22 @@ Nothing is asked for when no client that needs root is installed, and declining 
 the dialogs. `vpn.sudo` and `--sudo` choose between `ask`, `auto` (use a ticket that is
 already there, never prompt) and `never` — see
 [configuration.md](configuration.md#configtoml).
+
+### Windows
+
+None of that applies, because none of it can. UAC decides whether a process is elevated
+when it starts and cannot raise one afterwards, so there is no ticket to take and no agent
+to ask — the question is settled before controlcenter exists.
+
+**Start controlcenter as administrator** to use WireGuard or OpenVPN: right-click it and
+choose *Run as administrator*, or start it from an elevated terminal. It then runs those
+commands itself, with no dialog, and owns the OpenVPN process outright — which is exactly
+the property the sudo ticket buys on Linux, and for the same reason: a stop that can be
+dismissed is a VPN left running that nothing can reach.
+
+Started normally, controlcenter says so on the VPN tab and in an exported report, and
+everything else — tunnels, SSH, RDP, NetBird, Tailscale — works as usual. If the `sudo`
+that ships with current Windows is installed and its **inline** mode is turned on, VPN
+commands are routed through it instead, which asks for consent every time.
+
+`vpn.sudo` and `--sudo` do nothing here beyond `never`, which skips the check.

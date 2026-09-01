@@ -11,12 +11,14 @@
 //! what it finds and [`crate::app::App`] subtracts its own sessions. Two
 //! sources, because neither one is enough on its own:
 //!
-//! - **processes**, from `/proc`. An OpenVPN connection *is* a process, so this
+//! - **processes**, from `/proc` — from `Win32_Process` on Windows, which is
+//!   the same list by another name. An OpenVPN connection *is* a process, so this
 //!   is the source that can name one (by the `--config` it was started with)
 //!   and the only one that can stop it (by pid). It is also the only source
 //!   that sees a client which is failing to connect: a session stuck retrying
 //!   holds no interface yet still holds the server's slot.
-//! - **interfaces**, from `ip`. A tunnel actually carrying traffic has a device
+//! - **interfaces**, from `ip` — from `Get-NetAdapter` on Windows. A tunnel
+//!   actually carrying traffic has a device
 //!   whoever created it, so this is the catch-all — a device nothing else
 //!   accounts for is evidence, and is reported rather than dropped. It cannot
 //!   replace the process scan: a device says a tunnel exists, never whose it is
@@ -24,21 +26,41 @@
 //!
 //! Nothing here escalates, and nothing here is allowed to: reading another
 //! user's `/proc/<pid>/cmdline` and listing links are both unprivileged on an
-//! ordinary Linux, which is what lets the scan run on the same five-second
-//! clock as the rest of the status polling.
+//! ordinary Linux, and the two Windows queries are ordinary reads as well. That
+//! is what lets the scan run on the same five-second clock as the rest of the
+//! status polling. Windows does withhold one thing from an unelevated reader —
+//! the command line of a process running as somebody else — and the scan takes
+//! that as it comes: the process is still reported, it just cannot be named by
+//! the profile it is running.
 
 use super::{ProviderId, VpnMsg};
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::thread;
+
+/// Both separators, because these paths are not this program's.
+const SEPARATORS: [char; 2] = ['/', '\\'];
+
+/// The last component of a path exactly as the machine wrote it.
+///
+/// Not `Path::file_name`: a path read out of another process's command line is
+/// written with that system's separator, and a build of this parser for one
+/// system would read the other's separator as part of the name. Splitting on
+/// both is what makes the same code, and the same tests, right on either.
+fn base_name(path: &str) -> &str {
+    path.rsplit(SEPARATORS).next().unwrap_or(path)
+}
 
 /// The client binaries a running process can belong to. Only OpenVPN appears
 /// here for now: NetBird and Tailscale are daemons that are up whether or not
 /// anything is connected, so their own status is the honest source for them,
 /// and WireGuard has no process at all — its connection is the interface.
 fn provider_of_binary(name: &str) -> Option<ProviderId> {
-    match name {
+    // `openvpn` and `openvpn.exe` are the same client.
+    let name = name.to_ascii_lowercase();
+    match name.strip_suffix(".exe").unwrap_or(&name) {
         "openvpn" => Some(ProviderId::Openvpn),
         _ => None,
     }
@@ -99,17 +121,18 @@ impl Process {
         let Some(config) = self.config() else {
             return format!("pid {}", self.pid);
         };
-        let path = Path::new(config);
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-        match stem.as_deref() {
-            Some("config") | None => path
-                .parent()
-                .and_then(Path::file_name)
-                .map(|s| s.to_string_lossy().into_owned())
-                .or(stem)
-                .unwrap_or_else(|| format!("pid {}", self.pid)),
-            Some(_) => stem.unwrap(),
+        let file = base_name(config);
+        let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+        if stem == "config" || stem.is_empty() {
+            let dir = base_name(config.trim_end_matches(file).trim_end_matches(SEPARATORS));
+            if !dir.is_empty() {
+                return dir.to_string();
+            }
         }
+        if stem.is_empty() {
+            return format!("pid {}", self.pid);
+        }
+        stem.to_string()
     }
 
     /// Was this started by a controlcenter whose run directory is `run_dir`?
@@ -123,11 +146,7 @@ impl Process {
     /// How to stop it. The one place this command line is built, so what a
     /// report shows is what was actually run.
     pub fn stop_argv(&self, force: bool) -> Vec<String> {
-        vec![
-            "kill".to_string(),
-            if force { "-KILL" } else { "-TERM" }.to_string(),
-            self.pid.to_string(),
-        ]
+        crate::platform::kill_argv(self.pid, force)
     }
 }
 
@@ -143,7 +162,9 @@ pub enum LinkKind {
 }
 
 impl LinkKind {
-    /// What `ip link show type <kind>` is asked for.
+    /// What `ip link show type <kind>` is asked for. Linux's question; Windows
+    /// asks for every adapter at once and sorts them out afterwards.
+    #[cfg(unix)]
     pub fn query(self) -> &'static str {
         match self {
             Self::Wireguard => "wireguard",
@@ -210,6 +231,7 @@ impl Link {
     /// config to go with it, a better answer than pulling a link out from under
     /// whatever owns it. An `ovpn` device has no such owner by the time it is
     /// offered here (see `App::foreign_for`), so it is deleted outright.
+    #[cfg(not(windows))]
     pub fn remove_argv(&self) -> Vec<String> {
         match self.kind {
             LinkKind::Wireguard => {
@@ -220,6 +242,34 @@ impl Link {
                 "link".to_string(),
                 "delete".to_string(),
                 self.name.clone(),
+            ],
+        }
+    }
+
+    /// The same reasoning on Windows, where a WireGuard interface is a service
+    /// the client installed and giving it back to the client is `wireguard.exe`.
+    ///
+    /// No other kind is ever offered here: an OpenVPN or Tailscale adapter on
+    /// Windows is installed by the client's driver and outlives every session
+    /// by design, so its being there says nothing about a leak — see
+    /// [`windows_link_kind`], which is why none of them is classified `Ovpn`.
+    /// Disabling the adapter is what Windows offers for one that is genuinely
+    /// stuck, and that is what the arm does.
+    #[cfg(windows)]
+    pub fn remove_argv(&self) -> Vec<String> {
+        match self.kind {
+            LinkKind::Wireguard => vec![
+                "wireguard".to_string(),
+                "/uninstalltunnelservice".to_string(),
+                self.name.clone(),
+            ],
+            LinkKind::Ovpn | LinkKind::Tun => vec![
+                "netsh".to_string(),
+                "interface".to_string(),
+                "set".to_string(),
+                "interface".to_string(),
+                self.name.clone(),
+                "admin=disable".to_string(),
             ],
         }
     }
@@ -334,6 +384,7 @@ impl Foreign {
 // ---------------------------------------------------------------------------
 
 /// argv as `/proc/<pid>/cmdline` holds it: NUL-separated, usually NUL-terminated.
+#[cfg(any(unix, test))]
 fn split_cmdline(raw: &[u8]) -> Vec<String> {
     raw.split(|b| *b == 0)
         .filter(|part| !part.is_empty())
@@ -347,12 +398,11 @@ fn split_cmdline(raw: &[u8]) -> Vec<String> {
 /// controlcenter's own sessions are started through — is not counted a second
 /// time alongside the openvpn it exec'd.
 fn provider_of(argv: &[String]) -> Option<ProviderId> {
-    let program = argv.first()?;
-    let base = Path::new(program).file_name()?.to_str()?;
-    provider_of_binary(base)
+    provider_of_binary(base_name(argv.first()?))
 }
 
 /// The real uid from `/proc/<pid>/status`.
+#[cfg(any(unix, test))]
 fn uid_in_status(raw: &str) -> Option<u32> {
     raw.lines()
         .find_map(|l| l.strip_prefix("Uid:"))?
@@ -368,6 +418,7 @@ fn uid_in_status(raw: &str) -> Option<u32> {
 /// The fields are counted from the *end* of the command name rather than by
 /// splitting the whole line: field 2 is the executable name in parentheses and
 /// may itself contain spaces and brackets.
+#[cfg(any(unix, test))]
 fn starttime_in_stat(raw: &str, ticks_per_sec: u64) -> Option<u64> {
     // Everything after the comm field is fields 3 onwards, so field 22 is the
     // twentieth of them.
@@ -377,6 +428,7 @@ fn starttime_in_stat(raw: &str, ticks_per_sec: u64) -> Option<u64> {
 }
 
 /// Seconds since boot, from `/proc/uptime`.
+#[cfg(unix)]
 fn uptime_secs() -> Option<u64> {
     let raw = std::fs::read_to_string("/proc/uptime").ok()?;
     let secs: f64 = raw.split_whitespace().next()?.parse().ok()?;
@@ -386,8 +438,14 @@ fn uptime_secs() -> Option<u64> {
 /// The kernel's tick rate. `USER_HZ` is 100 on every Linux port that matters
 /// and there is no way to ask for it without libc, so it is assumed — this
 /// only ever moves the "running for" column, never a decision.
+#[cfg(unix)]
 const USER_HZ: u64 = 100;
 
+// ---------------------------------------------------------------------------
+// Reading the machine: /proc and ip
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
 fn read_processes() -> Vec<Process> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -436,6 +494,7 @@ fn read_processes() -> Vec<Process> {
 // ip
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn ip(args: &[&str]) -> Result<String, String> {
     let out = Command::new("ip")
         .args(args)
@@ -453,6 +512,7 @@ fn ip(args: &[&str]) -> Result<String, String> {
 /// Asking the kernel to filter by kind is why nothing here has to parse the
 /// device-type section of `ip -d`, which differs from device to device. A
 /// `master` in the flags means the device is enslaved to a bridge.
+#[cfg(any(unix, test))]
 fn parse_links(raw: &str, kind: LinkKind) -> Vec<Link> {
     raw.lines()
         .filter_map(|line| {
@@ -487,6 +547,7 @@ fn parse_links(raw: &str, kind: LinkKind) -> Vec<Link> {
 }
 
 /// Addresses per interface, from `ip -o addr show`.
+#[cfg(any(unix, test))]
 fn parse_addrs(raw: &str) -> Vec<(String, String)> {
     raw.lines()
         .filter_map(|line| {
@@ -502,6 +563,7 @@ fn parse_addrs(raw: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+#[cfg(unix)]
 fn read_links() -> (Vec<Link>, Option<String>) {
     let mut links: Vec<Link> = Vec::new();
     let mut error = None;
@@ -526,8 +588,165 @@ fn read_links() -> (Vec<Link>, Option<String>) {
     (links, error)
 }
 
-/// Read the machine. Runs on a thread; takes a few milliseconds of `/proc` and
-/// four `ip` calls.
+// ---------------------------------------------------------------------------
+// Reading the machine: Win32_Process and Get-NetAdapter
+// ---------------------------------------------------------------------------
+
+/// The process names asked for, which is the same list [`provider_of_binary`]
+/// knows written the way Windows writes it. Asking for them by name rather than
+/// listing every process is what keeps this cheap enough for the poll.
+#[cfg(windows)]
+const WINDOWS_CLIENT_BINARIES: &[&str] = &["openvpn.exe"];
+
+/// `Win32_Process`, which is the same list `/proc` is, with the command line
+/// already assembled into one string.
+///
+/// `CommandLine` comes back empty for a process this one is not allowed to
+/// read — on Windows that is any process belonging to somebody else or running
+/// elevated while we are not. The process is still reported: that an openvpn is
+/// running and holding the server's slot is the important half, and it can
+/// still be stopped by pid. It just cannot be named by its profile, and
+/// [`Process::label`] already falls back to the pid for exactly that case.
+#[cfg(windows)]
+fn read_processes() -> Vec<Process> {
+    let filter = WINDOWS_CLIENT_BINARIES
+        .iter()
+        .map(|n| format!("Name='{n}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"{filter}\" | Select-Object ProcessId,Name,CommandLine,@{{n='AgeSeconds';e={{[int]((Get-Date)-$_.CreationDate).TotalSeconds}}}} | ConvertTo-Csv -NoTypeInformation"
+    );
+    let Ok(raw) = crate::platform::powershell(&script) else {
+        return Vec::new();
+    };
+    let mut found = parse_windows_processes(&raw);
+    found.sort_by_key(|p| p.pid);
+    found
+}
+
+/// Turn the CSV of [`read_processes`] into the rows the tab lists.
+#[cfg(any(windows, test))]
+fn parse_windows_processes(raw: &str) -> Vec<Process> {
+    use crate::platform::{csv_field, parse_csv, split_command_line};
+    parse_csv(raw)
+        .iter()
+        .filter_map(|row| {
+            let pid: u32 = csv_field(row, "ProcessId")?.parse().ok()?;
+            // With no command line to read, the name is all there is to go on.
+            let argv = match csv_field(row, "CommandLine") {
+                Some(line) => split_command_line(line),
+                None => vec![csv_field(row, "Name")?.to_string()],
+            };
+            Some(Process {
+                pid,
+                provider: provider_of(&argv)?,
+                argv,
+                // Windows has no uid, and asking who owns a process needs a
+                // second query per pid. `root` is only ever used to decorate a
+                // row, so it goes unanswered rather than escalating for it.
+                uid: u32::MAX,
+                age_secs: csv_field(row, "AgeSeconds").and_then(|a| a.parse().ok()),
+            })
+        })
+        .collect()
+}
+
+/// What kind of tunnel a Windows adapter is, by what installed it.
+///
+/// Adapter descriptions are the vendor's own strings rather than anything
+/// Windows translates, so they are the one part of this that reads the same on
+/// every machine.
+///
+/// Note what is deliberately absent: nothing is classified [`LinkKind::Ovpn`].
+/// That kind means "a device that outlived the process that made it", which is
+/// a Linux failure — on Windows the TAP adapter OpenVPN uses is installed by
+/// its driver and is simply always there, connected or not. Calling it `Tun`
+/// puts it under the rule that a tunnel has an address, which is what tells an
+/// idle adapter apart from one carrying a connection.
+#[cfg(any(windows, test))]
+fn windows_link_kind(name: &str, description: &str) -> Option<LinkKind> {
+    let haystack = format!("{name} {description}").to_ascii_lowercase();
+    if haystack.contains("wireguard") {
+        return Some(LinkKind::Wireguard);
+    }
+    for marker in ["tap-windows", "openvpn", "wintun", "tailscale", "tap-win"] {
+        if haystack.contains(marker) {
+            return Some(LinkKind::Tun);
+        }
+    }
+    None
+}
+
+/// Adapters, from `Get-NetAdapter`. Everything that is not a tunnel of some
+/// kind is dropped here rather than carried and filtered later.
+#[cfg(any(windows, test))]
+fn parse_windows_links(raw: &str) -> Vec<Link> {
+    use crate::platform::{csv_field, parse_csv};
+    parse_csv(raw)
+        .iter()
+        .filter_map(|row| {
+            let name = csv_field(row, "Name")?;
+            let description = csv_field(row, "InterfaceDescription").unwrap_or("");
+            Some(Link {
+                name: name.to_string(),
+                kind: windows_link_kind(name, description)?,
+                // Windows has bridges, but not as a property of the adapter
+                // that would tell a tunnel from a virtual machine's tap.
+                bridged: false,
+                carrier: csv_field(row, "Status") == Some("Up"),
+                addrs: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Addresses per adapter, from `Get-NetIPAddress`. Written back as
+/// `address/prefix`, which is how the other half of the program has them.
+#[cfg(any(windows, test))]
+fn parse_windows_addrs(raw: &str) -> Vec<(String, String)> {
+    use crate::platform::{csv_field, parse_csv};
+    parse_csv(raw)
+        .iter()
+        .filter_map(|row| {
+            let iface = csv_field(row, "InterfaceAlias")?;
+            let addr = csv_field(row, "IPAddress")?;
+            let prefix = csv_field(row, "PrefixLength").unwrap_or("");
+            Some((
+                iface.to_string(),
+                if prefix.is_empty() {
+                    addr.to_string()
+                } else {
+                    format!("{addr}/{prefix}")
+                },
+            ))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn read_links() -> (Vec<Link>, Option<String>) {
+    use crate::platform::powershell;
+    let (mut links, error) = match powershell(
+        "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceDescription,Status | ConvertTo-Csv -NoTypeInformation",
+    ) {
+        Ok(out) => (parse_windows_links(&out), None),
+        Err(e) => (Vec::new(), Some(format!("listing interfaces: {e}"))),
+    };
+    if let Ok(out) = powershell(
+        "Get-NetIPAddress | Select-Object InterfaceAlias,IPAddress,PrefixLength | ConvertTo-Csv -NoTypeInformation",
+    ) {
+        for (iface, addr) in parse_windows_addrs(&out) {
+            if let Some(link) = links.iter_mut().find(|l| l.name == iface) {
+                link.addrs.push(addr);
+            }
+        }
+    }
+    (links, error)
+}
+
+/// Read the machine. Runs on a thread: a few milliseconds of `/proc` and four
+/// `ip` calls on Linux, two PowerShell queries on Windows.
 pub fn scan() -> Scan {
     let (links, error) = read_links();
     Scan {
@@ -636,8 +855,13 @@ mod tests {
 
     #[test]
     fn the_command_that_stops_a_process_is_built_in_one_place() {
-        assert_eq!(ovpn(77, &["openvpn"]).stop_argv(false), ["kill", "-TERM", "77"]);
-        assert_eq!(ovpn(77, &["openvpn"]).stop_argv(true), ["kill", "-KILL", "77"]);
+        // The command differs per system; that it names this pid, and only
+        // escalates when it has to, does not.
+        let polite = ovpn(77, &["openvpn"]).stop_argv(false);
+        let forced = ovpn(77, &["openvpn"]).stop_argv(true);
+        assert!(polite.contains(&"77".to_string()));
+        assert!(forced.contains(&"77".to_string()));
+        assert_ne!(polite, forced);
     }
 
     #[test]
@@ -728,7 +952,10 @@ mod tests {
         assert!(links[0].is_tunnel());
         assert!(links[0].detail().contains("no carrier"));
         assert!(links[0].detail().contains("192.168.233.5/24"));
-        // An ovpn device has no client left to hand it back to.
+        // An ovpn device has no client left to hand it back to, so on Linux it
+        // is taken away outright. (Windows never offers one — see
+        // `windows_link_kind`.)
+        #[cfg(not(windows))]
         assert_eq!(links[0].remove_argv(), ["ip", "link", "delete", "tun0"]);
     }
 
@@ -792,6 +1019,97 @@ mod tests {
         });
         assert_eq!(theirs.name(), "wt0");
         assert!(theirs.detail(run).contains("not controlcenter's"));
-        assert_eq!(theirs.stop_argv(false), ["wg-quick", "down", "wt0"]);
+        // Back to whichever client makes a wireguard interface here.
+        let argv = theirs.stop_argv(false);
+        assert!(argv.contains(&"wt0".to_string()));
+        assert!(argv[0].contains(if cfg!(windows) { "wireguard" } else { "wg-quick" }));
+    }
+
+    // -----------------------------------------------------------------------
+    // The Windows half. Its parsers are plain string work, so they are tested
+    // wherever the tests run rather than only on the system they are for.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_windows_openvpn_is_read_out_of_win32_process() {
+        let raw = concat!(
+            "\"ProcessId\",\"Name\",\"CommandLine\",\"AgeSeconds\"\r\n",
+            "\"4312\",\"openvpn.exe\",\"\"\"C:\\Program Files\\OpenVPN\\bin\\openvpn.exe\"\" --config \"\"C:\\cc\\work\\config.ovpn\"\" --writepid C:\\run\\openvpn-work.pid\",\"3600\"\r\n",
+        );
+        let found = parse_windows_processes(raw);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pid, 4312);
+        assert_eq!(found[0].provider, ProviderId::Openvpn);
+        assert_eq!(found[0].config(), Some(r"C:\cc\work\config.ovpn"));
+        assert_eq!(found[0].label(), "work");
+        assert_eq!(found[0].age_secs, Some(3600));
+        // There is no uid to read, so nothing claims one.
+        assert!(!found[0].root());
+    }
+
+    #[test]
+    fn a_process_whose_command_line_is_withheld_is_still_reported() {
+        // What an unelevated read of somebody else's openvpn looks like: the
+        // pid is there, the argv is not. It can still be stopped.
+        let raw = "\"ProcessId\",\"Name\",\"CommandLine\",\"AgeSeconds\"\r\n\"77\",\"openvpn.exe\",\"\",\"12\"\r\n";
+        let found = parse_windows_processes(raw);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].provider, ProviderId::Openvpn);
+        assert_eq!(found[0].config(), None);
+        assert_eq!(found[0].label(), "pid 77");
+    }
+
+    #[test]
+    fn windows_adapters_are_classified_by_what_installed_them() {
+        assert_eq!(
+            windows_link_kind("home", "WireGuard Tunnel #1"),
+            Some(LinkKind::Wireguard)
+        );
+        assert_eq!(
+            windows_link_kind("Ethernet 2", "TAP-Windows Adapter V9"),
+            Some(LinkKind::Tun)
+        );
+        assert_eq!(
+            windows_link_kind("tailscale0", "Tailscale Tunnel"),
+            Some(LinkKind::Tun)
+        );
+        // An ordinary card is not a tunnel and is not carried at all.
+        assert_eq!(windows_link_kind("Ethernet", "Intel(R) I219-V"), None);
+        // Nothing on Windows is ever the kind that means "left behind".
+        assert!(windows_link_kind("x", "OpenVPN Wintun") != Some(LinkKind::Ovpn));
+    }
+
+    #[test]
+    fn windows_links_and_their_addresses_come_back_joined_up() {
+        let links = "\"Name\",\"InterfaceDescription\",\"Status\"\r\n\"home\",\"WireGuard Tunnel\",\"Up\"\r\n\"Ethernet\",\"Intel(R) I219-V\",\"Up\"\r\n\"tap0\",\"TAP-Windows Adapter V9\",\"Disconnected\"\r\n";
+        let mut parsed = parse_windows_links(links);
+        assert_eq!(parsed.len(), 2, "the ordinary card is not carried");
+        assert!(parsed[0].carrier);
+        assert!(!parsed[1].carrier);
+
+        let addrs = "\"InterfaceAlias\",\"IPAddress\",\"PrefixLength\"\r\n\"home\",\"10.0.0.2\",\"24\"\r\n";
+        for (iface, addr) in parse_windows_addrs(addrs) {
+            if let Some(l) = parsed.iter_mut().find(|l| l.name == iface) {
+                l.addrs.push(addr);
+            }
+        }
+        assert_eq!(parsed[0].addrs, vec!["10.0.0.2/24"]);
+        assert!(parsed[0].is_tunnel());
+        // A TAP adapter with no address is an idle driver, not a leak.
+        assert!(!parsed[1].is_tunnel());
+    }
+
+    #[test]
+    fn a_wireguard_interface_goes_back_to_the_client_that_made_it() {
+        let link = Link {
+            name: "home".into(),
+            kind: LinkKind::Wireguard,
+            bridged: false,
+            carrier: true,
+            addrs: vec!["10.0.0.2/24".into()],
+        };
+        let argv = link.remove_argv();
+        assert!(argv.contains(&"home".to_string()));
+        assert!(argv[0].contains(if cfg!(windows) { "wireguard" } else { "wg-quick" }));
     }
 }

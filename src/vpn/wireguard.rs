@@ -1,13 +1,20 @@
-//! WireGuard through `wg-quick`.
+//! WireGuard through `wg-quick`, and through `wireguard.exe` on Windows.
 //!
-//! Two things shape this module. `wg-quick up` accepts a path, so the configs
+//! Three things shape this module. `wg-quick up` accepts a path, so the configs
 //! controlcenter generates can live in its own config directory and nothing ever
-//! has to be written into root-owned `/etc/wireguard`. And `wg show` needs
+//! has to be written into root-owned `/etc/wireguard`. `wg show` needs
 //! CAP_NET_ADMIN, so the five-second poll uses `ip` instead — an interface named
-//! after a profile existing is exactly what "that profile is up" means.
+//! after a profile existing is exactly what "that profile is up" means. And
+//! Windows has no `wg-quick` at all: there the same config is handed to
+//! `wireguard.exe /installtunnelservice`, which registers a service that owns
+//! the tunnel, and the adapter it creates is again named after the file. So the
+//! rule that reads the state — an interface named after the profile is that
+//! profile being up — is the same one on both, which is why the poll below is
+//! not two polls.
 
 use super::{privileged, ProviderId, VpnMsg, VpnProfile, VpnStatus};
-use crate::tunnel::which_bin;
+#[cfg(not(windows))]
+use crate::platform::which_bin;
 use crate::types::WireguardProfile;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +97,9 @@ pub fn validate(p: &WireguardProfile) -> Result<(), String> {
     if p.endpoint.is_empty() {
         return Err("endpoint is required, e.g. vpn.example.com:51820".into());
     }
+    // A wg-quick concern only: it shells out to one of these to install the
+    // DNS server. The Windows service does it itself and needs neither.
+    #[cfg(not(windows))]
     if !p.dns.is_empty() && which_bin("resolvconf").is_none() && which_bin("resolvectl").is_none() {
         return Err(
             "DNS is set but neither resolvconf nor resolvectl is on PATH; wg-quick will fail"
@@ -166,7 +176,11 @@ pub fn remove_conf(p: &WireguardProfile, dir: &Path) {
 fn wg(args: &[&str], stdin: Option<&str>) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut cmd = Command::new("wg");
+    let mut cmd = Command::new(crate::platform::program("wg"));
+    #[cfg(windows)]
+    {
+        crate::platform::hidden(&mut cmd);
+    }
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
@@ -199,8 +213,24 @@ pub fn public_key(private: &str) -> Result<String, String> {
     wg(&["pubkey"], Some(&format!("{private}\n")))
 }
 
+// ---------------------------------------------------------------------------
+// Reading the live state
+//
+// Three questions — which interfaces exist, what address one has, how much has
+// gone through it — asked of `ip` on Unix and of PowerShell on Windows. All six
+// answers are unprivileged: a status poll never escalates.
+// ---------------------------------------------------------------------------
+
+/// The wireguard interfaces that currently exist, which is the list of profiles
+/// that are up.
+#[cfg(not(windows))]
+fn interfaces_up() -> Result<Vec<String>, String> {
+    ip(&["-o", "link", "show", "type", "wireguard"]).map(|out| parse_interfaces(&out))
+}
+
 /// Names of the wireguard interfaces that currently exist. `ip` is unprivileged,
 /// which is the whole reason the poll uses it instead of `wg show`.
+#[cfg(any(not(windows), test))]
 fn parse_interfaces(raw: &str) -> Vec<String> {
     raw.lines()
         .filter_map(|line| {
@@ -213,6 +243,7 @@ fn parse_interfaces(raw: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(not(windows))]
 fn ip(args: &[&str]) -> Result<String, String> {
     let out = Command::new("ip")
         .args(args)
@@ -225,7 +256,16 @@ fn ip(args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The address the interface actually got, from `ip -o addr show dev <iface>`.
+/// The address the interface actually got.
+#[cfg(not(windows))]
+fn addresses(iface: &str) -> Vec<String> {
+    ip(&["-o", "addr", "show", "dev", iface])
+        .map(|out| parse_addresses(&out))
+        .unwrap_or_default()
+}
+
+/// From `ip -o addr show dev <iface>`.
+#[cfg(any(not(windows), test))]
 fn parse_addresses(raw: &str) -> Vec<String> {
     raw.lines()
         .filter_map(|line| {
@@ -239,8 +279,14 @@ fn parse_addresses(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// RX/TX byte counters from `ip -s link show dev <iface>`, which is also
-/// unprivileged — the closest thing to `wg show` transfer stats without root.
+/// Bytes in and out, the closest thing to `wg show` transfer stats without root.
+#[cfg(not(windows))]
+fn counters(iface: &str) -> Option<(u64, u64)> {
+    parse_counters(&ip(&["-s", "link", "show", "dev", iface]).ok()?)
+}
+
+/// From `ip -s link show dev <iface>`, which is also unprivileged.
+#[cfg(any(not(windows), test))]
 fn parse_counters(raw: &str) -> Option<(u64, u64)> {
     let lines: Vec<&str> = raw.lines().map(str::trim).collect();
     let mut rx = None;
@@ -256,13 +302,99 @@ fn parse_counters(raw: &str) -> Option<(u64, u64)> {
     Some((rx?, tx?))
 }
 
+// ---------------------------------------------------------------------------
+// The same three questions, asked of Windows
+// ---------------------------------------------------------------------------
+
+/// A name going into a PowerShell single-quoted string. The interface names
+/// controlcenter generates cannot contain a quote, but one taken from the stem
+/// of a config file the user pointed at can.
+#[cfg(any(windows, test))]
+fn ps_quote(name: &str) -> String {
+    name.replace('\'', "''")
+}
+
+/// The tunnels `wireguard.exe` currently has installed.
+///
+/// Asked of the services rather than the adapters: `/installtunnelservice`
+/// registers `WireGuardTunnel$<name>`, so the service list is the state
+/// exactly, including a tunnel whose adapter has not appeared yet. Reading it
+/// needs nothing beyond being logged in.
+#[cfg(windows)]
+fn interfaces_up() -> Result<Vec<String>, String> {
+    crate::platform::powershell(
+        "Get-Service -Name 'WireGuardTunnel$*' -ErrorAction SilentlyContinue | Select-Object Name,Status | ConvertTo-Csv -NoTypeInformation",
+    )
+    .map(|out| parse_services(&out))
+}
+
+/// The profile names out of `Get-Service`'s rows: `WireGuardTunnel$home` is the
+/// tunnel `home`. A service that is registered but not running is not up.
+#[cfg(any(windows, test))]
+fn parse_services(raw: &str) -> Vec<String> {
+    use crate::platform::{csv_field, parse_csv};
+    parse_csv(raw)
+        .iter()
+        .filter(|row| csv_field(row, "Status") == Some("Running"))
+        .filter_map(|row| {
+            let name = csv_field(row, "Name")?;
+            let (_, tunnel) = name.split_once('$')?;
+            (!tunnel.is_empty()).then(|| tunnel.to_string())
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn addresses(iface: &str) -> Vec<String> {
+    let script = format!(
+        "Get-NetIPAddress -InterfaceAlias '{}' -ErrorAction SilentlyContinue | Select-Object IPAddress,PrefixLength | ConvertTo-Csv -NoTypeInformation",
+        ps_quote(iface)
+    );
+    crate::platform::powershell(&script)
+        .map(|out| parse_windows_addresses(&out))
+        .unwrap_or_default()
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_addresses(raw: &str) -> Vec<String> {
+    use crate::platform::{csv_field, parse_csv};
+    parse_csv(raw)
+        .iter()
+        .filter_map(|row| {
+            let addr = csv_field(row, "IPAddress")?;
+            Some(match csv_field(row, "PrefixLength") {
+                Some(prefix) => format!("{addr}/{prefix}"),
+                None => addr.to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn counters(iface: &str) -> Option<(u64, u64)> {
+    let script = format!(
+        "Get-NetAdapterStatistics -Name '{}' -ErrorAction SilentlyContinue | Select-Object ReceivedBytes,SentBytes | ConvertTo-Csv -NoTypeInformation",
+        ps_quote(iface)
+    );
+    parse_windows_counters(&crate::platform::powershell(&script).ok()?)
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_counters(raw: &str) -> Option<(u64, u64)> {
+    use crate::platform::{csv_field, parse_csv};
+    let rows = parse_csv(raw);
+    let row = rows.first()?;
+    Some((
+        csv_field(row, "ReceivedBytes")?.parse().ok()?,
+        csv_field(row, "SentBytes")?.parse().ok()?,
+    ))
+}
+
 fn status_for(profile: &WireguardProfile, iface: &str) -> VpnStatus {
     let mut fields = vec![("Interface".to_string(), iface.to_string())];
-    if let Ok(out) = ip(&["-o", "addr", "show", "dev", iface]) {
-        let addrs = parse_addresses(&out);
-        if !addrs.is_empty() {
-            fields.push(("Address".into(), addrs.join(", ")));
-        }
+    let addrs = addresses(iface);
+    if !addrs.is_empty() {
+        fields.push(("Address".into(), addrs.join(", ")));
     }
     if !profile.endpoint.is_empty() {
         fields.push(("Endpoint".into(), profile.endpoint.clone()));
@@ -276,17 +408,15 @@ fn status_for(profile: &WireguardProfile, iface: &str) -> VpnStatus {
     if profile.external() {
         fields.push(("Config".into(), profile.config_path.clone()));
     }
-    if let Ok(out) = ip(&["-s", "link", "show", "dev", iface]) {
-        if let Some((rx, tx)) = parse_counters(&out) {
-            fields.push((
-                "Transfer".into(),
-                format!(
-                    "{} received, {} sent",
-                    crate::ui::human_bytes(rx),
-                    crate::ui::human_bytes(tx)
-                ),
-            ));
-        }
+    if let Some((rx, tx)) = counters(iface) {
+        fields.push((
+            "Transfer".into(),
+            format!(
+                "{} received, {} sent",
+                crate::ui::human_bytes(rx),
+                crate::ui::human_bytes(tx)
+            ),
+        ));
     }
     VpnStatus {
         connected: true,
@@ -298,8 +428,8 @@ fn status_for(profile: &WireguardProfile, iface: &str) -> VpnStatus {
 
 pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<WireguardProfile>) {
     thread::spawn(move || {
-        let up = match ip(&["-o", "link", "show", "type", "wireguard"]) {
-            Ok(out) => parse_interfaces(&out),
+        let up = match interfaces_up() {
+            Ok(names) => names,
             Err(e) => {
                 let _ = tx.send(VpnMsg::Refreshed {
                     provider: ME,
@@ -380,11 +510,7 @@ pub fn connect(
             return Vec::new();
         }
     };
-    let argv = vec![
-        "wg-quick".to_string(),
-        "up".to_string(),
-        path.to_string_lossy().into_owned(),
-    ];
+    let argv = up_argv(&path);
     let ran = vec![as_root(&argv)];
     action(tx, desc, argv, stored);
     ran
@@ -399,15 +525,58 @@ pub fn disconnect(
     // `wg-quick down` also accepts a bare interface name, which is what we want
     // when the config was never written or has since been deleted.
     let path = conf_path(&profile, dir);
-    let target = if path.exists() {
-        path.to_string_lossy().into_owned()
-    } else {
-        profile.interface()
-    };
-    let argv = vec!["wg-quick".to_string(), "down".to_string(), target];
+    let argv = down_argv(&path, &profile.interface());
     let ran = vec![as_root(&argv)];
     action(tx, format!("taking down '{}'", profile.name), argv, stored);
     ran
+}
+
+/// Bringing the interface up, per client.
+///
+/// `wg-quick up <path>` and `wireguard /installtunnelservice <path>` are the
+/// same act said twice: both read the config, create the interface named after
+/// it, and own it until they are told otherwise.
+#[cfg(not(windows))]
+pub fn up_argv(conf: &Path) -> Vec<String> {
+    vec![
+        "wg-quick".to_string(),
+        "up".to_string(),
+        conf.to_string_lossy().into_owned(),
+    ]
+}
+
+#[cfg(windows)]
+pub fn up_argv(conf: &Path) -> Vec<String> {
+    vec![
+        "wireguard".to_string(),
+        "/installtunnelservice".to_string(),
+        conf.to_string_lossy().into_owned(),
+    ]
+}
+
+/// And taking it down again.
+///
+/// `wg-quick down` also accepts a bare interface name, which is what we want
+/// when the config was never written or has since been deleted. Windows only
+/// ever takes the name — the service is registered under it, and the file it
+/// was installed from is beside the point by then.
+#[cfg(not(windows))]
+pub fn down_argv(conf: &Path, interface: &str) -> Vec<String> {
+    let target = if conf.exists() {
+        conf.to_string_lossy().into_owned()
+    } else {
+        interface.to_string()
+    };
+    vec!["wg-quick".to_string(), "down".to_string(), target]
+}
+
+#[cfg(windows)]
+pub fn down_argv(_conf: &Path, interface: &str) -> Vec<String> {
+    vec![
+        "wireguard".to_string(),
+        "/uninstalltunnelservice".to_string(),
+        interface.to_string(),
+    ]
 }
 
 /// How the log writes a command that went through the escalation helper.
@@ -524,5 +693,43 @@ mod tests {
         let raw = "5: home: <POINTOPOINT,NOARP,UP> mtu 1420\n    link/none\n    RX: bytes  packets  errors  dropped  missed   mcast\n    1048576    900      0       0        0        0\n    TX: bytes  packets  errors  dropped  carrier collsns\n    2097152    1200     0       0        0       0\n";
         assert_eq!(parse_counters(raw), Some((1048576, 2097152)));
         assert_eq!(parse_counters("nothing useful"), None);
+    }
+
+    // The Windows readers are string parsing, so they are tested here rather
+    // than only on the system they run on.
+
+    #[test]
+    fn windows_tunnel_services_name_the_profiles_that_are_up() {
+        let raw = "\"Name\",\"Status\"\r\n\"WireGuardTunnel$home\",\"Running\"\r\n\"WireGuardTunnel$office\",\"Stopped\"\r\n";
+        assert_eq!(parse_services(raw), vec!["home"]);
+        assert!(parse_services("").is_empty());
+    }
+
+    #[test]
+    fn windows_addresses_read_the_way_the_rest_of_the_program_wants_them() {
+        let raw = "\"IPAddress\",\"PrefixLength\"\r\n\"10.0.0.2\",\"24\"\r\n\"fd00::2\",\"128\"\r\n";
+        assert_eq!(parse_windows_addresses(raw), vec!["10.0.0.2/24", "fd00::2/128"]);
+    }
+
+    #[test]
+    fn windows_transfer_counters_are_read_out_of_the_adapter_statistics() {
+        let raw = "\"ReceivedBytes\",\"SentBytes\"\r\n\"1048576\",\"2097152\"\r\n";
+        assert_eq!(parse_windows_counters(raw), Some((1048576, 2097152)));
+        assert_eq!(parse_windows_counters("nothing useful"), None);
+    }
+
+    #[test]
+    fn an_interface_name_cannot_close_the_quote_it_is_passed_in() {
+        assert_eq!(ps_quote("wg0"), "wg0");
+        assert_eq!(ps_quote("it's"), "it''s");
+    }
+
+    #[test]
+    fn bringing_a_profile_up_names_the_config_and_taking_it_down_names_the_interface() {
+        let conf = Path::new("/tmp/controlcenter-wg-does-not-exist/home.conf");
+        let up = up_argv(conf);
+        assert!(up.last().unwrap().contains("home.conf"));
+        // Without a config to point at, the interface name is what is left.
+        assert!(down_argv(conf, "home").contains(&"home".to_string()));
     }
 }

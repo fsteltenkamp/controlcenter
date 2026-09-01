@@ -31,8 +31,8 @@ impl FileBrowser {
     pub fn open(initial: &str) -> Self {
         let input = if initial.trim().is_empty() {
             home()
-                .map(|h| format!("{}/", h.display()))
-                .unwrap_or_else(|| "./".into())
+                .map(|h| with_trailing_slash(&h))
+                .unwrap_or_else(|| format!(".{SEP}"))
         } else {
             initial.to_string()
         };
@@ -155,16 +155,41 @@ impl FileBrowser {
     }
 }
 
+/// What separates the segments of a typed path.
+///
+/// Windows accepts either and people type both, so both are read; only one is
+/// ever written back, and that is [`SEP`].
+#[cfg(windows)]
+const SEPARATORS: &[char] = &['/', '\\'];
+#[cfg(not(windows))]
+const SEPARATORS: &[char] = &['/'];
+
+#[cfg(windows)]
+const SEP: char = '\\';
+#[cfg(not(windows))]
+const SEP: char = '/';
+
 /// Split a typed path into the directory to list and the segment being typed.
 fn split_input(input: &str) -> (String, String) {
-    match input.rsplit_once('/') {
-        Some((dir, name)) => {
-            let dir = if dir.is_empty() { "/" } else { dir };
-            (dir.to_string(), name.to_string())
-        }
-        // No slash yet: a bare name is relative to the working directory.
-        None => (".".to_string(), input.to_string()),
-    }
+    let Some(cut) = input.rfind(SEPARATORS) else {
+        // No separator yet: a bare name is relative to the working directory.
+        return (".".to_string(), input.to_string());
+    };
+    let (dir, name) = input.split_at(cut);
+    // Every separator is one byte, so the split is on a char boundary and the
+    // separator itself is the first byte of the second half.
+    let name = &name[1..];
+    let dir = if dir.is_empty() {
+        // The path was rooted and its root is all that is left of it.
+        SEP.to_string()
+    } else if dir.ends_with(':') {
+        // `C:` on its own is the working directory of that drive, which is not
+        // what somebody typing `C:\` meant.
+        format!("{dir}{SEP}")
+    } else {
+        dir.to_string()
+    };
+    (dir, name.to_string())
 }
 
 /// Directories first, then case-insensitively by name — the order a file
@@ -183,15 +208,15 @@ fn starts_with_ci(name: &str, prefix: &str) -> bool {
 
 fn with_trailing_slash(path: &Path) -> String {
     let s = path.to_string_lossy();
-    if s.ends_with('/') {
+    if s.ends_with(SEPARATORS) {
         s.into_owned()
     } else {
-        format!("{s}/")
+        format!("{s}{SEP}")
     }
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::platform::home()
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -286,12 +311,27 @@ mod tests {
 
         let mut b = FileBrowser::open(&format!("{}/", dir.display()));
         assert_eq!(b.accept(), None);
-        assert_eq!(b.input, format!("{}/", dir.join("sub").display()));
+        assert_eq!(b.input, with_trailing_slash(&dir.join("sub")));
 
         // And back out again, with the directory we left selected.
         b.ascend();
         assert_eq!(b.selected_entry().map(|e| e.name.as_str()), Some("sub"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_drive_root_lists_the_drive_and_not_its_working_directory() {
+        assert_eq!(split_input(r"C:\"), (r"C:\".to_string(), String::new()));
+        assert_eq!(
+            split_input(r"C:\Users\fl"),
+            (r"C:\Users".to_string(), "fl".to_string())
+        );
+        // Typed the other way round, which Windows also accepts.
+        assert_eq!(
+            split_input("C:/Users/fl"),
+            ("C:/Users".to_string(), "fl".to_string())
+        );
     }
 }

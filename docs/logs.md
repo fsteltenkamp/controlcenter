@@ -12,8 +12,8 @@ A pane merges two things, in the order they happened:
 
 - **what controlcenter did** — the plan it built, the command line it ran, the exit code
   it saw, the reason it gave up
-- **what the process printed** — ssh's stderr for a tunnel, xfreerdp's output for an RDP
-  session, openvpn's log for a VPN session
+- **what the process printed** — ssh's stderr for a tunnel, the RDP client's output for an
+  RDP session, openvpn's log for a VPN session
 
 Each line is stamped with the time and marked with who said it, so a refused key and the
 command that asked for it read as one story. Lines controlcenter wrote itself are bright;
@@ -25,7 +25,7 @@ a process's own output is dim; anything that failed is red.
 | VPN | the selected profile: its session log, and what was run to bring it up |
 | Tunnels | the selected tunnel: its ssh output and its starts, restarts and failures |
 | SSH | the selected host: the command line, where the session opened, how it ended |
-| RDP | the selected connection: the xfreerdp log |
+| RDP | the selected connection: the client's log |
 
 An SSH session is the one thing with no output here — it runs in a terminal window of its
 own, and that is where what it prints stays.
@@ -73,7 +73,7 @@ beside the report rather than inside it — in full, one section per link — an
 links to the file:
 
 ```
-~/.config/controlcenter/reports/
+<config dir>/reports/
     controlcenter-tunnel-prod-db-20260826-140311.md          the report
     controlcenter-tunnel-prod-db-20260826-140311-chain.log   every log it depends on
 ```
@@ -82,15 +82,16 @@ Every file of one export shares that name, so an export is a set you can send to
 though the report alone is enough when the answer is in the pane you were looking at, and
 there is no `.log` at all when the chain had nothing to say.
 
-Reports land in `~/.config/controlcenter/reports/`. The directory is `0700` and every file
+Reports land in `<config dir>/reports/`. The directory is `0700` and every file
 `0600`, because they name your hosts, your usernames and your paths. Nothing deletes them
 for you.
 
 ## What a report will not contain
 
 No password ever reaches a command line in the first place: they go through the
-environment (`sshpass -e`) or a child's stdin (`xfreerdp /from-stdin`,
-`openvpn --auth-user-pass /dev/stdin`). A stored one is reported as present and how long it
+environment (`sshpass -e`, `SSH_ASKPASS`), a child's stdin (`xfreerdp /from-stdin`,
+`openvpn --auth-user-pass /dev/stdin`), or a file only its owner can read that is deleted
+as soon as it has been read. A stored one is reported as present and how long it
 is, never as itself:
 
 ```

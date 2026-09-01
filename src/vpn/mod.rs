@@ -52,10 +52,15 @@ impl ProviderId {
         Self::ALL.iter().position(|p| *p == self).unwrap_or(0)
     }
 
-    /// Everything that has to be on PATH for the provider to be usable.
+    /// Everything that has to be found before the provider is usable.
+    ///
+    /// Not the same list on both systems: `wg-quick` is a shell script and does
+    /// not exist on Windows, where the client's own `wireguard.exe` installs a
+    /// tunnel instead. `wg` is on both and is what generates a key pair.
     pub fn binaries(self) -> &'static [&'static str] {
         match self {
             Self::Netbird => &["netbird"],
+            Self::Wireguard if cfg!(windows) => &["wireguard", "wg"],
             Self::Wireguard => &["wg", "wg-quick"],
             Self::Openvpn => &["openvpn"],
             Self::Tailscale => &["tailscale"],
@@ -66,7 +71,13 @@ impl ProviderId {
     pub fn install_hint(self) -> &'static str {
         match self {
             Self::Netbird => "install it from https://netbird.io",
+            Self::Wireguard if cfg!(windows) => {
+                "install WireGuard for Windows from https://www.wireguard.com/install/"
+            }
             Self::Wireguard => "install the 'wireguard-tools' package (wg, wg-quick)",
+            Self::Openvpn if cfg!(windows) => {
+                "install OpenVPN for Windows from https://openvpn.net/community-downloads/"
+            }
             Self::Openvpn => "install the 'openvpn' package",
             Self::Tailscale => "install it from https://tailscale.com/download",
         }
@@ -85,10 +96,18 @@ impl ProviderId {
         matches!(self, Self::Netbird | Self::Tailscale)
     }
 
-    /// Whether connecting needs root. Only used to warn up front; the escalation
-    /// itself is decided per command in [`privileged`].
+    /// Whether connecting needs root — administrator, on Windows. Warns up
+    /// front, and decides whether an action goes through [`privileged`] at all;
+    /// which escalation that then is stays [`privileged`]'s to choose.
     pub fn needs_root(self) -> bool {
-        matches!(self, Self::Wireguard | Self::Openvpn | Self::Tailscale)
+        match self {
+            Self::Netbird => false,
+            Self::Wireguard | Self::Openvpn => true,
+            // On Linux tailscaled's socket is root-owned unless the user was
+            // made its operator. The Windows service takes commands from
+            // whoever is signed in, so nothing has to be escalated there.
+            Self::Tailscale => !cfg!(windows),
+        }
     }
 }
 
@@ -159,35 +178,14 @@ pub enum VpnMsg {
 
 /// Files controlcenter generates for a VPN hold private keys and certificates,
 /// so they are only ever readable by their owner — the same rule ssh.toml and
-/// vpn.toml follow.
-#[cfg(unix)]
-pub fn restrict_file(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("locking down {}: {e}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn restrict_file(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(unix)]
-pub fn restrict_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("locking down {}: {e}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn restrict_dir(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
+/// vpn.toml follow. How that is said differs per system; see
+/// [`crate::platform::restrict_file`].
+pub use crate::platform::{restrict_dir, restrict_file};
 
 pub fn installed(p: ProviderId) -> bool {
     p.binaries()
         .iter()
-        .all(|b| crate::tunnel::which_bin(b).is_some())
+        .all(|b| crate::platform::which_bin(b).is_some())
 }
 
 /// What the providers need from the app to act: the stored profiles, plus where

@@ -585,7 +585,7 @@ pub const RDP_FIELDS: &[RdpField] = &[
 ];
 
 impl RdpField {
-    pub fn label(self) -> &'static str {
+    pub fn label(self, client: rdp::Client) -> &'static str {
         match self {
             Self::Name => "Name",
             Self::Group => "Group (optional)",
@@ -593,7 +593,7 @@ impl RdpField {
             Self::Port => "Port",
             Self::Domain => "Domain (optional)",
             Self::Username => "Username",
-            Self::ExtraArgs => "Extra xfreerdp args (optional)",
+            Self::ExtraArgs => client.extra_args_hint(),
             Self::RequiresVpn => "Requires VPN",
             Self::DependsOn => "Requires tunnel",
         }
@@ -1690,11 +1690,8 @@ impl VpnForm {
 /// `~/x` is what a person types; every other tool here takes a real path.
 fn expand_tilde(path: &str) -> String {
     match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => std::path::Path::new(&home)
-                .join(rest)
-                .to_string_lossy()
-                .into_owned(),
+        Some(rest) => match crate::platform::home() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
             None => path.to_string(),
         },
         None => path.to_string(),
@@ -1848,6 +1845,8 @@ pub struct App {
     pub rdp_form: RdpForm,
     pub rdp_mode: RdpMode,
     pub rdp_installed: bool,
+    /// Which client opens an RDP session on this machine.
+    pub rdp_client: rdp::Client,
     pub ssh_hosts: Vec<SshHost>,
     pub ssh_rows: Vec<RowItem>,
     /// Index into `ssh_rows`, not into `ssh_hosts`.
@@ -1856,7 +1855,8 @@ pub struct App {
     pub ssh_mode: SshMode,
     /// Form state to come back to when the password warning is dismissed.
     ssh_return_mode: SshMode,
-    pub sshpass_installed: bool,
+    /// How a stored SSH password is carried to ssh on this machine.
+    pub ssh_password_helper: ssh::PasswordHelper,
     /// Outcome of the last finished interactive session, by host name.
     pub ssh_last: HashMap<String, SessionOutcome>,
     /// Sessions running in windows of their own, by host name. A host can have
@@ -1898,6 +1898,7 @@ impl App {
     ) -> Self {
         let theme = theme::by_name(&app_config.ui.theme);
         let app_config_terminal = app_config.ssh.terminal.clone();
+        let rdp_client = rdp::resolve_client(&app_config.rdp.client);
         let (vpn_tx, vpn_rx) = channel();
         let vpn_view = VpnView::new();
         let empty_ctx = FormContext {
@@ -1941,14 +1942,15 @@ impl App {
             rdp_selected: 0,
             rdp_form,
             rdp_mode: RdpMode::None,
-            rdp_installed: rdp::installed(),
+            rdp_installed: rdp::installed(rdp_client),
+            rdp_client,
             ssh_hosts,
             ssh_rows: Vec::new(),
             ssh_selected: 0,
             ssh_form,
             ssh_mode: SshMode::None,
             ssh_return_mode: SshMode::None,
-            sshpass_installed: ssh::sshpass_available(),
+            ssh_password_helper: ssh::password_helper(),
             ssh_last: HashMap::new(),
             ssh_windows: HashMap::new(),
             ssh_launcher: ssh::resolve_launch(&app_config_terminal),
@@ -3258,7 +3260,8 @@ impl App {
                 LogTarget::Vpn(ProviderId::Openvpn, name.clone()),
                 match pid {
                     Some(pid) => format!(
-                        "left running as root on exit (pid {pid}); stop it with `sudo kill {pid}`"
+                        "left running as root on exit (pid {pid}); stop it with `{}`",
+                        crate::platform::kill_argv(pid, false).join(" ")
                     ),
                     None => "left running as root on exit".to_string(),
                 },
@@ -4164,7 +4167,11 @@ impl App {
             return;
         }
         if !self.rdp_installed {
-            self.flash("xfreerdp3 not found on PATH", true);
+            let client = self.rdp_client;
+            self.flash(
+                format!("{} not found on PATH — {}", client.program(), client.install_hint()),
+                true,
+            );
             return;
         }
         // Members that are already up stay up; the rest are asked for a
@@ -4194,7 +4201,7 @@ impl App {
             old.stop();
         }
         let target = LogTarget::Rdp(conn.name.clone());
-        match rdp::spawn(&conn, password) {
+        match rdp::spawn(&conn, password, self.rdp_client, &self.paths.run_dir) {
             Ok(active) => {
                 let cmd = report::command_line(&active.argv);
                 self.rdp_active.insert(conn.name.clone(), active);
@@ -4549,24 +4556,30 @@ impl App {
             return Ok(());
         };
         let target = LogTarget::Ssh(host.name.clone());
-        if !host.password.is_empty() && !self.sshpass_installed {
+        if !host.password.is_empty() && !self.ssh_password_helper.usable() {
             self.report(
-                target,
-                format!("'{}' has a stored password but sshpass is not on PATH", host.name),
-                true,
+                target.clone(),
+                format!(
+                    "'{}' has a stored password but nothing here can carry it — ssh will ask",
+                    host.name
+                ),
+                false,
             );
-            return Ok(());
         }
         // The session's own output goes to its window or to this terminal, so
         // the command line is the one thing about it worth keeping here.
         self.note(
             target.clone(),
-            format!("opening in {}: {}", self.ssh_launcher.label(), ssh::command_preview(&host)),
+            format!(
+                "opening in {}: {}",
+                self.ssh_launcher.label(),
+                ssh::command_preview(&host, &self.ssh_password_helper)
+            ),
         );
 
         match self.ssh_launcher.clone() {
             ssh::Launch::Window(term) => {
-                match ssh::spawn_windowed(&host, &term) {
+                match ssh::spawn_windowed(&host, &term, &self.ssh_password_helper) {
                     Ok(session) => {
                         self.ssh_windows
                             .entry(host.name.clone())
@@ -4584,8 +4597,11 @@ impl App {
         }
 
         crate::suspend_terminal(terminal)?;
-        println!("── controlcenter: {} ──", ssh::command_preview(&host));
-        let result = ssh::run_interactive(&host);
+        println!(
+            "── controlcenter: {} ──",
+            ssh::command_preview(&host, &self.ssh_password_helper)
+        );
+        let result = ssh::run_interactive(&host, &self.ssh_password_helper);
         crate::resume_terminal(terminal)?;
 
         match result {

@@ -20,7 +20,7 @@ cargo build --release
 | 2 | **VPN** | NetBird, WireGuard, OpenVPN and Tailscale side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
 | 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running |
-| 5 | **RDP** | `xfreerdp3` sessions, running in the background with a log view |
+| 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
 
 Entries on any of these tabs can share a **group** name to stack under one header and be
 acted on together, and can **require** a VPN profile or a tunnel — see
@@ -121,8 +121,8 @@ appear; see [docs/logs.md](docs/logs.md).
 `x` works from any tab. It lists what is up and asks, then takes down every tunnel, RDP
 session, SSH window and VPN profile — including the ones controlcenter did not start —
 abandons any activation in flight and stops auto-reconnect, so nothing comes back on its
-own. Taking a VPN down needs root: silent with a sudo ticket, otherwise a polkit prompt
-for each one.
+own. Taking a VPN down needs root: silent with a sudo ticket or an elevated controlcenter,
+otherwise a polkit prompt for each one.
 
 ### Popups
 
@@ -132,21 +132,37 @@ In a form or a password prompt `q` is just a letter; use `Esc` there.
 
 ## Requirements
 
-`ssh` on PATH is the only hard requirement. Tunnels run ssh with `BatchMode=yes` (no
-interactive prompts), so use key- or agent-based authentication for the hosts you tunnel
-through; SSH-tab sessions are interactive and may prompt normally.
+`ssh` on PATH is the only hard requirement. On Windows that is the OpenSSH client, which
+ships with Windows 10 and 11 but is not always turned on:
+
+```powershell
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+Tunnels run ssh with `BatchMode=yes` (no interactive prompts), so use key- or agent-based
+authentication for the hosts you tunnel through; SSH-tab sessions are interactive and may
+prompt normally.
 
 Optional, each detected on startup and only greying out its own feature when missing:
 
-- `xfreerdp3` (freerdp3) — the RDP tab
-- `sshpass` — SSH hosts with a stored password
-- `netbird`, `wireguard-tools` (`wg`, `wg-quick`), `openvpn`, `tailscale` — the VPN tab
+| | Linux | Windows |
+| --- | --- | --- |
+| RDP tab | `xfreerdp3` (freerdp3) | `mstsc`, which is part of Windows |
+| SSH passwords | `sshpass` | nothing to install — see below |
+| VPN tab | `netbird`, `wireguard-tools` (`wg`, `wg-quick`), `openvpn`, `tailscale` | the NetBird, WireGuard, OpenVPN and Tailscale installers; controlcenter looks under Program Files as well as on PATH |
 
-WireGuard, OpenVPN and Tailscale need root to change the network. controlcenter never
-handles a password itself: it runs `pkexec` so your polkit agent puts the prompt in front
-of you, and falls back to `sudo -n` when there is no agent to answer — a bare tty, or an
-ssh session. If neither works it says so instead of hanging. Status polling never
-escalates.
+A stored SSH password is never an argument. Where `sshpass` is installed it is used;
+where it is not — every Windows machine — controlcenter answers ssh's own prompt instead,
+through `SSH_ASKPASS`. Either way the password travels in the environment.
+
+### Root, and administrator
+
+WireGuard and OpenVPN need to change the network, and so does Tailscale on Linux.
+
+On Linux controlcenter never handles a password itself: it runs `pkexec`
+so your polkit agent puts the prompt in front of you, and falls back to `sudo -n` when
+there is no agent to answer — a bare tty, or an ssh session. If neither works it says so
+instead of hanging. Status polling never escalates.
 
 A polkit dialog is the wrong thing to stand between you and a connection you are trying
 to take *down*: dismiss it, or have no agent to show it, and a root openvpn is left
@@ -154,11 +170,18 @@ running that nothing on the machine can reach. So before the TUI starts — whil
 terminal is still yours — controlcenter runs `sudo -v` once, and every stop after that is
 silent. Set `vpn.sudo = "never"` in `config.toml`, or pass `--sudo never`, to skip it.
 
+On Windows there is nothing to take in advance: UAC decides when a process starts and
+cannot raise one afterwards. **Start controlcenter as administrator** if you want to use
+WireGuard or OpenVPN — right-click it and choose *Run as administrator*, or start it from
+an elevated terminal. Started normally it still runs everything else, and says on the VPN
+tab that it cannot start or stop those two. NetBird and Tailscale on Windows take their
+commands from the signed-in user and need nothing.
+
 ## Configuration
 
-Everything is edited in the TUI and stored as TOML under `~/.config/controlcenter/`, so
-you can also edit it by hand. `controlcenter --config-paths` prints exactly where each
-file lives.
+Everything is edited in the TUI and stored as TOML — under `~/.config/controlcenter/` on
+Linux and `%APPDATA%\controlcenter\controlcenter\config\` on Windows — so you can also
+edit it by hand. `controlcenter --config-paths` prints exactly where each file lives.
 
 ## More
 

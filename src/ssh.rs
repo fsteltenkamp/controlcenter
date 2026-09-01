@@ -1,5 +1,7 @@
+use crate::platform;
 use crate::types::SshHost;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -47,7 +49,7 @@ pub fn build_args(host: &SshHost) -> Vec<String> {
         args.push("-o".into());
         args.push("StrictHostKeyChecking=no".into());
         args.push("-o".into());
-        args.push("UserKnownHostsFile=/dev/null".into());
+        args.push(format!("UserKnownHostsFile={}", platform::NULL_DEVICE));
         // Otherwise every connect prints a "permanently added" warning.
         args.push("-o".into());
         args.push("LogLevel=ERROR".into());
@@ -65,9 +67,9 @@ pub fn build_args(host: &SshHost) -> Vec<String> {
 
 /// The command line as the user would type it, for the details panel.
 /// A stored password is never shown — it goes through the environment.
-pub fn command_preview(host: &SshHost) -> String {
+pub fn command_preview(host: &SshHost, helper: &PasswordHelper) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if !host.password.is_empty() {
+    if !host.password.is_empty() && *helper == PasswordHelper::Sshpass {
         parts.push("sshpass".into());
         parts.push("-e".into());
     }
@@ -78,22 +80,23 @@ pub fn command_preview(host: &SshHost) -> String {
 
 /// Run ssh attached to the current terminal and wait for it to finish.
 /// The caller must have left the alternate screen and raw mode first.
-pub fn run_interactive(host: &SshHost) -> Result<SessionOutcome> {
+pub fn run_interactive(host: &SshHost, helper: &PasswordHelper) -> Result<SessionOutcome> {
     let args = build_args(host);
     let started = Instant::now();
 
-    let mut cmd = if host.password.is_empty() {
-        let mut c = Command::new("ssh");
-        c.args(&args);
-        c
-    } else {
+    let sshpass = !host.password.is_empty() && *helper == PasswordHelper::Sshpass;
+    let mut cmd = if sshpass {
         // -e reads the password from SSHPASS so it never lands in the process
         // list, where any user on the box could read it.
-        let mut c = Command::new("sshpass");
+        let mut c = Command::new(platform::program("sshpass"));
         c.arg("-e").arg("ssh").args(&args);
-        c.env("SSHPASS", &host.password);
+        c
+    } else {
+        let mut c = Command::new(platform::program("ssh"));
+        c.args(&args);
         c
     };
+    carry_password(&mut cmd, &host.password, helper);
 
     let mut child = cmd
         .stdin(Stdio::inherit())
@@ -101,10 +104,10 @@ pub fn run_interactive(host: &SshHost) -> Result<SessionOutcome> {
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| {
-            if host.password.is_empty() {
-                "spawning ssh".to_string()
-            } else {
+            if sshpass {
                 "spawning sshpass (is sshpass installed?)".to_string()
+            } else {
+                "spawning ssh".to_string()
             }
         })?;
     let status = child.wait().context("waiting for ssh")?;
@@ -115,6 +118,81 @@ pub fn run_interactive(host: &SshHost) -> Result<SessionOutcome> {
         finished_at: Instant::now(),
         windowed: false,
     })
+}
+
+
+// ---------------------------------------------------------------------------
+// Getting a stored password to ssh
+// ---------------------------------------------------------------------------
+
+/// How a stored password reaches ssh without ever being an argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordHelper {
+    /// `sshpass -e`, which reads it out of `SSHPASS` in the environment. The
+    /// Unix answer, and the one used wherever sshpass is installed.
+    Sshpass,
+    /// controlcenter answers ssh's own prompt: ssh runs the program named by
+    /// `SSH_ASKPASS` when it wants a password, and the program named is this
+    /// one, re-run with `CONTROLCENTER_ASKPASS` set. It reads the password out
+    /// of the same `SSHPASS` variable and prints it.
+    ///
+    /// This is what Windows uses, where sshpass — a Unix program built around
+    /// pseudo-terminals — does not exist and cannot. It is also the fallback on
+    /// a Unix box that simply has not got sshpass installed.
+    Askpass(PathBuf),
+    /// Nothing here can carry it; ssh will ask the user itself.
+    None,
+}
+
+impl PasswordHelper {
+    /// What the details panel says a stored password is done with.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sshpass => "passed to ssh through sshpass",
+            Self::Askpass(_) => "answered at ssh's own prompt, through SSH_ASKPASS",
+            Self::None => "not usable — ssh will ask for it",
+        }
+    }
+
+    pub fn usable(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Which helper this machine can use. sshpass first where it exists: it is what
+/// the Unix half has always used and what a user's own scripts expect.
+pub fn password_helper() -> PasswordHelper {
+    if platform::which_bin("sshpass").is_some() {
+        return PasswordHelper::Sshpass;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => PasswordHelper::Askpass(exe),
+        Err(_) => PasswordHelper::None,
+    }
+}
+
+/// The environment variable ssh's askpass helper reads the password out of.
+/// The same name sshpass uses, because it means the same thing.
+pub const PASSWORD_ENV: &str = "SSHPASS";
+
+/// Set on the child so that a controlcenter started by ssh knows it is being
+/// asked for a password rather than being started by a person.
+pub const ASKPASS_ENV: &str = "CONTROLCENTER_ASKPASS";
+
+/// Put the password where the chosen helper will find it, and — for askpass —
+/// point ssh at the helper. Never an argument, on either path.
+fn carry_password(cmd: &mut Command, password: &str, helper: &PasswordHelper) {
+    if password.is_empty() {
+        return;
+    }
+    cmd.env(PASSWORD_ENV, password);
+    if let PasswordHelper::Askpass(exe) = helper {
+        cmd.env("SSH_ASKPASS", exe);
+        // Without `force`, ssh only reaches for the helper when it has no
+        // terminal to ask at — and an inline session has one.
+        cmd.env("SSH_ASKPASS_REQUIRE", "force");
+        cmd.env(ASKPASS_ENV, "1");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +240,12 @@ impl Launch {
 
 /// Emulators in the order they are tried, with the flag that makes each one run
 /// a command. Those that take the command with no flag at all get an empty list.
+///
+/// Windows has one entry and needs no more: `cmd.exe` is always there, and a
+/// child given a console of its own *is* a new window — see [`spawn_windowed`].
+/// A user who would rather have Windows Terminal says so in `ssh.terminal`,
+/// e.g. `wt.exe cmd /C {cmd}`.
+#[cfg(not(windows))]
 const TERMINALS: &[(&str, &[&str])] = &[
     // The freedesktop indirection comes first: it opens whichever terminal the
     // desktop is already configured to use, and takes the command as-is.
@@ -180,6 +264,9 @@ const TERMINALS: &[(&str, &[&str])] = &[
     ("st", &["-e"]),
     ("xterm", &["-e"]),
 ];
+
+#[cfg(windows)]
+const TERMINALS: &[(&str, &[&str])] = &[("cmd", &["/C", "{cmd}"])];
 
 /// Resolve the configured preference: `auto` picks the first emulator found,
 /// `inline` keeps the old behaviour, anything else is a command line to run.
@@ -210,7 +297,7 @@ fn detect_terminal() -> Option<Terminal> {
     if let Some(pref) = std::env::var_os("TERMINAL") {
         let pref = pref.to_string_lossy().into_owned();
         if let Some(t) = parse_terminal(&pref) {
-            if crate::tunnel::which_bin(&t.program).is_some() {
+            if crate::platform::which_bin(&t.program).is_some() {
                 // A bare $TERMINAL carries no flags of its own; use the ones we
                 // know for it, falling back to the near-universal -e.
                 if t.args.is_empty() {
@@ -222,7 +309,7 @@ fn detect_terminal() -> Option<Terminal> {
     }
     TERMINALS
         .iter()
-        .find(|(bin, _)| crate::tunnel::which_bin(bin).is_some())
+        .find(|(bin, _)| crate::platform::which_bin(bin).is_some())
         .map(|(bin, args)| Terminal {
             program: (*bin).to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
@@ -277,22 +364,38 @@ impl WindowSession {
     }
 }
 
-/// The shell command the window runs: ssh, and on failure a pause so the error
-/// is still readable after the session dies.
-fn session_script(host: &SshHost) -> String {
+/// The command the window runs: ssh, and on failure a pause so the error is
+/// still readable after the session dies.
+///
+/// Two dialects, because the window is a shell's and the shells do not agree —
+/// on how a status is read back, on how a line is held, or on what a quote
+/// means. Both say the same thing.
+fn session_script(host: &SshHost, helper: &PasswordHelper) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if !host.password.is_empty() {
+    if !host.password.is_empty() && *helper == PasswordHelper::Sshpass {
         parts.push("sshpass".into());
         parts.push("-e".into());
     }
     parts.push("ssh".into());
     parts.extend(build_args(host).iter().map(|a| shell_quote(a)));
     let cmd = parts.join(" ");
-    format!(
-        "{cmd}; s=$?; if [ \"$s\" -ne 0 ]; then printf '\\n[controlcenter] ssh exited %s — press Enter to close ' \"$s\"; read -r _; fi; exit $s"
-    )
+
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{cmd}; s=$?; if [ \"$s\" -ne 0 ]; then printf '\\n[controlcenter] ssh exited %s — press Enter to close ' \"$s\"; read -r _; fi; exit $s"
+        )
+    }
+    #[cfg(windows)]
+    {
+        // `||` runs the right-hand side only on a non-zero exit, which is the
+        // whole of what the shell form above does with $?.
+        format!("{cmd} || (echo. & echo [controlcenter] ssh failed & pause)")
+    }
 }
 
+/// Quote an argument for the shell the window runs.
+#[cfg(not(windows))]
 fn shell_quote(arg: &str) -> String {
     if !arg.is_empty()
         && arg
@@ -304,25 +407,58 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// cmd.exe has no escape character inside a quoted string and no way to put a
+/// literal `"` in one, so an argument that needs quoting gets quoted and one
+/// that contains a quote gets it dropped — an ssh argument never legitimately
+/// carries one, and a silently mangled command line is better than a window
+/// that runs something else.
+#[cfg(windows)]
+fn shell_quote(arg: &str) -> String {
+    let arg = arg.replace('"', "");
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || "&|<>^()%!".contains(c)) {
+        return arg;
+    }
+    format!("\"{arg}\"")
+}
+
 /// Open the session in its own window and return immediately.
-pub fn spawn_windowed(host: &SshHost, term: &Terminal) -> Result<WindowSession> {
-    let script = session_script(host);
-    let mut cmd = Command::new(&term.program);
+///
+/// The `{cmd}` placeholder is where the script goes; a terminal that names no
+/// placeholder is handed the command as `sh -c <script>` on Unix, and the line
+/// itself on Windows, where the terminal is a shell rather than an emulator
+/// that runs one.
+pub fn spawn_windowed(
+    host: &SshHost,
+    term: &Terminal,
+    helper: &PasswordHelper,
+) -> Result<WindowSession> {
+    let script = session_script(host, helper);
+    let mut cmd = Command::new(platform::program(&term.program));
     let mut placed = false;
     for arg in &term.args {
         if arg.contains("{cmd}") {
-            cmd.arg(arg.replace("{cmd}", &script));
+            place_script(&mut cmd, &arg.replace("{cmd}", &script));
             placed = true;
         } else {
             cmd.arg(arg);
         }
     }
     if !placed {
-        cmd.arg("sh").arg("-c").arg(&script);
+        #[cfg(not(windows))]
+        {
+            cmd.arg("sh").arg("-c").arg(&script);
+        }
+        #[cfg(windows)]
+        {
+            place_script(&mut cmd, &script);
+        }
     }
-    if !host.password.is_empty() {
-        // Same as inline: through the environment, never the command line.
-        cmd.env("SSHPASS", &host.password);
+    carry_password(&mut cmd, &host.password, helper);
+    // A console of its own is what makes this a window on Windows; elsewhere
+    // the emulator opens one and this is not a thing that exists.
+    #[cfg(windows)]
+    {
+        platform::new_console(&mut cmd);
     }
     let child = cmd
         // The window has its own; ours stays with the TUI.
@@ -339,18 +475,32 @@ pub fn spawn_windowed(host: &SshHost, term: &Terminal) -> Result<WindowSession> 
     })
 }
 
+/// Hand a whole command line to the terminal.
+///
+/// cmd.exe parses `/C` by its own rules and Rust's argument quoting — written
+/// for programs that use `CommandLineToArgvW` — mangles what it gets, so on
+/// Windows the line crosses raw and the quoting done in [`shell_quote`] is the
+/// only quoting there is.
+fn place_script(cmd: &mut Command, script: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(script);
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg(script);
+    }
+}
+
 fn expand_tilde(path: &str) -> String {
     match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => format!("{}/{}", home.to_string_lossy(), rest),
+        Some(rest) => match platform::home() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
             None => path.to_string(),
         },
         None => path.to_string(),
     }
-}
-
-pub fn sshpass_available() -> bool {
-    crate::tunnel::which_bin("sshpass").is_some()
 }
 
 #[cfg(test)]
@@ -410,7 +560,9 @@ mod tests {
         };
         let args = build_args(&h);
         assert!(args.contains(&"StrictHostKeyChecking=no".to_string()));
-        assert!(args.contains(&"UserKnownHostsFile=/dev/null".to_string()));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with(platform::NULL_DEVICE)));
     }
 
     #[test]
@@ -419,10 +571,10 @@ mod tests {
             extra_args: "-o ProxyCommand=none".into(),
             ..host()
         };
-        let script = session_script(&h);
-        assert!(script.starts_with("ssh -o ProxyCommand=none example.com;"));
+        let script = session_script(&h, &PasswordHelper::Sshpass);
+        assert!(script.starts_with("ssh -o ProxyCommand=none example.com"));
         // The window stays up after a failure so the error can be read.
-        assert!(script.contains("read -r _"));
+        assert!(script.contains(if cfg!(windows) { "pause" } else { "read -r _" }));
     }
 
     #[test]
@@ -431,22 +583,45 @@ mod tests {
             password: "hunter2".into(),
             ..host()
         };
-        let script = session_script(&h);
+        let script = session_script(&h, &PasswordHelper::Sshpass);
         assert!(script.starts_with("sshpass -e ssh"));
+        assert!(!script.contains("hunter2"));
+
+        // With no sshpass to wrap it, ssh is run directly and answers its own
+        // prompt — but the password is still nowhere near the command line.
+        let askpass = PasswordHelper::Askpass(std::path::PathBuf::from("/opt/controlcenter"));
+        let script = session_script(&h, &askpass);
+        assert!(script.starts_with("ssh "));
         assert!(!script.contains("hunter2"));
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn quoting_survives_spaces_and_quotes() {
         assert_eq!(shell_quote("plain"), "plain");
         assert_eq!(shell_quote("/home/me/id rsa"), "'/home/me/id rsa'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn quoting_survives_what_cmd_would_otherwise_eat() {
+        assert_eq!(shell_quote("plain"), "plain");
+        assert_eq!(shell_quote(r"C:\Users\me\id rsa"), "\"C:\\Users\\me\\id rsa\"");
+        // `&` starts a second command as far as cmd is concerned.
+        assert_eq!(shell_quote("a&b"), "\"a&b\"");
+    }
+
     /// Run a windowed launch against a stand-in "terminal" that only records
     /// what it was handed, and give back (recorded argument, SSHPASS seen).
+    ///
+    /// The stand-in is `sh`, so these three cover the Unix launch path only —
+    /// cmd.exe takes its line by a different route entirely (see
+    /// [`place_script`]) and there is no shell common to both to write them in.
+    #[cfg(not(windows))]
     fn record_launch(host: &SshHost, term: Terminal, out: &std::path::Path) -> String {
-        let mut session = spawn_windowed(host, &term).expect("spawning the stand-in terminal");
+        let mut session = spawn_windowed(host, &term, &PasswordHelper::Sshpass)
+            .expect("spawning the stand-in terminal");
         for _ in 0..200 {
             if session.poll().is_some() {
                 break;
@@ -457,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn a_terminal_without_a_placeholder_gets_the_script_appended() {
         let out = std::env::temp_dir().join("controlcenter-launch-append");
         let _ = std::fs::remove_file(&out);
@@ -471,6 +647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn a_placeholder_takes_the_script_wherever_it_sits() {
         let out = std::env::temp_dir().join("controlcenter-launch-placeholder");
         let _ = std::fs::remove_file(&out);
@@ -488,6 +665,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_window_reads_the_password_from_the_environment() {
         let out = std::env::temp_dir().join("controlcenter-launch-env");
         let _ = std::fs::remove_file(&out);
@@ -524,8 +702,12 @@ mod tests {
             password: "hunter2".into(),
             ..host()
         };
-        let preview = command_preview(&h);
+        let preview = command_preview(&h, &PasswordHelper::Sshpass);
         assert!(!preview.contains("hunter2"));
         assert!(preview.starts_with("sshpass -e ssh"));
+        // Nothing to wrap ssh with means nothing is claimed to wrap it.
+        let preview = command_preview(&h, &PasswordHelper::None);
+        assert!(preview.starts_with("ssh "));
+        assert!(!preview.contains("hunter2"));
     }
 }

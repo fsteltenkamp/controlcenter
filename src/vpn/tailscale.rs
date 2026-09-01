@@ -16,7 +16,12 @@ const DEFAULT_CONTROL_URL: &str = "https://controlplane.tailscale.com";
 /// The unprivileged half: `status` and `debug prefs` normally work as the plain
 /// user, and escalating a five-second poll would spam the polkit agent.
 fn run(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("tailscale")
+    let mut cmd = Command::new(crate::platform::program("tailscale"));
+    #[cfg(windows)]
+    {
+        crate::platform::hidden(&mut cmd);
+    }
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| format!("running tailscale: {e}"))?;
@@ -247,12 +252,17 @@ pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) {
 }
 
 /// `up` and `down` change system state, so they go through the escalation
-/// helper — unlike the status poll.
+/// helper — unlike the status poll, and unless this system does not need one;
+/// see [`ProviderId::needs_root`].
 fn action(tx: Sender<VpnMsg>, desc: String, args: Vec<String>, stored: Vec<TailscaleProfile>) {
     thread::spawn(move || {
         let mut argv = vec!["tailscale".to_string()];
         argv.extend(args);
-        let error = privileged::run(&argv).err();
+        let error = if ME.needs_root() {
+            privileged::run(&argv).err()
+        } else {
+            run(&argv[1..].iter().map(String::as_str).collect::<Vec<_>>()).err()
+        };
         let _ = tx.send(VpnMsg::ActionDone {
             provider: ME,
             desc,
@@ -282,9 +292,13 @@ pub fn disconnect(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) -> Vec<Stri
     ran
 }
 
-/// How the log writes a command that went through the escalation helper.
+/// How the log writes a command, saying whether it was escalated.
 fn as_root(args: &[String]) -> String {
-    format!("tailscale {} (as root)", args.join(" "))
+    format!(
+        "tailscale {}{}",
+        args.join(" "),
+        if ME.needs_root() { " (as root)" } else { "" }
+    )
 }
 
 #[cfg(test)]

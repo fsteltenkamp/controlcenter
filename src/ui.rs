@@ -402,7 +402,7 @@ fn render_dashboard(f: &mut Frame, app: &App, area: Rect) {
     ];
     if !app.rdp_installed {
         rdp_lines.push(Line::from(Span::styled(
-            " xfreerdp3 not found on PATH",
+            format!(" {} not found on PATH", app.rdp_client.program()),
             Style::default().fg(DIM()),
         )));
     }
@@ -1097,7 +1097,11 @@ fn render_vpn_status(f: &mut Frame, app: &App, area: Rect) {
         lines.push(kv(
             "root",
             Span::styled(
-                "no pkexec or sudo found",
+                if cfg!(windows) {
+                    "not running as administrator"
+                } else {
+                    "no pkexec or sudo found"
+                },
                 Style::default().fg(DANGER()),
             ),
         ));
@@ -1251,6 +1255,12 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
             " Anything that requires the profile being left is disconnected.",
             " Profiles are netbird's own; add them with the netbird CLI.",
         ],
+        ProviderId::Wireguard if cfg!(windows) => vec![
+            " Enter installs the selected profile as a tunnel service; Enter again removes it.",
+            " ◆ marks an interface no stored profile accounts for; Enter removes it too.",
+            " Several tunnels can be up at once, so profiles never conflict.",
+            " Installing a tunnel needs an elevated controlcenter.",
+        ],
         ProviderId::Wireguard => vec![
             " Enter runs wg-quick up on the selected profile; Enter again takes it down.",
             " ◆ marks an interface no stored profile accounts for; Enter runs wg-quick down.",
@@ -1264,13 +1274,25 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
             " still holding the address. Enter takes one away; that is all it does.",
             " Saving a profile copies the .ovpn and every certificate it names",
             " into controlcenter, so it survives the download folder being cleaned up.",
-            " Disconnecting asks for root a second time: the process runs as root",
-            " and has to be signalled by the pid openvpn wrote.",
+            if cfg!(windows) {
+                " Starting a session needs an elevated controlcenter; it then owns"
+            } else {
+                " Disconnecting asks for root a second time: the process runs as root"
+            },
+            if cfg!(windows) {
+                " the process outright and stopping it asks for nothing."
+            } else {
+                " and has to be signalled by the pid openvpn wrote."
+            },
         ],
         ProviderId::Tailscale => vec![
             " Enter runs tailscale up --reset with the profile's flags,",
             " so a profile always means exactly the state it describes.",
-            " Connecting asks for root through polkit.",
+            if cfg!(windows) {
+                " The Windows service takes commands from you; nothing escalates."
+            } else {
+                " Connecting asks for root through polkit."
+            },
         ],
     }
 }
@@ -1383,7 +1405,7 @@ fn render_vpn_secret_warning(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!(" It goes into {path}, which is written mode 0600."),
+            format!(" It goes into {path}, which only you can read."),
             Style::default().fg(TEXT()),
         )),
         Line::from(Span::styled(
@@ -1847,12 +1869,14 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled("p", Style::default().fg(ACCENT()).bold()),
                     Span::styled(" to remove it", Style::default().fg(DIM())),
                 ]));
-                if !app.sshpass_installed {
-                    lines.push(Line::from(Span::styled(
-                        "sshpass is not on PATH — it cannot be used",
-                        Style::default().fg(DANGER()),
-                    )));
-                }
+                lines.push(Line::from(Span::styled(
+                    app.ssh_password_helper.label(),
+                    Style::default().fg(if app.ssh_password_helper.usable() {
+                        DIM()
+                    } else {
+                        DANGER()
+                    }),
+                )));
             }
 
             let open = app.ssh_windows_open(&h.name);
@@ -1884,7 +1908,7 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                truncate(&ssh::command_preview(h), 60),
+                truncate(&ssh::command_preview(h, &app.ssh_password_helper), 60),
                 Style::default().fg(DIM()),
             )));
             lines.push(Line::from(""));
@@ -2163,7 +2187,7 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
         let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<30}", fld.label()), label_style),
+            Span::styled(format!(" {:<30}", fld.label(app.rdp_client)), label_style),
             Span::styled(value, Style::default().fg(TEXT())),
             Span::styled(cursor, Style::default().fg(ACCENT())),
         ]));
@@ -2627,7 +2651,7 @@ fn render_password_warning(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(TEXT()),
         )),
         Line::from(Span::styled(
-            " (file mode 0600) and passed to ssh through sshpass.",
+            format!(" readable only by you, and {}.", app.ssh_password_helper.label()),
             Style::default().fg(TEXT()),
         )),
         Line::from(Span::styled(
@@ -2749,7 +2773,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         entry("  vpn", "netbird, wireguard, openvpn and tailscale side by side"),
         entry("  tunnels", "ssh forwards — local (-L), remote (-R), dynamic (-D)"),
         entry("  ssh", "interactive logins, each in a terminal window of its own"),
-        entry("  rdp", "xfreerdp3 sessions, running in the background"),
+        entry("  rdp", "remote desktop sessions, running in the background"),
         Line::from(""),
         section("groups"),
         text("entries sharing a group name stack under one header, and the"),
@@ -2779,7 +2803,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         text("line and VPN state — to a file you can hand to someone else"),
         Line::from(""),
         section("config"),
-        text("TOML under ~/.config/controlcenter, editable by hand"),
+        text("TOML in your config directory, editable by hand"),
         text("(controlcenter --config-paths says exactly where)"),
         Line::from(""),
         Line::from(vec![
@@ -2871,7 +2895,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         row("a e d", "profile", "tunnel", "host", "connection"),
         row("r", "refresh", "restart", "new session", "reconnect"),
         row("p", "openvpn pw", "—", "stored pw", "never stored"),
-        row("l", "profile log", "ssh output", "what it did", "xfreerdp log"),
+        row("l", "profile log", "ssh output", "what it did", "client log"),
         row("c", "errors", "failed", "last session", "finished"),
         row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move connection"),
         Line::from(""),

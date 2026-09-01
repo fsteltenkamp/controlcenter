@@ -427,7 +427,11 @@ fn ssh_block(out: &mut String, app: &App, h: &SshHost) {
     field(out, "extra args", redact(&h.extra_args));
     requirements(out, app, &h.requires_vpn, &h.depends_on);
     field(out, "opens in", app.ssh_launcher.label());
-    field(out, "command", redact(&ssh::command_preview(h)));
+    field(
+        out,
+        "command",
+        redact(&ssh::command_preview(h, &app.ssh_password_helper)),
+    );
     field(out, "windows open", app.ssh_windows_open(&h.name).to_string());
     match app.ssh_last.get(&h.name) {
         Some(o) => field(
@@ -442,6 +446,7 @@ fn ssh_block(out: &mut String, app: &App, h: &SshHost) {
 fn rdp_block(out: &mut String, app: &App, c: &RdpConnection) {
     field(out, "name", &c.name);
     field(out, "group", if c.group.is_empty() { "—" } else { &c.group });
+    field(out, "client", app.rdp_client.program());
     field(out, "target", c.target_summary());
     field(out, "login", c.login_summary());
     field(out, "password", "asked for on connect, never stored");
@@ -455,7 +460,11 @@ fn rdp_block(out: &mut String, app: &App, c: &RdpConnection) {
         }
         None => {
             field(out, "state", "no session");
-            field(out, "command", command_line(&crate::rdp::build_args(c)));
+            field(
+                out,
+                "command",
+                command_line(&crate::rdp::build_args(c, app.rdp_client, None)),
+            );
         }
     }
 }
@@ -591,7 +600,7 @@ fn vpn_profile_block(out: &mut String, app: &App, provider: ProviderId, profile:
 /// Clients nothing here uses are left out with everything else about them.
 fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarget]) {
     section(out, "environment");
-    let bin = |name: &str| match tunnel::which_bin(name) {
+    let bin = |name: &str| match crate::platform::which_bin(name) {
         Some(p) => p.display().to_string(),
         None => "not on PATH".to_string(),
     };
@@ -602,7 +611,11 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
     for t in std::iter::once(target).chain(chain) {
         match t {
             LogTarget::Program => {
-                wanted.extend(["ssh", "sshpass", "xfreerdp3"]);
+                wanted.push("ssh");
+                if app.ssh_password_helper == crate::ssh::PasswordHelper::Sshpass {
+                    wanted.push("sshpass");
+                }
+                wanted.push(app.rdp_client.program());
                 for p in ProviderId::ALL {
                     wanted.extend(p.binaries());
                 }
@@ -611,10 +624,13 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
             }
             LogTarget::Tunnel(_) => wanted.push("ssh"),
             LogTarget::Ssh(_) => {
-                wanted.extend(["ssh", "sshpass"]);
+                wanted.push("ssh");
+                if app.ssh_password_helper == crate::ssh::PasswordHelper::Sshpass {
+                    wanted.push("sshpass");
+                }
                 opens_a_session = true;
             }
-            LogTarget::Rdp(_) => wanted.push("xfreerdp3"),
+            LogTarget::Rdp(_) => wanted.push(app.rdp_client.program()),
             LogTarget::Vpn(p, _) => {
                 wanted.extend(p.binaries());
                 needs_root |= p.needs_root();
@@ -630,29 +646,48 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
         }
     }
     if needs_root {
+        // Which escalation was available, and which was used, decides whether a
+        // stop could have been dismissed — so it belongs next to the commands
+        // that were run.
+        #[cfg(not(windows))]
+        {
+            field(
+                out,
+                "root",
+                if crate::vpn::privileged::available() {
+                    format!("{} / {}", bin("pkexec"), bin("sudo"))
+                } else {
+                    "neither pkexec nor sudo is on PATH".to_string()
+                },
+            );
+            field(
+                out,
+                "sudo ticket",
+                if crate::vpn::privileged::has_ticket() {
+                    "held — root commands run as `sudo -n`, without a dialog"
+                } else {
+                    "none — root commands go through pkexec"
+                },
+            );
+        }
+        #[cfg(windows)]
         field(
             out,
-            "root",
-            if crate::vpn::privileged::available() {
-                format!("{} / {}", bin("pkexec"), bin("sudo"))
-            } else {
-                "neither pkexec nor sudo is on PATH".to_string()
-            },
-        );
-        // Which escalation was used decides whether a stop could have been
-        // dismissed, so it belongs next to the commands that were run.
-        field(
-            out,
-            "sudo ticket",
+            "administrator",
             if crate::vpn::privileged::has_ticket() {
-                "held — root commands run as `sudo -n`, without a dialog"
+                "yes — VPN commands run directly".to_string()
+            } else if crate::vpn::privileged::available() {
+                format!("no — VPN commands go through {}", bin("sudo"))
             } else {
-                "none — root commands go through pkexec"
+                "no, and there is no sudo — VPN commands cannot run at all".to_string()
             },
         );
     }
     if opens_a_session {
         field(out, "ssh sessions", app.ssh_launcher.label());
+        // Which helper carries a stored password decides what a failed login
+        // means: a wrong password, or one that never reached ssh at all.
+        field(out, "ssh passwords", app.ssh_password_helper.label());
     }
     // A plan still running is why something is half up, whatever it is about.
     match &app.activation {

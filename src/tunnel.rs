@@ -126,7 +126,7 @@ pub fn spawn(tunnel: &Tunnel) -> Result<ActiveTunnel> {
     // argv[0] is the program; ssh itself takes the rest.
     let args = &argv[1..];
 
-    let mut child = Command::new("ssh")
+    let mut child = Command::new(crate::platform::program("ssh"))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -357,19 +357,8 @@ fn pipe(mut from: TcpStream, mut to: TcpStream, counter: &AtomicU64) {
     let _ = to.shutdown(Shutdown::Both);
 }
 
-pub fn which_bin(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let full = dir.join(name);
-        if full.is_file() {
-            return Some(full);
-        }
-    }
-    None
-}
-
 pub fn which_ssh() -> Option<std::path::PathBuf> {
-    which_bin("ssh")
+    crate::platform::which_bin("ssh")
 }
 
 #[cfg(test)]

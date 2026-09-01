@@ -118,6 +118,13 @@ fn fault_in(line: &str) -> Option<String> {
 /// config relative to the working directory, not to the config file, so it is
 /// pointed at the directory the config lives in.
 ///
+/// The credentials go through a pipe where there is one to go through. Windows
+/// has no `/dev/stdin` for a program to open, and openvpn there reads a console
+/// rather than a handed-down stdin, so the only way in that does not put them on
+/// a command line is a file — written 0600-equivalent in a directory only its
+/// owner can open, and unlinked the moment openvpn has read it. See
+/// [`auth_file`] and [`write_auth_file`].
+///
 /// `--verb` and `--mute` come *after* `--config` on purpose. openvpn applies
 /// options in the order it reads them, so anything meant to override the
 /// profile's own settings has to follow the `--config` that pulls them in.
@@ -143,10 +150,50 @@ pub fn build_args(p: &OpenvpnProfile, config: &Path, pid_file: &Path) -> Vec<Str
     ]);
     if !p.username.is_empty() {
         args.push("--auth-user-pass".into());
-        args.push("/dev/stdin".into());
+        args.push(match auth_file(pid_file) {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None => "/dev/stdin".to_string(),
+        });
     }
     args.extend(p.extra_args.split_whitespace().map(String::from));
     args
+}
+
+/// Where openvpn is told to read the credentials from, when that is a file
+/// rather than a pipe. Derived from the pid file so a report can name it
+/// without a session having been started.
+///
+/// `None` means the pipe, which is what every system with a `/dev/stdin` uses.
+#[cfg(windows)]
+pub fn auth_file(pid_file: &Path) -> Option<PathBuf> {
+    Some(pid_file.with_extension("auth"))
+}
+
+#[cfg(not(windows))]
+pub fn auth_file(_pid_file: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Write the credentials openvpn will read, and take them away again.
+///
+/// The file is two lines, the format openvpn's `--auth-user-pass <file>`
+/// expects. It is written into the run directory, which is locked to its owner,
+/// and removed once openvpn has had time to read it — openvpn reads it while it
+/// starts and keeps what it found in memory, so it does not have to outlive the
+/// launch, and holding a password it should not.
+#[cfg(windows)]
+fn write_auth_file(path: &Path, username: &str, password: &str) -> Result<(), String> {
+    std::fs::write(path, format!("{username}\n{password}\n"))
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    super::restrict_file(path)
+}
+
+#[cfg(windows)]
+fn sweep_auth_file(path: PathBuf) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(20));
+        let _ = std::fs::remove_file(path);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +488,15 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
     let _ = std::fs::remove_file(&pid_file);
 
     let argv = build_args(p, &config, &pid_file);
+    #[cfg(windows)]
+    {
+        if !p.username.is_empty() {
+            if let Some(auth) = auth_file(&pid_file) {
+                write_auth_file(&auth, &p.username, &p.password)?;
+                sweep_auth_file(auth);
+            }
+        }
+    }
     let mut cmd = privileged::command(&argv)?;
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -450,11 +506,12 @@ pub fn spawn(p: &OpenvpnProfile, base: &Path, run_dir: &Path) -> Result<ActiveOv
         .map_err(|e| format!("spawning openvpn: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        if !p.username.is_empty() {
+        // Only where openvpn was pointed at the pipe; where it was pointed at a
+        // file, this just closes so it cannot sit on a further prompt.
+        if !p.username.is_empty() && auth_file(&pid_file).is_none() {
             let _ = writeln!(stdin, "{}", p.username);
             let _ = writeln!(stdin, "{}", p.password);
         }
-        // Dropping stdin closes the pipe so openvpn cannot sit on a further prompt.
     }
 
     let log = Arc::new(Ring::new("openvpn"));
@@ -571,13 +628,17 @@ impl ActiveOvpn {
     /// slot and the next connection to the same profile gets thrown off it
     /// every couple of minutes by the one that is still there.
     pub fn stop(&mut self) -> Option<String> {
-        let mut err = None;
         let pids = self.holders();
         for pid in &pids {
             let argv = kill_argv(*pid, false);
             self.log.push(format!("── stopping: {} ──", argv.join(" ")));
             if let Err(e) = privileged::run(&argv) {
-                err = Some(e);
+                // Not a failure yet. A process that will not close politely is
+                // exactly what the forceful stop below is for — and on Windows
+                // a console program with no window refuses this one by design.
+                // What went wrong is written down; whether it stopped is
+                // decided after.
+                self.log.push(format!("── pid {pid}: {e} ──"));
             }
         }
         // Always tear down our own side, so a dismissed prompt cannot leave a
@@ -585,6 +646,7 @@ impl ActiveOvpn {
         let _ = self.child.kill();
         let _ = self.child.wait();
 
+        let mut err = None;
         for pid in pids {
             if let Some(e) = wait_out_or_kill(pid, &self.log) {
                 err = Some(e);
@@ -643,22 +705,13 @@ fn device_in_line(line: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Signalling a pid, built in one place so a report shows what actually ran.
-pub fn kill_argv(pid: u32, force: bool) -> Vec<String> {
-    vec![
-        "kill".to_string(),
-        if force { "-KILL" } else { "-TERM" }.to_string(),
-        pid.to_string(),
-    ]
-}
+/// Stopping a pid, built in one place so a report shows what actually ran. What
+/// that command is differs per system; see [`crate::platform::kill_argv`].
+pub use crate::platform::kill_argv;
 
-/// Is the process still there? `/proc` rather than `kill -0`, because a root
-/// process cannot be signalled from here just to ask.
-fn alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
+use crate::platform::process_alive as alive;
 
-/// How long a `SIGTERM` is given before the session is killed outright.
+/// How long the polite stop is given before the session is killed outright.
 /// openvpn tears its interface down and exits well inside this; anything that
 /// does not is stuck, and stuck is the case this whole path exists for.
 const TERM_GRACE: Duration = Duration::from_millis(1500);
@@ -673,12 +726,12 @@ fn wait_out_or_kill(pid: u32, log: &Ring) -> Option<String> {
         thread::sleep(Duration::from_millis(100));
     }
     let argv = kill_argv(pid, true);
-    log.push(format!("── {pid} ignored SIGTERM: {} ──", argv.join(" ")));
+    log.push(format!("── {pid} would not stop; forcing: {} ──", argv.join(" ")));
     if let Err(e) = privileged::run(&argv) {
         return Some(format!("pid {pid} would not stop: {e}"));
     }
     thread::sleep(Duration::from_millis(200));
-    alive(pid).then(|| format!("pid {pid} is still running after SIGKILL"))
+    alive(pid).then(|| format!("pid {pid} is still running after being killed"))
 }
 
 #[cfg(test)]
@@ -709,7 +762,13 @@ mod tests {
         let joined = args_of(&profile()).join(" ");
         assert!(!joined.contains("hunter2"));
         assert!(!joined.contains(" me "));
-        assert!(joined.contains("--auth-user-pass /dev/stdin"));
+        // Through a pipe where there is one, through an owner-only file where
+        // there is not — an argument in neither case.
+        assert!(joined.contains("--auth-user-pass"));
+        match auth_file(Path::new("/run/user/1000/openvpn-work.pid")) {
+            Some(path) => assert!(joined.contains(&path.to_string_lossy().into_owned())),
+            None => assert!(joined.contains("--auth-user-pass /dev/stdin")),
+        }
     }
 
     #[test]

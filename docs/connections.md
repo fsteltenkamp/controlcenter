@@ -117,32 +117,51 @@ Which terminal is used is `ssh.terminal` in `config.toml`:
 
 - `auto` (the default) takes `$TERMINAL` if it is installed, else the first of
   `xdg-terminal-exec`, ghostty, kitty, alacritty, foot, wezterm, konsole, gnome-terminal,
-  xfce4-terminal, terminator, tilix, urxvt, st, xterm that is on PATH
+  xfce4-terminal, terminator, tilix, urxvt, st, xterm that is on PATH. On Windows it is
+  `cmd.exe`, given a console of its own — which *is* a new window there, and needs
+  nothing installed
 - `inline` hands *this* terminal to ssh until the session ends — which is also what
   happens automatically when no terminal emulator can be found, over a plain TTY, say.
   While an inline session is open the TUI is not drawing, so status and auto-reconnect
   pause until you exit; traffic through existing tunnels keeps flowing
 - anything else is a command line of your own, e.g. `kitty --title ssh` or
-  `alacritty -e sh -c {cmd}`. A `{cmd}` placeholder is replaced by the shell command;
-  without one, `sh -c <command>` is appended
+  `alacritty -e sh -c {cmd}`, and on Windows `wt.exe cmd /C {cmd}` for Windows Terminal.
+  A `{cmd}` placeholder is replaced by the shell command; without one, `sh -c <command>`
+  is appended (on Windows the command line itself is)
 
-The window runs ssh through `sh`, and on a non-zero exit it waits for Enter before closing
-so the error stays readable. Its output belongs to that window, so `l` on the SSH tab shows
-what controlcenter knows instead: the command line it ran, where the session opened, and
-how it ended — see [logs.md](logs.md).
+The window runs ssh through `sh` — through `cmd` on Windows — and on a non-zero exit it
+waits before closing so the error stays readable. Its output belongs to that window, so
+`l` on the SSH tab shows what controlcenter knows instead: the command line it ran, where
+the session opened, and how it ended — see [logs.md](logs.md).
 
 ## Passwords
 
 Storing an SSH password is optional and asks for confirmation first, because it is written
-to `ssh.toml` in the clear (the file is mode 0600). It is handed to ssh through
-`sshpass -e`, i.e. via the environment, so it never shows up in the process list. `p` on
-the SSH tab removes a stored password. A key file or an agent is the better option.
+to `ssh.toml` in the clear (the file is mode 0600, or on Windows an ACL that leaves you as
+its only reader). `p` on the SSH tab removes a stored password. A key file or an agent is
+the better option.
 
-RDP passwords are never stored: `Enter` asks for one (masked) and passes it to xfreerdp on
-stdin (`/from-stdin`), never on the command line. That is why `r` — reconnect — asks again.
+It never shows up in the process list, whichever route it takes:
+
+- where `sshpass` is installed, it is handed to ssh through `sshpass -e`, i.e. via the
+  environment
+- where it is not — every Windows machine, since sshpass is built on pseudo-terminals and
+  cannot exist there — controlcenter answers ssh's own prompt instead. ssh runs the
+  program named by `SSH_ASKPASS` when it wants a password, and the program named is
+  controlcenter, re-run as a helper; it reads the password out of the same environment
+  variable and prints it. If ssh asks anyway, type it: nothing is broken, the helper just
+  did not get a turn
+
+RDP passwords are never stored. `Enter` asks for one (masked) and never puts it on a
+command line. With freerdp it goes in on stdin (`/from-stdin`); with mstsc, which reads
+neither stdin nor a password argument, it is sealed with DPAPI to your Windows account —
+the same thing Remote Desktop does with a saved connection — and written into the `.rdp`
+file, which is deleted once mstsc has read it. Either way `r` — reconnect — asks again,
+because nothing keeps a copy.
 
 OpenVPN credentials can be stored in `vpn.toml` (0600) and are written to the child's
-stdin; `p` on the VPN tab forgets the selected profile's password.
+stdin, or on Windows to a file that is deleted once openvpn has read it — see
+[vpn.md](vpn.md#openvpn). `p` on the VPN tab forgets the selected profile's password.
 
 ## Throughput
 
