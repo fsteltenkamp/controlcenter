@@ -283,6 +283,16 @@ fn start_relay(
             }
             match listener.accept() {
                 Ok((client, _)) => {
+                    // Windows hands back a socket that inherited the listener's
+                    // non-blocking mode; Linux always hands back a blocking one.
+                    // Left alone, the first read in `pipe` would return
+                    // WouldBlock and be taken for a closed connection, so every
+                    // tunnel would relay nothing at all. Saying it explicitly is
+                    // right on both, and a socket that will not go back to
+                    // blocking can carry nothing, so it is dropped.
+                    if client.set_nonblocking(false).is_err() {
+                        continue;
+                    }
                     let counters = Arc::clone(&counters);
                     let stop = Arc::clone(&stop);
                     thread::spawn(move || handle_conn(client, internal_port, counters, stop));

@@ -178,14 +178,16 @@ fn split_input(input: &str) -> (String, String) {
     let (dir, name) = input.split_at(cut);
     // Every separator is one byte, so the split is on a char boundary and the
     // separator itself is the first byte of the second half.
-    let name = &name[1..];
+    let (sep, name) = name.split_at(1);
     let dir = if dir.is_empty() {
-        // The path was rooted and its root is all that is left of it.
-        SEP.to_string()
+        // The path was rooted and its root is all that is left of it. The
+        // separator that was typed is the one written back, so a path typed
+        // one way does not come back the other.
+        sep.to_string()
     } else if dir.ends_with(':') {
         // `C:` on its own is the working directory of that drive, which is not
         // what somebody typing `C:\` meant.
-        format!("{dir}{SEP}")
+        format!("{dir}{sep}")
     } else {
         dir.to_string()
     };

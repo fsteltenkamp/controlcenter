@@ -13,12 +13,26 @@ cargo build --release
 ```
 
 Both systems are built and tested in CI (`.github/workflows/ci.yml`): Linux and Windows.
-A change to a `#[cfg(windows)]` path is not verified by a green build here — push it and
-read the Windows job.
+A change to a `#[cfg(windows)]` path is not verified by a green build here, so check it
+before pushing:
 
-There is no test harness for the TUI itself. Anything drawn is verified by reading it;
-anything parsed, planned or rendered to a config file has unit tests next to it and should
-keep having them.
+```sh
+./build.sh              # dist/controlcenter and dist/controlcenter.exe
+./build.sh test         # the Windows unit tests, run here under wine
+```
+
+`build.sh` cross-compiles in a container — the toolchain is not on this machine and on
+Arch the package that would provide it replaces the `rust` package — with the source
+mounted read-only and the object tree in a volume, so nothing is installed, nothing
+root-owned lands in the working tree, and a second run takes seconds. The `.exe` is the
+gnu target; releases ship the msvc one from a real Windows runner.
+
+`./build.sh test` is worth the wait rather than a formality: it is what caught the
+accepted socket in `tunnel.rs` inheriting the listener's non-blocking mode, which made
+every tunnel on Windows relay nothing at all and which no amount of reading had found.
+Four of the 169 tests are Unix-only and do not run there. What wine cannot answer for is
+anything that reaches a real Windows service — DPAPI, `icacls`, `taskkill`, PowerShell —
+so those still need the CI job or a real machine.
 
 ## Layout
 
