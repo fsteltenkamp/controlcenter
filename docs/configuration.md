@@ -26,8 +26,8 @@ ACL instead: `icacls <path> /inheritance:r /grant:r <you>:F` drops everything th
 directory granted — including the machine's administrators — and leaves your account as
 the only entry. A file that would be 0600 on Linux is yours alone on Windows too.
 
-NetBird is absent from `vpn.toml` on purpose: its profiles live in netbird and are only
-read. `reports/` is written to rather than read, and appears the first time you export
+NetBird and Pangolin are absent from `vpn.toml` on purpose: netbird's profiles live in
+netbird and pangolin's accounts live in pangolin, and both are only read. `reports/` is written to rather than read, and appears the first time you export
 one — see [logs.md](logs.md).
 
 ## config.toml

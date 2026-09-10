@@ -1250,6 +1250,12 @@ fn vpn_status_block(lines: Vec<Line>) -> Paragraph {
 /// What is worth knowing about this particular client, in the space there is.
 fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
     match id {
+        ProviderId::Pangolin => vec![
+            " Enter selects the account and brings the client up.",
+            " Anything that requires the account being left is disconnected.",
+            " Accounts are pangolin's own; add one with `pangolin login`.",
+            " pangolin runs its own sudo, so it needs controlcenter's sudo ticket.",
+        ],
         ProviderId::Netbird => vec![
             " Enter switches to the selected profile and connects.",
             " Anything that requires the profile being left is disconnected.",
@@ -1378,7 +1384,7 @@ fn render_vpn_delete_confirm(f: &mut Frame, app: &App, area: Rect, provider: Pro
         ProviderId::Wireguard => app.vpn_cfg.wireguard.get(idx).map(|p| p.name.clone()),
         ProviderId::Openvpn => app.vpn_cfg.openvpn.get(idx).map(|p| p.name.clone()),
         ProviderId::Tailscale => app.vpn_cfg.tailscale.get(idx).map(|p| p.name.clone()),
-        ProviderId::Netbird => None,
+        ProviderId::Netbird | ProviderId::Pangolin => None,
     }
     .unwrap_or_else(|| "?".into());
     render_confirm_box(
@@ -2770,7 +2776,10 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(""),
         section("tabs"),
         entry("  dashboard", "everything that is up, and what it is moving"),
-        entry("  vpn", "netbird, wireguard, openvpn and tailscale side by side"),
+        entry(
+            "  vpn",
+            "netbird, wireguard, openvpn, tailscale and pangolin side by side",
+        ),
         entry("  tunnels", "ssh forwards — local (-L), remote (-R), dynamic (-D)"),
         entry("  ssh", "interactive logins, each in a terminal window of its own"),
         entry("  rdp", "remote desktop sessions, running in the background"),

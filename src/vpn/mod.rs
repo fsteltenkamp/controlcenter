@@ -7,6 +7,7 @@
 
 pub mod netbird;
 pub mod openvpn;
+pub mod pangolin;
 pub mod privileged;
 pub mod scan;
 pub mod tailscale;
@@ -24,14 +25,16 @@ pub enum ProviderId {
     Wireguard,
     Openvpn,
     Tailscale,
+    Pangolin,
 }
 
 impl ProviderId {
-    pub const ALL: [ProviderId; 4] = [
+    pub const ALL: [ProviderId; 5] = [
         Self::Netbird,
         Self::Wireguard,
         Self::Openvpn,
         Self::Tailscale,
+        Self::Pangolin,
     ];
 
     /// How the provider is written in `requires_vpn` and in config files.
@@ -41,6 +44,7 @@ impl ProviderId {
             Self::Wireguard => "wireguard",
             Self::Openvpn => "openvpn",
             Self::Tailscale => "tailscale",
+            Self::Pangolin => "pangolin",
         }
     }
 
@@ -64,6 +68,7 @@ impl ProviderId {
             Self::Wireguard => &["wg", "wg-quick"],
             Self::Openvpn => &["openvpn"],
             Self::Tailscale => &["tailscale"],
+            Self::Pangolin => &["pangolin"],
         }
     }
 
@@ -80,25 +85,34 @@ impl ProviderId {
             }
             Self::Openvpn => "install the 'openvpn' package",
             Self::Tailscale => "install it from https://tailscale.com/download",
+            Self::Pangolin => "install the Pangolin CLI from https://docs.digpangolin.com",
         }
     }
 
     /// Whether controlcenter owns this provider's profiles, i.e. whether they can
-    /// be added, edited and deleted here. NetBird's live in netbird itself.
+    /// be added, edited and deleted here. NetBird's live in netbird itself, and
+    /// a Pangolin profile is an account only `pangolin login` can create.
     pub fn manages_profiles(self) -> bool {
-        !matches!(self, Self::Netbird)
+        !matches!(self, Self::Netbird | Self::Pangolin)
     }
 
     /// Whether only one profile of this provider can be up at a time. NetBird
-    /// selects one profile; tailscale puts the node in one state. WireGuard
-    /// interfaces and OpenVPN sessions coexist, so they never conflict.
+    /// selects one profile; tailscale puts the node in one state; pangolin runs
+    /// one client against one selected account. WireGuard interfaces and OpenVPN
+    /// sessions coexist, so they never conflict.
     pub fn exclusive(self) -> bool {
-        matches!(self, Self::Netbird | Self::Tailscale)
+        matches!(self, Self::Netbird | Self::Tailscale | Self::Pangolin)
     }
 
     /// Whether connecting needs root — administrator, on Windows. Warns up
     /// front, and decides whether an action goes through [`privileged`] at all;
     /// which escalation that then is stays [`privileged`]'s to choose.
+    ///
+    /// Pangolin is the one client that answers yes and still runs unprivileged:
+    /// its own CLI re-executes itself under sudo, so putting it behind
+    /// [`privileged`] too would be two escalations for one command. Saying yes
+    /// here is what takes the startup ticket that CLI's sudo then finds — see
+    /// [`pangolin`].
     pub fn needs_root(self) -> bool {
         match self {
             Self::Netbird => false,
@@ -107,6 +121,7 @@ impl ProviderId {
             // made its operator. The Windows service takes commands from
             // whoever is signed in, so nothing has to be escalated there.
             Self::Tailscale => !cfg!(windows),
+            Self::Pangolin => true,
         }
     }
 }
@@ -207,6 +222,7 @@ pub fn refresh(p: ProviderId, tx: Sender<VpnMsg>, env: VpnEnv<'_>) {
         ProviderId::Netbird => netbird::refresh(tx),
         ProviderId::Wireguard => wireguard::refresh(tx, env.cfg.wireguard.clone()),
         ProviderId::Tailscale => tailscale::refresh(tx, env.cfg.tailscale.clone()),
+        ProviderId::Pangolin => pangolin::refresh(tx),
         ProviderId::Openvpn => {}
     }
 }
@@ -224,6 +240,7 @@ pub fn connect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::connect(tx, profile)),
+        ProviderId::Pangolin => pangolin::connect(tx, profile),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::connect(
@@ -260,6 +277,7 @@ pub fn disconnect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::disconnect(tx)),
+        ProviderId::Pangolin => Ok(pangolin::disconnect(tx)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::disconnect(

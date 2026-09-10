@@ -43,10 +43,10 @@ pub fn home() -> Option<PathBuf> {
 /// Directories searched after `PATH`.
 ///
 /// On Linux everything controlcenter drives is a package that puts itself on
-/// `PATH`. On Windows almost none of it does: the WireGuard, OpenVPN, Tailscale
-/// and NetBird installers drop their binaries under Program Files and leave
-/// `PATH` alone, so a search that stopped at `PATH` would report every client
-/// as missing on a machine that has all four installed.
+/// `PATH`. On Windows almost none of it does: the WireGuard, OpenVPN, Tailscale,
+/// NetBird and Pangolin installers drop their binaries under Program Files and
+/// leave `PATH` alone, so a search that stopped at `PATH` would report every
+/// client as missing on a machine that has all of them installed.
 #[cfg(windows)]
 fn extra_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -58,6 +58,12 @@ fn extra_dirs() -> Vec<PathBuf> {
         dirs.push(base.join("OpenVPN").join("bin"));
         dirs.push(base.join("Tailscale"));
         dirs.push(base.join("Netbird"));
+        dirs.push(base.join("Pangolin"));
+    }
+    // Pangolin's installer is a per-user one and does not go near Program Files.
+    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        dirs.push(base.join("Programs").join("Pangolin"));
+        dirs.push(base.join("Pangolin"));
     }
     if let Some(root) = std::env::var_os("SystemRoot").map(PathBuf::from) {
         dirs.push(root.join("System32"));

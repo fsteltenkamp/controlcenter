@@ -2,18 +2,18 @@
 
 Back to the [README](../README.md).
 
-Four clients share one tab. A client that is not on PATH stays listed, greyed out, with
+Five clients share one tab. A client that is not on PATH stays listed, greyed out, with
 the install hint and what is already waiting on it. Every connect, disconnect and status
 poll runs in the background; the UI never blocks.
 
-| | NetBird | WireGuard | OpenVPN | Tailscale |
-| --- | --- | --- | --- | --- |
-| needs | `netbird` | `wg`, `wg-quick` | `openvpn` | `tailscale` |
-| profiles come from | `netbird profile list` | `vpn.toml` | `vpn.toml` | `vpn.toml` |
-| status poll | `netbird status` | `ip link show type wireguard` | the child process | `tailscale status --json` |
-| also swept | — | strays | orphans and leftover devices | — |
-| poll needs root | no | no | no | no |
-| connect | `profile select` + `up` | `wg-quick up <conf>` | `openvpn --config …` | `tailscale up --reset …` |
+| | NetBird | WireGuard | OpenVPN | Tailscale | Pangolin |
+| --- | --- | --- | --- | --- | --- |
+| needs | `netbird` | `wg`, `wg-quick` | `openvpn` | `tailscale` | `pangolin` |
+| profiles come from | `netbird profile list` | `vpn.toml` | `vpn.toml` | `vpn.toml` | pangolin's account store |
+| status poll | `netbird status` | `ip link show type wireguard` | the child process | `tailscale status --json` | `pangolin status --json` |
+| also swept | — | strays | orphans and leftover devices | — | — |
+| poll needs root | no | no | no | no | no |
+| connect | `profile select` + `up` | `wg-quick up <conf>` | `openvpn --config …` | `tailscale up --reset …` | `select account` + `up --silent` |
 
 ### On Windows
 
@@ -153,6 +153,33 @@ poll.
 Only one profile is active at a time, so switching prompts as a conflict when something is
 riding on the profile going down.
 
+## Pangolin
+
+Profiles here are pangolin **accounts** — one per login, an email against a host. They are
+pangolin's own, so like NetBird's they are listed and switched but never edited here;
+`a`, `e` and `d` say so, and `pangolin login` is what adds one. `Enter` selects the account
+and brings the client up; only one can be up at a time, so switching prompts as a conflict
+when something is riding on the account going down.
+
+The account list is read from the store pangolin itself writes, beside the file
+`pangolin config path` names, because `pangolin select account` is a menu and has no
+non-interactive listing. Only the email, host and organisation are taken from it. Two
+logins with the same email on different hosts are listed as `email @ host`; a single one
+is listed as just the email.
+
+Status is `pangolin status --json`, which needs no privileges — when nothing is up the CLI
+says so in prose and that is read as a state, not an error. A tunnel counts as connected
+only when the client is both connected *and* registered: a client the server has not
+accepted holds the tunnel open and carries nothing, and the panel says which of the two is
+missing.
+
+Bringing the client up needs root, and pangolin gets it for itself: `pangolin up`
+re-executes under `sudo` to create the tunnel device. controlcenter therefore runs it
+unprivileged rather than escalating it twice — what makes that silent is the same startup
+sudo ticket described under [Root](#root). Without a ticket that `sudo` has no terminal to
+ask on and the CLI reports it as `failed to start subprocess`, so the panel adds what it
+actually needed.
+
 ## Connections controlcenter is not holding
 
 A session can outlive the program that started it — a crash, a `kill -9`, an exit while
@@ -203,9 +230,10 @@ down first; its device goes with it, and anything still standing afterwards is l
 
 A device is matched to its owner by what the clients say about themselves — the interface
 a WireGuard profile creates, the device a live session named in its own log, the address
-NetBird or Tailscale reports. One that matches none of them is listed as *unaccounted
-for* rather than guessed at. NetBird and Tailscale are daemons whose status already
-reports the machine rather than this process, so nothing of theirs can be orphaned here.
+NetBird, Tailscale or Pangolin reports. One that matches none of them is listed as
+*unaccounted for* rather than guessed at. NetBird, Tailscale and Pangolin each answer for
+the machine rather than for this process — their status reports whatever client is up,
+whoever started it — so nothing of theirs can be orphaned here.
 
 Nothing in the sweep escalates: reading `/proc/<pid>/cmdline` and listing links are both
 unprivileged, and so are the two PowerShell queries that replace them. Only taking
@@ -213,7 +241,9 @@ something down needs root.
 
 ## Root
 
-WireGuard and OpenVPN need root to change the network, and so does Tailscale on Linux.
+WireGuard and OpenVPN need root to change the network, and so do Tailscale on Linux and
+Pangolin — though Pangolin's CLI escalates itself rather than being escalated here, so
+what it needs from the ticket below is only that it is already there.
 
 ### Linux
 

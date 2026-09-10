@@ -17,7 +17,7 @@ cargo build --release
 | | | |
 | --- | --- | --- |
 | 1 | **Dashboard** | everything that is up: VPN state, tunnel counts and traffic, running RDP sessions, and the aggregate throughput sparkline |
-| 2 | **VPN** | NetBird, WireGuard, OpenVPN and Tailscale side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
+| 2 | **VPN** | NetBird, WireGuard, OpenVPN, Tailscale and Pangolin side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
 | 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running |
 | 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
@@ -80,8 +80,8 @@ An entry moves inside its own group and a group header moves the whole group, so
 list keeps the shape it is drawn in; `Ctrl+↑` `Ctrl+↓` on a group's first or last entry
 says so rather than moving it into the neighbouring group.
 
-NetBird profiles are netbird's own, so `a` `e` `d` `Ctrl+↑` `Ctrl+↓` say so instead of
-editing them.
+NetBird profiles and Pangolin accounts belong to those clients, so `a` `e` `d` `Ctrl+↑`
+`Ctrl+↓` say so instead of editing them.
 Reconnecting an RDP session asks for the password again, because nothing keeps a copy.
 
 ### Connections that are not ours
@@ -149,7 +149,7 @@ Optional, each detected on startup and only greying out its own feature when mis
 | --- | --- | --- |
 | RDP tab | `xfreerdp3` (freerdp3) | `mstsc`, which is part of Windows |
 | SSH passwords | `sshpass` | nothing to install — see below |
-| VPN tab | `netbird`, `wireguard-tools` (`wg`, `wg-quick`), `openvpn`, `tailscale` | the NetBird, WireGuard, OpenVPN and Tailscale installers; controlcenter looks under Program Files as well as on PATH |
+| VPN tab | `netbird`, `wireguard-tools` (`wg`, `wg-quick`), `openvpn`, `tailscale`, `pangolin` | the NetBird, WireGuard, OpenVPN, Tailscale and Pangolin installers; controlcenter looks under Program Files as well as on PATH |
 
 A stored SSH password is never an argument. Where `sshpass` is installed it is used;
 where it is not — every Windows machine — controlcenter answers ssh's own prompt instead,
@@ -157,7 +157,9 @@ through `SSH_ASKPASS`. Either way the password travels in the environment.
 
 ### Root, and administrator
 
-WireGuard and OpenVPN need to change the network, and so does Tailscale on Linux.
+WireGuard and OpenVPN need to change the network, and so do Tailscale on Linux and
+Pangolin. Pangolin is the one that escalates itself — its own CLI re-runs under `sudo` —
+so all it needs from controlcenter is that the ticket below is already there.
 
 On Linux controlcenter never handles a password itself: it runs `pkexec`
 so your polkit agent puts the prompt in front of you, and falls back to `sudo -n` when
@@ -175,7 +177,7 @@ cannot raise one afterwards. **Start controlcenter as administrator** if you wan
 WireGuard or OpenVPN — right-click it and choose *Run as administrator*, or start it from
 an elevated terminal. Started normally it still runs everything else, and says on the VPN
 tab that it cannot start or stop those two. NetBird and Tailscale on Windows take their
-commands from the signed-in user and need nothing.
+commands from the signed-in user and need nothing; Pangolin asks for elevation itself.
 
 ## Configuration
 

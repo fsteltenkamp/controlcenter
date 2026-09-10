@@ -31,7 +31,8 @@ stay navigation: they move the selection ten rows.)
   entry between groups is a change of `group`, so it is done in the form with `e`
 
 On the VPN tab the same keys move the selected profile in `vpn.toml`. NetBird's profiles
-are netbird's own and a `◆` row is not a stored profile at all, so neither one moves; the
+and Pangolin's accounts belong to those clients, and a `◆` row is not a stored profile at
+all, so none of those move; the
 client list on the left is fixed, because that order is the order a plan brings clients up
 in.
 
@@ -70,6 +71,7 @@ chain.
 | `"*"` | any VPN, as long as one is connected |
 | `"netbird:*"` | any NetBird profile |
 | `"wireguard:home"` | that profile of that client |
+| `"pangolin:you@example.net"` | that pangolin account |
 | `"work"` | NetBird's `work` — how it was written before there was more than one client |
 
 Unqualified names still mean NetBird, so config files written before the other clients
@@ -78,7 +80,7 @@ next save the entry.
 
 A plan holds **one requirement per client**, so a chain may legitimately need WireGuard
 *and* Tailscale and both get a step, run in a fixed order (netbird, wireguard, openvpn,
-tailscale). Within one client a named profile beats `*`, and two different profiles of the
+tailscale, pangolin). Within one client a named profile beats `*`, and two different profiles of the
 *same* client is a contradiction, refused before anything starts. Renaming a profile
 follows it through everything that requires it.
 
@@ -95,8 +97,9 @@ pulling a VPN up behind it, or a profile switched by hand on the VPN tab:
 | VPN profile | a different profile of the *same* client being active | switches, disconnecting whatever required the old one |
 | RDP | another running session to the same host:port | disconnects it |
 
-Only NetBird and Tailscale can hold one profile at a time, so only they conflict.
-WireGuard interfaces and OpenVPN sessions coexist, and several can be up at once.
+Only NetBird, Tailscale and Pangolin can hold one profile at a time, so only they
+conflict. WireGuard interfaces and OpenVPN sessions coexist, and several can be up at
+once.
 
 A prompt only appears when something running would actually be cut. Switching to another
 profile of the same client while nothing is riding on the old one is simply what you asked

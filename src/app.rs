@@ -1435,13 +1435,23 @@ pub const TAILSCALE_FIELDS: &[VpnFieldSpec] = &[
     text("extra_args", "Extra tailscale args (optional)"),
 ];
 
+/// Said wherever a profile key is pressed on a client that keeps its own
+/// profiles. Every key means something on every tab, so these say why rather
+/// than doing nothing; see the keymap contract in AGENTS.md.
+fn managed_elsewhere(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Pangolin => "pangolin accounts are managed by pangolin itself — use `pangolin login`",
+        _ => "netbird profiles are managed by netbird itself",
+    }
+}
+
 pub fn vpn_fields(provider: ProviderId) -> &'static [VpnFieldSpec] {
     match provider {
         ProviderId::Wireguard => WIREGUARD_FIELDS,
         ProviderId::Openvpn => OPENVPN_FIELDS,
         ProviderId::Tailscale => TAILSCALE_FIELDS,
-        // NetBird's profiles live in netbird; there is nothing to edit here.
-        ProviderId::Netbird => &[],
+        // These profiles live in the client itself; there is nothing to edit here.
+        ProviderId::Netbird | ProviderId::Pangolin => &[],
     }
 }
 
@@ -2806,7 +2816,7 @@ impl App {
                 if self.selected_foreign().is_some() {
                     self.foreign_row_note("delete");
                 } else if !provider.manages_profiles() {
-                    self.flash("netbird profiles are managed by netbird itself", true);
+                    self.flash(managed_elsewhere(provider), true);
                 } else if self.vpn_profile_count() > 0 {
                     self.vpn_mode = VpnMode::DeleteConfirm { provider, idx };
                 }
@@ -2862,7 +2872,7 @@ impl App {
         }
         let id = self.vpn.current_id();
         if !id.manages_profiles() {
-            self.flash("netbird profiles are managed by netbird itself", true);
+            self.flash(managed_elsewhere(id), true);
             return;
         }
         let Some(name) = self
@@ -2883,7 +2893,7 @@ impl App {
             ProviderId::Tailscale => {
                 move_named(&mut self.vpn_cfg.tailscale, |p| &p.name, &name, dir)
             }
-            ProviderId::Netbird => None,
+            ProviderId::Netbird | ProviderId::Pangolin => None,
         };
         let Some(to) = moved else {
             self.flash(
@@ -2993,7 +3003,9 @@ impl App {
                     foreign: None,
                 })
                 .collect(),
-            ProviderId::Netbird => {
+            // Read from the client, not from vpn.toml; the background refresh
+            // is the only thing that fills these lists.
+            ProviderId::Netbird | ProviderId::Pangolin => {
                 self.merge_foreign(id);
                 return;
             }
@@ -3505,10 +3517,11 @@ impl App {
                     }
                 }
             }
-            // NetBird and Tailscale are daemons: their own status already
-            // reports the machine rather than this process, so there is nothing
-            // here they could be holding without knowing it.
-            ProviderId::Netbird | ProviderId::Tailscale => {}
+            // NetBird, Tailscale and Pangolin each answer for the machine
+            // rather than for this process — their own status reports whatever
+            // client is up, whoever started it — so there is nothing here they
+            // could be holding without knowing it.
+            ProviderId::Netbird | ProviderId::Tailscale | ProviderId::Pangolin => {}
         }
         out
     }
@@ -3607,7 +3620,7 @@ impl App {
     fn open_vpn_form(&mut self, edit: Option<usize>) {
         let provider = self.vpn.current_id();
         if !provider.manages_profiles() {
-            self.flash("netbird profiles are managed by netbird itself", true);
+            self.flash(managed_elsewhere(provider), true);
             return;
         }
         self.vpn_form = match (provider, edit) {
@@ -3712,7 +3725,7 @@ impl App {
                 .vpn_form
                 .to_tailscale()
                 .and_then(|t| self.store_tailscale(t, edit)),
-            ProviderId::Netbird => Err("netbird profiles are managed by netbird".into()),
+            ProviderId::Netbird | ProviderId::Pangolin => Err(managed_elsewhere(provider).into()),
         };
         match result {
             Ok(name) => {
@@ -3907,7 +3920,7 @@ impl App {
                 }
                 self.vpn_cfg.tailscale.remove(idx).name
             }
-            ProviderId::Netbird => return,
+            ProviderId::Netbird | ProviderId::Pangolin => return,
         };
         self.save_vpn_cfg();
         self.refresh_provider(provider);

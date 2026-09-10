@@ -592,6 +592,18 @@ fn vpn_profile_block(out: &mut String, app: &App, provider: ProviderId, profile:
         ProviderId::Netbird => {
             field(out, "profiles", "netbird's own — controlcenter only reads them");
         }
+        ProviderId::Pangolin => {
+            field(out, "accounts", "pangolin's own — controlcenter only reads them");
+            field(
+                out,
+                "command",
+                command_line(&["pangolin".into(), "up".into(), "--silent".into()]),
+            );
+            // The escalation is the CLI's, not ours, and a report that did not
+            // say so would send the reader to privileged.rs for a sudo that
+            // never happened there.
+            field(out, "escalation", "pangolin's own sudo, using the startup ticket");
+        }
     }
 }
 

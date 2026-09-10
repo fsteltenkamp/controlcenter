@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 169 tests, all pure unit tests — no network, no root
+cargo test             # 179 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -30,7 +30,7 @@ gnu target; releases ship the msvc one from a real Windows runner.
 `./build.sh test` is worth the wait rather than a formality: it is what caught the
 accepted socket in `tunnel.rs` inheriting the listener's non-blocking mode, which made
 every tunnel on Windows relay nothing at all and which no amount of reading had found.
-Four of the 169 tests are Unix-only and do not run there. What wine cannot answer for is
+Two of the 179 tests are Unix-only and do not run there. What wine cannot answer for is
 anything that reaches a real Windows service — DPAPI, `icacls`, `taskkill`, PowerShell —
 so those still need the CI job or a real machine.
 
@@ -166,6 +166,12 @@ ticket before the TUI started, in which case sudo goes first because it cannot b
 dismissed. That warm-up is the only place sudo is ever allowed to prompt, and it runs in
 `main` before the alternate screen, on the user's own terminal. Nothing else shells out to
 sudo, and status polling never escalates at all.
+
+The one exception is a client that escalates *itself*: `pangolin up` re-executes under
+sudo, so controlcenter runs it unprivileged and `ProviderId::needs_root` returning true is
+what takes the startup ticket that sudo then finds. Wrapping it in `privileged::run` as
+well would be two escalations racing for one command. Do not add a second such client
+without the same reasoning written down beside it.
 
 Windows is a second implementation behind the same interface, in the same file. There is
 nothing to warm up: UAC settles the question before the process starts and cannot raise
