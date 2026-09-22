@@ -3,6 +3,7 @@ use crate::app::{
     VpnMode, VpnPane, FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
 };
 use crate::browser::FileBrowser;
+use crate::chooser::{Chooser, Row as ChooserRow};
 use crate::logs;
 use crate::platform::Advice;
 use crate::rdp::RdpStatus;
@@ -123,9 +124,12 @@ pub fn render(f: &mut Frame, app: &App) {
         render_log_overlay(f, app, pane, area);
     }
 
-    // The file picker covers the form that opened it.
+    // The pickers cover the form that opened them.
     if let Some(browser) = &app.browser {
         render_browser_overlay(f, browser, area);
+    }
+    if let Some((_, chooser)) = &app.chooser {
+        render_chooser_overlay(f, chooser, area);
     }
 
     // A refused port explains a start that has already failed, so it draws
@@ -631,23 +635,24 @@ fn render_active_table(f: &mut Frame, app: &App, area: Rect) {
 /// Compact "needs …" tail for a tunnel row; the details panel spells out which
 /// profile and which tunnel.
 fn needs_span(app: &App, t: &Tunnel) -> Span<'static> {
+    // Both the tunnel's own requirements and those of the SSH host it rides:
+    // a tunnel whose host is behind a VPN is not ready until that VPN is up.
+    let requires = app.tunnel_requirements(t);
     let mut parts: Vec<&str> = Vec::new();
-    if !t.requires_vpn.is_empty() {
+    if requires.iter().any(|r| !r.vpn.is_empty()) {
         parts.push("vpn");
     }
-    if !t.depends_on.is_empty() {
+    if requires.iter().any(|r| !r.tunnel.is_empty()) {
         parts.push("tun");
     }
     if parts.is_empty() {
         return Span::raw("");
     }
-    let ready = app.vpn_satisfied(&t.requires_vpn)
-        && (t.depends_on.is_empty()
-            || matches!(
-                app.active.get(&t.depends_on).map(|a| a.status),
-                Some(Status::Up)
-            ));
-    let color = if app.dependency_missing(&t.depends_on) {
+    let ready = requires
+        .iter()
+        .all(|r| app.vpn_satisfied(&r.vpn) && app.tunnel_requirement_met(&r.tunnel));
+    let missing = requires.iter().any(|r| app.dependency_missing(&r.tunnel));
+    let color = if missing || app.ssh_entry_missing(t) {
         DANGER()
     } else if ready {
         OK()
@@ -655,6 +660,12 @@ fn needs_span(app: &App, t: &Tunnel) -> Span<'static> {
         DIM()
     };
     Span::styled(format!("needs {}", parts.join("+")), Style::default().fg(color))
+}
+
+/// What a tunnel row puts after "via": the SSH host's own name where it rides
+/// one, because `ssh:` is storage and the name is what the user picked.
+fn via_name(t: &Tunnel) -> String {
+    t.ssh_entry().map(str::to_string).unwrap_or_else(|| t.ssh_host.clone())
 }
 
 /// The head of a group's details panel: its name, how many members it has and
@@ -719,8 +730,12 @@ fn render_tunnels(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(DIM()),
                     ),
                     Span::styled(
-                        format!("via {:<12}", truncate(&t.ssh_host, 12)),
-                        Style::default().fg(DIM()),
+                        format!("via {:<12}", truncate(&via_name(t), 12)),
+                        Style::default().fg(if app.ssh_entry_missing(t) {
+                            DANGER()
+                        } else {
+                            DIM()
+                        }),
                     ),
                     needs_span(app, t),
                 ]))
@@ -802,7 +817,28 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
             if !t.group.is_empty() {
                 lines.push(field("group", t.group.clone()));
             }
-            lines.push(field("ssh host", t.ssh_host.clone()));
+            match (t.ssh_entry(), app.ssh_entry_for(t)) {
+                (Some(name), Some(h)) => {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<11}", "ssh host"), Style::default().fg(DIM())),
+                        Span::styled(name.to_string(), Style::default().fg(ACCENT())),
+                        Span::styled(
+                            format!("  {}", h.target_summary()),
+                            Style::default().fg(DIM()),
+                        ),
+                    ]));
+                }
+                (Some(name), None) => {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:<11}", "ssh host"), Style::default().fg(DIM())),
+                        Span::styled(
+                            format!("{name} (missing)"),
+                            Style::default().fg(DANGER()),
+                        ),
+                    ]));
+                }
+                (None, _) => lines.push(field("ssh host", t.ssh_host.clone())),
+            }
             lines.push(field("type", t.forward.label().to_string()));
             lines.push(field("forward", t.forward_summary()));
             if !t.extra_args.is_empty() {
@@ -1899,6 +1935,10 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
                 dependency_span(app, &h.depends_on),
             ]));
             lines.extend(chain_lines(app, Step::Ssh(h.name.clone())));
+            let riders = app.ssh_riders_of(&h.name);
+            if !riders.is_empty() {
+                lines.push(field("runs", riders.join(", ")));
+            }
             if !h.extra_args.is_empty() {
                 lines.push(field("extra args", h.extra_args.clone()));
             }
@@ -2136,6 +2176,16 @@ fn render_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             format!(" {err}"),
             Style::default().fg(DANGER()),
         )));
+    } else if form.field() == FormField::SshHost {
+        lines.push(Line::from(Span::styled(
+            " Ctrl+O picks a host from the SSH tab · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+    } else if matches!(form.field(), FormField::RequiresVpn | FormField::DependsOn) {
+        lines.push(Line::from(Span::styled(
+            " ◂▸ toggle · Ctrl+O the whole list · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             " tab/↓ next · ↑ prev · ◂▸ toggle · Enter save · Esc cancel",
@@ -2242,6 +2292,11 @@ fn render_rdp_form_overlay(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!(" {err}"),
             Style::default().fg(DANGER()),
+        )));
+    } else if form.field().is_picker() {
+        lines.push(Line::from(Span::styled(
+            " ◂▸ toggle · Ctrl+O the whole list · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
         )));
     } else {
         lines.push(Line::from(Span::styled(
@@ -2654,6 +2709,11 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
     } else if form.field() == SshField::KeyPath {
         lines.push(Line::from(Span::styled(
             " Ctrl+O file picker · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+    } else if matches!(form.field(), SshField::RequiresVpn | SshField::DependsOn) {
+        lines.push(Line::from(Span::styled(
+            " ◂▸ toggle · Ctrl+O the whole list · Enter save · Esc cancel",
             Style::default().fg(DIM()),
         )));
     } else {
@@ -3150,7 +3210,9 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("← →", "switch pane · change the field under the cursor"),
         entry("esc", "cancel a form, close a popup"),
         entry("y", "confirm in a prompt"),
-        entry("ctrl+o", "open the file picker on a path field"),
+        entry("ctrl+o", "open a picker for the field under the cursor — files"),
+        entry("", "on a path, the whole list on a VPN, tunnel or ssh-host"),
+        entry("", "field, where groups are folders and typing searches"),
         entry("o", "open the login URL — in a VPN browser-login prompt,"),
         entry("", "where c gives up on the login instead"),
         Line::from(""),
@@ -3287,6 +3349,113 @@ fn render_browser_overlay(f: &mut Frame, browser: &FileBrowser, area: Rect) {
             " ↑↓ select · → / Enter open folder · Enter pick file · ← up · Esc cancel",
             Style::default().fg(DIM()),
         ))),
+        chunks[3],
+    );
+}
+
+/// The list picker: what is being typed, and the folder it is looking in.
+/// Deliberately the file picker's layout — the keys are the same, so the shape
+/// should be too.
+fn render_chooser_overlay(f: &mut Frame, chooser: &Chooser, area: Rect) {
+    let width = 76.min(area.width);
+    let height = area.height.saturating_sub(4).clamp(8, 26);
+    let rect = centered_rect(width, height, area);
+    f.render_widget(Clear, rect);
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(
+                format!(" pick {} ", chooser.title),
+                Style::default().fg(ACCENT()).bold(),
+            )),
+        rect,
+    );
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let where_ = if chooser.folder.is_empty() {
+        "all".to_string()
+    } else {
+        format!("{}/", chooser.folder)
+    };
+    let filter_width = inner.width as usize;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {where_} "), Style::default().fg(ACCENT())),
+            Span::styled(
+                scrolled(&chooser.filter, filter_width.saturating_sub(where_.len() + 3)),
+                Style::default().fg(TEXT()),
+            ),
+            Span::styled("▏", Style::default().fg(ACCENT())),
+        ])),
+        chunks[0],
+    );
+
+    let subtitle = if chooser.rows.is_empty() {
+        Span::styled(" nothing here matches", Style::default().fg(DIM()))
+    } else if chooser.folder.is_empty() && !chooser.filter.is_empty() {
+        Span::styled(
+            format!(" {} of {} match", chooser.rows.len(), chooser.total()),
+            Style::default().fg(DIM()),
+        )
+    } else {
+        Span::styled(
+            format!(" {} entries", chooser.rows.len()),
+            Style::default().fg(DIM()),
+        )
+    };
+    f.render_widget(Paragraph::new(Line::from(subtitle)), chunks[1]);
+
+    let items: Vec<ListItem> = chooser
+        .rows
+        .iter()
+        .map(|r| {
+            let (mark, text, style) = match r {
+                ChooserRow::Folder(name) => {
+                    ("▸ ", format!("{name}/"), Style::default().fg(ACCENT()))
+                }
+                ChooserRow::Choice { label, .. } => {
+                    ("  ", label.clone(), Style::default().fg(TEXT()))
+                }
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(DIM())),
+                Span::styled(text, style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !chooser.rows.is_empty() {
+        state.select(Some(chooser.selected));
+    }
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+        chunks[2],
+        &mut state,
+    );
+
+    let hint = if chooser.folder.is_empty() {
+        " ↑↓ select · type to search every group · Enter pick · Esc cancel"
+    } else {
+        " ↑↓ select · type to filter · Enter pick · ← out of the group · Esc cancel"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM())))),
         chunks[3],
     );
 }

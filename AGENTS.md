@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 179 tests, all pure unit tests — no network, no root
+cargo test             # 211 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -30,7 +30,7 @@ gnu target; releases ship the msvc one from a real Windows runner.
 `./build.sh test` is worth the wait rather than a formality: it is what caught the
 accepted socket in `tunnel.rs` inheriting the listener's non-blocking mode, which made
 every tunnel on Windows relay nothing at all and which no amount of reading had found.
-Two of the 179 tests are Unix-only and do not run there. What wine cannot answer for is
+Two of the tests are Unix-only and do not run there. What wine cannot answer for is
 anything that reaches a real Windows service — DPAPI, `icacls`, `taskkill`, PowerShell —
 so those still need the CI job or a real machine.
 
@@ -50,6 +50,7 @@ so those still need the CI job or a real machine.
 | `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline |
 | `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
 | `src/browser.rs` | the file picker |
+| `src/chooser.rs` | the list picker — groups as folders, entries as files |
 | `src/theme.rs` | the four colour themes |
 | `src/vpn/` | one module per client behind a shared interface in `mod.rs`, plus `privileged.rs` for pkexec/sudo/elevation and `scan.rs` for what is on the machine |
 
@@ -66,6 +67,14 @@ changes. The table in the README is the contract. When adding a key:
   `render_status` in the same change
 - navigation is arrow keys only. `h` `j` `k` `l` are action keys; do not reintroduce vim
   bindings
+
+`Ctrl+O` is the one picker key, in forms. It opens whatever picker the field under the
+cursor has — `browser::FileBrowser` on a path, `chooser::Chooser` on a field whose value
+comes from a list — and flashes a line on a field that has neither, rather than doing
+nothing. A new form field with a list behind it is added to `App::active_chooser_field`
+and its two companions, not given a key of its own. A `Chooser` never stores anything
+itself: it hands back a value, and a `Picker` or a text field takes it, so what is saved
+does not depend on which way the field was set.
 
 **A list's order is its file's order.** `build_rows` lays a list out as the ungrouped
 entries, then each group in order of first appearance, so `reorder` only makes moves that
@@ -120,6 +129,15 @@ say so in the comment and say why, the same as any other decision.
 justify a decision that would otherwise look arbitrary — why WireGuard is polled with `ip`
 rather than `wg show`, why openvpn is stopped through a pid file. Do not add comments that
 restate the code.
+
+**A configured SSH host becomes a command line in one place.** A tunnel's `ssh_host` is
+either a destination ssh resolves or `ssh:<name>`, an entry from `ssh.toml`
+(`types::parse_ssh_target`). Where it is an entry, everything that entry says about
+reaching the host comes from `ssh::connection_args` — the same function an interactive
+session uses — so a field added to `SshHost` reaches tunnels and sessions together or
+neither. What the entry needs for itself is folded into the tunnel's plan by
+`Catalog::requires_of`, which returns one `Requires` per source rather than merging them:
+a tunnel and the host it rides can each name a tunnel, and both have to be up.
 
 **A client is driven through its CLI, unless its CLI cannot be driven.** Every
 provider shells out; `vpn/pangolin.rs` is the one that also talks to its client's

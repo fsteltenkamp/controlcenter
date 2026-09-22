@@ -39,13 +39,57 @@ impl ForwardType {
     }
 }
 
+/// What a tunnel's [`Tunnel::ssh_host`] names.
+///
+/// The same shape as a VPN requirement: a prefix that names the kind, and a
+/// bare value that means what it always meant. `ssh:` is the prefix because a
+/// destination ssh itself would accept can never start with it — `ssh://` is a
+/// URI and is spelled with the slashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshTarget<'a> {
+    /// A host configured on the SSH tab, by name.
+    Entry(&'a str),
+    /// Anything ssh resolves on its own: an `ssh_config` alias, `user@host`,
+    /// an `ssh://` URI.
+    Destination(&'a str),
+}
+
+/// How a reference to an SSH-tab host is written in `tunnels.toml`.
+pub const SSH_ENTRY_PREFIX: &str = "ssh:";
+
+/// Read a tunnel's `ssh_host`.
+pub fn parse_ssh_target(value: &str) -> SshTarget<'_> {
+    let value = value.trim();
+    match value.strip_prefix(SSH_ENTRY_PREFIX) {
+        // `ssh://user@host` is a destination, not the entry named "//user@host".
+        Some(name) if !name.starts_with('/') && !name.is_empty() => SshTarget::Entry(name),
+        _ => SshTarget::Destination(value),
+    }
+}
+
+/// The stored form of a reference to the SSH-tab host called `name`.
+pub fn ssh_entry_ref(name: &str) -> String {
+    format!("{SSH_ENTRY_PREFIX}{name}")
+}
+
+/// The SSH-tab host a tunnel rides, when it names one that is still there.
+/// `None` covers both a plain destination and a reference to a host that has
+/// been deleted; [`Tunnel::ssh_entry`] tells the two apart.
+pub fn ssh_entry_of<'a>(hosts: &'a [SshHost], t: &Tunnel) -> Option<&'a SshHost> {
+    let name = t.ssh_entry()?;
+    hosts.iter().find(|h| h.name == name)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tunnel {
     pub name: String,
     /// Empty string means ungrouped.
     #[serde(default)]
     pub group: String,
-    /// Anything ssh accepts as destination: host alias, user@host, user@host:port via extra args.
+    /// Where the tunnel goes through. Either something ssh resolves itself — a
+    /// host alias from `ssh_config`, `user@host` — or `ssh:<name>`, a host on
+    /// the SSH tab whose port, user, key, password and options the tunnel then
+    /// runs with. See [`parse_ssh_target`].
     pub ssh_host: String,
     #[serde(default)]
     pub forward: ForwardType,
@@ -139,6 +183,23 @@ impl Tunnel {
             &self.remote_host
         }
     }
+
+    /// The SSH-tab host this tunnel rides, when it names one.
+    pub fn ssh_entry(&self) -> Option<&str> {
+        match parse_ssh_target(&self.ssh_host) {
+            SshTarget::Entry(name) => Some(name),
+            SshTarget::Destination(_) => None,
+        }
+    }
+
+    /// How the ssh host reads in the UI: the entry's name where it is one,
+    /// because that is what the user picked and what they can go and edit.
+    pub fn ssh_host_label(&self) -> String {
+        match parse_ssh_target(&self.ssh_host) {
+            SshTarget::Entry(name) => format!("ssh host '{name}'"),
+            SshTarget::Destination(d) => d.to_string(),
+        }
+    }
 }
 
 /// An interactive SSH login. Unlike a tunnel this is a foreground session: the
@@ -213,13 +274,19 @@ impl Tunnel {
     /// The endpoint this tunnel binds while it runs: a local listen port for
     /// -L/-D, or a port on the ssh host for -R. Two tunnels can only be up at
     /// the same time if their bindings differ.
+    ///
+    /// The remote end is named by what was written in the config, so two
+    /// spellings of one host — an alias and its hostname, an `ssh:` entry and
+    /// the `user@host` it resolves to — are not seen as the same endpoint.
+    /// That has always been true of aliases and there is nothing here that
+    /// could tell: only ssh knows what an `ssh_config` alias resolves to.
     pub fn binding(&self) -> String {
         match self.forward {
             ForwardType::Local | ForwardType::Dynamic => {
                 format!("local port {}", self.local_port)
             }
             ForwardType::Remote => {
-                format!("port {} on {}", self.remote_port, self.ssh_host)
+                format!("port {} on {}", self.remote_port, self.ssh_host_label())
             }
         }
     }
@@ -566,6 +633,41 @@ mod tests {
         let r = parse_vpn_requirement("acme:prod").unwrap();
         assert_eq!(r.provider, Some(ProviderId::Netbird));
         assert_eq!(r.profile.as_deref(), Some("acme:prod"));
+    }
+
+    #[test]
+    fn an_ssh_host_is_a_destination_unless_it_names_an_entry() {
+        assert_eq!(parse_ssh_target("bastion"), SshTarget::Destination("bastion"));
+        assert_eq!(
+            parse_ssh_target("fl@bastion.corp"),
+            SshTarget::Destination("fl@bastion.corp")
+        );
+        assert_eq!(parse_ssh_target("ssh:jump"), SshTarget::Entry("jump"));
+        // A name with spaces in it is a name; only the prefix is stripped.
+        assert_eq!(
+            parse_ssh_target("ssh:prod bastion"),
+            SshTarget::Entry("prod bastion")
+        );
+    }
+
+    #[test]
+    fn an_ssh_uri_is_not_an_entry_called_slash_slash() {
+        assert_eq!(
+            parse_ssh_target("ssh://fl@bastion:2222"),
+            SshTarget::Destination("ssh://fl@bastion:2222")
+        );
+        // Nor is the prefix on its own.
+        assert_eq!(parse_ssh_target("ssh:"), SshTarget::Destination("ssh:"));
+    }
+
+    #[test]
+    fn a_tunnel_reports_the_entry_it_rides() {
+        let mut t = tunnel("a", ForwardType::Local, 1, 2);
+        assert_eq!(t.ssh_entry(), None);
+        assert_eq!(t.ssh_host_label(), "bastion");
+        t.ssh_host = ssh_entry_ref("jump");
+        assert_eq!(t.ssh_entry(), Some("jump"));
+        assert_eq!(t.ssh_host_label(), "ssh host 'jump'");
     }
 
     #[test]

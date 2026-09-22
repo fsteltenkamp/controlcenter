@@ -1,5 +1,6 @@
 use crate::logs::{Entry, Ring};
-use crate::types::{ForwardType, Tunnel};
+use crate::ssh::PasswordHelper;
+use crate::types::{ForwardType, SshHost, Tunnel};
 use anyhow::{Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -65,15 +66,40 @@ pub struct ActiveTunnel {
 
 /// The ssh arguments for a tunnel, in the order they are passed.
 ///
+/// `via` is the SSH-tab host the tunnel rides, when [`Tunnel::ssh_entry`] names
+/// one: its port, key, host-key setting and extra args are put on the command
+/// line here, so a tunnel needs nothing in `~/.ssh/config`.
+///
 /// `internal` is the loopback port ssh binds for -L/-D, which is chosen when the
 /// tunnel starts; `None` renders it as a placeholder, for the command line the
 /// report shows for a tunnel that is not running.
-pub fn build_args(tunnel: &Tunnel, internal: Option<u16>) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "ssh".into(),
+pub fn build_args(
+    tunnel: &Tunnel,
+    via: Option<&SshHost>,
+    helper: &PasswordHelper,
+    internal: Option<u16>,
+) -> Vec<String> {
+    // ssh takes the first value it is given for an option, so the tunnel's own
+    // settings go first and nothing later can quietly undo them.
+    //
+    // BatchMode turns off every prompt — including the password one, which is
+    // the whole point of a stored password. A tunnel that carries one is
+    // therefore not in batch mode; `NumberOfPasswordPrompts=1` below is what
+    // keeps it from sitting on a prompt nobody can answer.
+    let password = via.map(|h| h.password.as_str()).unwrap_or("");
+    let batch = password.is_empty();
+    // sshpass is the program that is actually run; ssh becomes its argument.
+    // argv[0] is the program either way, so what is written down is what ran.
+    let mut args: Vec<String> = if !password.is_empty() && *helper == PasswordHelper::Sshpass {
+        vec!["sshpass".into(), "-e".into(), "ssh".into()]
+    } else {
+        vec!["ssh".into()]
+    };
+    args.extend([
+        "-N".into(),
         "-N".into(),
         "-o".into(),
-        "BatchMode=yes".into(),
+        format!("BatchMode={}", if batch { "yes" } else { "no" }),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
         "-o".into(),
@@ -82,7 +108,7 @@ pub fn build_args(tunnel: &Tunnel, internal: Option<u16>) -> Vec<String> {
         "ServerAliveInterval=10".into(),
         "-o".into(),
         "ServerAliveCountMax=3".into(),
-    ];
+    ]);
     let port = match internal {
         Some(p) => p.to_string(),
         None => "<port>".to_string(),
@@ -109,30 +135,56 @@ pub fn build_args(tunnel: &Tunnel, internal: Option<u16>) -> Vec<String> {
             ));
         }
     }
-    args.extend(tunnel.extra_args.split_whitespace().map(String::from));
-    args.push(tunnel.ssh_host.clone());
+    match via {
+        Some(host) => {
+            args.extend(crate::ssh::connection_args(host));
+            // The tunnel's own extra args come last of the two, so a tunnel can
+            // still say something its host does not.
+            args.extend(tunnel.extra_args.split_whitespace().map(String::from));
+            args.push(host.destination());
+        }
+        None => {
+            args.extend(tunnel.extra_args.split_whitespace().map(String::from));
+            args.push(tunnel.ssh_host.clone());
+        }
+    }
     args
 }
 
 /// Spawn ssh for the given tunnel. For Local/Dynamic forwards ssh binds an
 /// internal loopback port and a relay thread listens on the configured port,
 /// counting bytes in both directions.
-pub fn spawn(tunnel: &Tunnel) -> Result<ActiveTunnel> {
+pub fn spawn(
+    tunnel: &Tunnel,
+    via: Option<&SshHost>,
+    helper: &PasswordHelper,
+) -> Result<ActiveTunnel> {
     let internal_port = match tunnel.forward {
         ForwardType::Local | ForwardType::Dynamic => Some(free_port()?),
         ForwardType::Remote => None,
     };
-    let argv = build_args(tunnel, internal_port);
-    // argv[0] is the program; ssh itself takes the rest.
-    let args = &argv[1..];
+    let argv = build_args(tunnel, via, helper, internal_port);
+    // argv[0] is the program — ssh, or sshpass with ssh as its argument — and
+    // the rest is passed to it untouched.
+    let mut cmd = Command::new(crate::platform::program(&argv[0]));
+    cmd.args(&argv[1..]);
+    // -e makes sshpass read the password out of the environment, and askpass
+    // does the same at ssh's own prompt; neither is ever an argument.
+    crate::ssh::carry_password(&mut cmd, via.map_or("", |h| h.password.as_str()), helper);
 
-    let mut child = Command::new(crate::platform::program("ssh"))
-        .args(args)
+    let sshpass = argv[0] == "sshpass";
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawning ssh")?;
+        .with_context(|| {
+            if sshpass {
+                "spawning sshpass (is sshpass installed?)".to_string()
+            } else {
+                "spawning ssh".to_string()
+            }
+        })?;
 
     let stderr_log = Arc::new(Ring::new("ssh"));
     if let Some(stderr) = child.stderr.take() {
@@ -459,9 +511,30 @@ mod tests {
         }
     }
 
+    fn entry(name: &str) -> SshHost {
+        SshHost {
+            name: name.into(),
+            group: String::new(),
+            host: "bastion.corp".into(),
+            port: 2222,
+            username: "fl".into(),
+            key_path: "/keys/id_bastion".into(),
+            password: String::new(),
+            skip_host_key_check: false,
+            extra_args: "-A".into(),
+            depends_on: String::new(),
+            requires_vpn: String::new(),
+        }
+    }
+
     #[test]
     fn a_local_forward_binds_the_internal_port_and_the_relay_takes_the_real_one() {
-        let args = build_args(&tunnel(ForwardType::Local), Some(40001));
+        let args = build_args(
+            &tunnel(ForwardType::Local),
+            None,
+            &PasswordHelper::None,
+            Some(40001),
+        );
         assert_eq!(args[0], "ssh");
         assert!(args.contains(&"-L".to_string()));
         assert!(args.contains(&"127.0.0.1:40001:db.internal:5432".to_string()));
@@ -472,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_remote_forward_has_no_internal_port_at_all() {
-        let args = build_args(&tunnel(ForwardType::Remote), None);
+        let args = build_args(&tunnel(ForwardType::Remote), None, &PasswordHelper::None, None);
         assert!(args.contains(&"5432:db.internal:5432".to_string()));
         assert!(!args.iter().any(|a| a.contains("<port>")));
     }
@@ -480,8 +553,53 @@ mod tests {
     #[test]
     fn without_a_port_the_preview_says_so_rather_than_inventing_one() {
         // What the report prints for a tunnel that is not running.
-        let args = build_args(&tunnel(ForwardType::Dynamic), None);
+        let args = build_args(&tunnel(ForwardType::Dynamic), None, &PasswordHelper::None, None);
         assert!(args.contains(&"127.0.0.1:<port>".to_string()));
+    }
+
+    #[test]
+    fn riding_an_ssh_host_puts_its_port_key_and_args_on_the_command_line() {
+        let host = entry("jump");
+        let mut t = tunnel(ForwardType::Local);
+        t.ssh_host = crate::types::ssh_entry_ref("jump");
+        let args = build_args(&t, Some(&host), &PasswordHelper::None, Some(40001));
+
+        // Nothing here needs ~/.ssh/config: the destination is spelled out.
+        assert_eq!(args.last().unwrap(), "fl@bastion.corp");
+        assert!(args.windows(2).any(|w| w == ["-p", "2222"]));
+        assert!(args.windows(2).any(|w| w == ["-i", "/keys/id_bastion"]));
+        assert!(args.contains(&"IdentitiesOnly=yes".to_string()));
+        // The host's own extra args and the tunnel's both survive.
+        assert!(args.contains(&"-A".to_string()));
+        assert!(args.contains(&"-J".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn a_stored_password_turns_batch_mode_off_and_goes_through_sshpass() {
+        let mut host = entry("jump");
+        host.password = "hunter2".into();
+        let mut t = tunnel(ForwardType::Local);
+        t.ssh_host = crate::types::ssh_entry_ref("jump");
+
+        let args = build_args(&t, Some(&host), &PasswordHelper::Sshpass, Some(40001));
+        // BatchMode=yes would refuse the password prompt the password is for.
+        assert!(args.contains(&"BatchMode=no".to_string()));
+        assert!(args.contains(&"NumberOfPasswordPrompts=1".to_string()));
+        assert_eq!(&args[..3], ["sshpass", "-e", "ssh"]);
+        // And it is never an argument.
+        assert!(!args.iter().any(|a| a.contains("hunter2")));
+
+        // Where sshpass is not installed the helper answers ssh's own prompt,
+        // so ssh is the program again.
+        let askpass = build_args(
+            &t,
+            Some(&host),
+            &PasswordHelper::Askpass("/bin/controlcenter".into()),
+            Some(40001),
+        );
+        assert_eq!(askpass[0], "ssh");
+        assert!(askpass.contains(&"BatchMode=no".to_string()));
     }
 
     #[test]

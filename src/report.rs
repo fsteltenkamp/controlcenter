@@ -213,12 +213,31 @@ fn chain_targets(app: &App, target: &LogTarget) -> Vec<LogTarget> {
             password: String::new(),
         },
     };
-    app.plan_for(step)
-        .unwrap_or_default()
-        .iter()
-        .map(Step::log_target)
-        .filter(|t| t != target)
-        .collect()
+    let mut out: Vec<LogTarget> = Vec::new();
+    for step in app.plan_for(step).unwrap_or_default() {
+        // A tunnel riding an SSH host runs with that host's port, key and
+        // options, so the host is part of what explains the tunnel even though
+        // no session of it is ever opened.
+        if let Step::Tunnel(name) = &step {
+            if let Some(host) = app
+                .tunnels
+                .iter()
+                .find(|t| &t.name == name)
+                .and_then(|t| app.ssh_entry_for(t))
+            {
+                let via = LogTarget::Ssh(host.name.clone());
+                if !out.contains(&via) {
+                    out.push(via);
+                }
+            }
+        }
+        let t = step.log_target();
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out.retain(|t| t != target);
+    out
 }
 
 /// One connection as the report describes it, whichever kind it is.
@@ -369,7 +388,23 @@ fn requirements(out: &mut String, app: &App, vpn: &str, dep: &str) {
 fn tunnel_block(out: &mut String, app: &App, t: &Tunnel) {
     field(out, "name", &t.name);
     field(out, "group", if t.group.is_empty() { "—" } else { &t.group });
-    field(out, "ssh host", &t.ssh_host);
+    match t.ssh_entry() {
+        // Say both: which host was picked, and what it turns into — a report is
+        // read by someone who has not got the SSH tab in front of them.
+        Some(name) => match app.ssh_entry_for(t) {
+            Some(h) => field(
+                out,
+                "ssh host",
+                format!("'{name}' on the ssh tab — {}", h.target_summary()),
+            ),
+            None => field(
+                out,
+                "ssh host",
+                format!("'{name}' on the ssh tab — no host by that name is configured"),
+            ),
+        },
+        None => field(out, "ssh host", &t.ssh_host),
+    }
     field(out, "forward", t.forward.label());
     field(out, "forwards", t.forward_summary());
     field(out, "extra args", redact(&t.extra_args));
@@ -406,7 +441,12 @@ fn tunnel_block(out: &mut String, app: &App, t: &Tunnel) {
                 "command",
                 format!(
                     "{} (the internal port is picked when it starts)",
-                    command_line(&tunnel::build_args(t, None))
+                    command_line(&tunnel::build_args(
+                        t,
+                        app.ssh_entry_for(t),
+                        &app.ssh_password_helper,
+                        None
+                    ))
                 ),
             );
         }

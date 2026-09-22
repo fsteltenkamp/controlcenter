@@ -39,12 +39,16 @@ in.
 ## Dependencies
 
 Tunnels, SSH hosts and RDP connections each take two optional requirements, picked with
-`←` `→` in their form:
+`←` `→` in their form — or with `Ctrl+O`, which opens the whole list as a popup where
+groups are folders and typing searches every one of them at once:
 
 - **`requires_vpn`** — a VPN that must be up first, written as `provider:profile`
 - **`depends_on`** — a tunnel that must be up. Tunnels can name another tunnel here, which
   is how you stack them: point the upper tunnel's ssh host at `127.0.0.1` with
   `-p <lower tunnel's local port>` (or a `-J` jump host) and it runs through the one below
+
+A tunnel has a third link: the host it goes **through**, which can be an entry on the SSH
+tab rather than something `~/.ssh/config` has to know about.
 
 `Enter` builds a plan out of that chain and runs it in order: the VPNs first, then the
 tunnels bottom-up, then the connection itself. Each step is waited for before the next one
@@ -60,6 +64,52 @@ Renaming a tunnel updates everything that depends on it; deleting one leaves the
 dependency visible and marked *missing* rather than silently unlinking it. Auto-reconnect
 holds off while a tunnel's VPN or parent tunnel is down instead of retrying into a dead
 chain.
+
+### Tunnels through a configured host
+
+A tunnel's **SSH host** field takes two kinds of value:
+
+- a destination ssh works out for itself — an `ssh_config` alias, `user@host`, an
+  `ssh://` URI. This is what it has always taken
+- the name of an entry on the **SSH tab**, stored as `ssh:<name>`. Press `Ctrl+O` on the
+  field to pick one
+
+Pick an entry and the tunnel runs with everything that entry says: its host and port, its
+username, its key (`-i`, with `IdentitiesOnly`), its `skip_host_key_check`, its extra args
+and — where one is stored — its password. Nothing about the connection has to be repeated
+in `extra_args`, and nothing has to exist in `~/.ssh/config`. The tunnel's own extra args
+are still passed, after the host's.
+
+The entry's **own** requirements become the tunnel's: if the host needs a VPN or sits
+behind another tunnel, that is now part of this tunnel's chain and is brought up first. A
+host that needs a tunnel which rides that same host is a cycle, and is refused when you
+save it rather than when you try to start it.
+
+```
+tunnels.toml                 ssh.toml
+name      = "prod-cache"     name       = "bast"
+ssh_host  = "ssh:bast"       host       = "bastion.corp"
+forward   = "local"          port       = 2222
+local_port = 6379            username   = "fl"
+remote_host = "cache.int"    key_path   = "~/.ssh/id_b"
+remote_port = 6379           extra_args = "-A"
+extra_args = "-o TCPKeepAlive=yes"
+
+what runs:
+ssh -N -o BatchMode=yes … -L 127.0.0.1:<port>:cache.int:6379 \
+    -p 2222 -i ~/.ssh/id_b -o IdentitiesOnly=yes -A \
+    -o TCPKeepAlive=yes fl@bastion.corp
+```
+
+Tunnels normally run with `BatchMode=yes`, which switches off every prompt — including the
+password one. A tunnel riding a host that has a **stored password** therefore runs with
+`BatchMode=no` and `NumberOfPasswordPrompts=1` instead, and the password reaches ssh the
+same way an interactive session's does: through `sshpass -e`, or through `SSH_ASKPASS`
+where sshpass is not installed. It is never an argument. One wrong attempt and ssh gives
+up rather than sitting on a prompt nobody can answer.
+
+The SSH tab shows which tunnels run through a host, and deleting a host says which tunnels
+it has just left pointing at nothing. Renaming one follows through to them.
 
 ### Requiring a VPN
 

@@ -1,4 +1,5 @@
 use crate::browser::FileBrowser;
+use crate::chooser::{Choice, Chooser};
 use crate::config::{self, AppConfig, Paths};
 use crate::logs::{Entry, Journal, LogTarget, Ring};
 use crate::rdp::{self, ActiveRdp, RdpStatus};
@@ -7,9 +8,9 @@ use crate::ssh::{self, SessionOutcome};
 use crate::theme::{self, Theme};
 use crate::tunnel::{self, ActiveTunnel, Status};
 use crate::types::{
-    canonical_vpn_requirement, parse_vpn_requirement, tunnel_conflict, vpn_requirement_label,
-    ForwardType, OpenvpnProfile, RdpConnection, Requires, SshHost, TailscaleProfile, Tunnel,
-    VpnConfig, WireguardProfile, VPN_ANY,
+    canonical_vpn_requirement, parse_vpn_requirement, ssh_entry_of, ssh_entry_ref, tunnel_conflict,
+    vpn_requirement_label, ForwardType, OpenvpnProfile, RdpConnection, Requires, SshHost,
+    TailscaleProfile, Tunnel, VpnConfig, WireguardProfile, VPN_ANY,
 };
 use crate::ui;
 use crate::vpn::openvpn::{self, ActiveOvpn, OvpnStatus};
@@ -284,7 +285,7 @@ impl FormField {
         match self {
             Self::Name => "Name",
             Self::Group => "Group (optional)",
-            Self::SshHost => "SSH host (alias or user@host)",
+            Self::SshHost => "SSH host (Ctrl+O or user@host)",
             Self::Forward => "Forward type",
             Self::LocalPort => match forward {
                 ForwardType::Remote => "Local destination port",
@@ -483,60 +484,73 @@ pub enum PickerKind {
 /// Cycling picker used by the forms to link a connection to what it needs:
 /// "(none)" plus every configured tunnel, or "(none)", "(any profile)" and
 /// every VPN profile.
+///
+/// `◂ ▸` walks the options in order; `Ctrl+O` opens the same options as a
+/// [`Chooser`], which is the only way to find anything once a list is long.
+/// Both set `idx`, so nothing downstream knows or cares which was used.
 #[derive(Debug, Clone)]
 pub struct Picker {
     pub kind: PickerKind,
-    pub options: Vec<String>,
+    pub options: Vec<Choice>,
     pub idx: usize,
 }
 
 impl Picker {
     /// `exclude` keeps a tunnel from being offered as its own dependency.
     pub fn tunnels(tunnels: &[Tunnel], current: &str, exclude: Option<&str>) -> Self {
-        let mut options = vec![String::new()];
+        let mut options = vec![Choice::plain("", "(none)")];
         options.extend(
             tunnels
                 .iter()
-                .map(|t| t.name.clone())
-                .filter(|n| Some(n.as_str()) != exclude),
+                .filter(|t| Some(t.name.as_str()) != exclude)
+                .map(|t| Choice::in_folder(&t.name, &t.name, &t.group)),
         );
         Self::build(PickerKind::Tunnel, options, current)
     }
 
     /// "(none)", "(any VPN)", then each provider's "any profile" entry followed
-    /// by its profiles.
+    /// by its profiles. The provider is the folder the list picker files a
+    /// profile under, which is what it already is in the stored value.
     ///
     /// A provider that is not installed is still offered once it has profiles
     /// configured, so a dependency can be wired up before the client is there.
     pub fn vpn(view: &VpnView, current: &str) -> Self {
-        let mut options = vec![String::new(), VPN_ANY.to_string()];
+        let mut options = vec![
+            Choice::plain("", "(none)"),
+            Choice::plain(VPN_ANY, "any VPN"),
+        ];
         for state in &view.providers {
             if !state.installed && state.profiles.is_empty() {
                 continue;
             }
-            options.push(format!("{}:{VPN_ANY}", state.id.slug()));
-            options.extend(
-                state
-                    .profiles
-                    .iter()
-                    .map(|p| format!("{}:{}", state.id.slug(), p.name)),
-            );
+            let slug = state.id.slug();
+            options.push(Choice::in_folder(
+                format!("{slug}:{VPN_ANY}"),
+                "(any profile)",
+                slug,
+            ));
+            options.extend(state.profiles.iter().map(|p| {
+                Choice::in_folder(format!("{slug}:{}", p.name), &p.name, slug)
+            }));
         }
         Self::build(PickerKind::Vpn, options, &canonical_vpn_requirement(current))
     }
 
-    fn build(kind: PickerKind, mut options: Vec<String>, current: &str) -> Self {
+    fn build(kind: PickerKind, mut options: Vec<Choice>, current: &str) -> Self {
         // Keep a dangling requirement visible instead of silently dropping it —
         // the tunnel may have been deleted, or the VPN may just be unreachable.
-        if !current.is_empty() && !options.iter().any(|o| o == current) {
-            options.push(current.to_string());
+        if !current.is_empty() && !options.iter().any(|o| o.value == current) {
+            options.push(Choice::plain(current, format!("{current} (missing)")));
         }
-        let idx = options.iter().position(|o| o == current).unwrap_or(0);
+        let idx = options.iter().position(|o| o.value == current).unwrap_or(0);
         Self { kind, options, idx }
     }
 
     pub fn value(&self) -> String {
-        self.options.get(self.idx).cloned().unwrap_or_default()
+        self.options
+            .get(self.idx)
+            .map(|o| o.value.clone())
+            .unwrap_or_default()
     }
 
     pub fn label(&self) -> String {
@@ -548,12 +562,56 @@ impl Picker {
         }
     }
 
+    /// The options as the list picker lays them out.
+    pub fn choices(&self) -> Vec<Choice> {
+        self.options.clone()
+    }
+
+    /// Just the stored values, in order.
+    #[cfg(test)]
+    pub fn values(&self) -> Vec<&str> {
+        self.options.iter().map(|o| o.value.as_str()).collect()
+    }
+
+    /// Move to the option with this value, for a pick made in the list picker.
+    pub fn set(&mut self, value: &str) {
+        if let Some(i) = self.options.iter().position(|o| o.value == value) {
+            self.idx = i;
+        }
+    }
+
     pub fn next(&mut self) {
         self.idx = (self.idx + 1) % self.options.len();
     }
 
     pub fn prev(&mut self) {
         self.idx = (self.idx + self.options.len() - 1) % self.options.len();
+    }
+}
+
+/// Which field a [`Chooser`] was opened over, so the pick goes back where it
+/// came from. The forms' picker fields all store a name, and the tunnel's
+/// "SSH host" is a text field that can hold one, so there is nothing else to
+/// tell them apart by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChooserTarget {
+    TunnelSshHost,
+    TunnelVpn,
+    TunnelDep,
+    SshVpn,
+    SshDep,
+    RdpVpn,
+    RdpDep,
+}
+
+impl ChooserTarget {
+    /// What is missing when there is nothing to pick from.
+    fn subject(self) -> &'static str {
+        match self {
+            Self::TunnelSshHost => "ssh host",
+            Self::TunnelVpn | Self::SshVpn | Self::RdpVpn => "VPN profile",
+            Self::TunnelDep | Self::SshDep | Self::RdpDep => "tunnel",
+        }
     }
 }
 
@@ -930,25 +988,50 @@ pub enum SshMode {
 
 /// Follow the tunnel chain from `start` and report the loop if it bites its
 /// own tail.
-pub fn tunnel_cycle(tunnels: &[Tunnel], start: &str) -> Option<String> {
-    let mut seen = vec![start.to_string()];
-    let mut current = start.to_string();
-    loop {
-        let next = tunnels
-            .iter()
-            .find(|t| t.name == current)
-            .map(|t| t.depends_on.clone())
-            .unwrap_or_default();
-        if next.is_empty() {
+///
+/// A tunnel has two ways to name another one: its own `depends_on`, and the
+/// `depends_on` of the SSH host it rides — which has to be up too, or the
+/// tunnel has nothing to run over. Both are followed, so this is a walk of a
+/// tree rather than of a line.
+pub fn tunnel_cycle(tunnels: &[Tunnel], ssh_hosts: &[SshHost], start: &str) -> Option<String> {
+    fn walk(
+        tunnels: &[Tunnel],
+        ssh_hosts: &[SshHost],
+        name: &str,
+        seen: &mut Vec<String>,
+    ) -> Option<String> {
+        if let Some(at) = seen.iter().position(|n| n == name) {
+            let mut loop_back: Vec<String> = seen[at..].to_vec();
+            loop_back.push(name.to_string());
+            return Some(loop_back.join(" → "));
+        }
+        let Some(t) = tunnels.iter().find(|t| t.name == name) else {
+            // A dependency on a tunnel that is not there is not a loop; the
+            // row says it is missing and activation reports it.
             return None;
+        };
+        let mut next: Vec<String> = Vec::new();
+        if !t.depends_on.is_empty() {
+            next.push(t.depends_on.clone());
         }
-        let looped = seen.contains(&next);
-        seen.push(next.clone());
-        if looped {
-            return Some(seen.join(" → "));
+        if let Some(host) = t
+            .ssh_entry()
+            .and_then(|n| ssh_hosts.iter().find(|h| h.name == n))
+        {
+            if !host.depends_on.is_empty() {
+                next.push(host.depends_on.clone());
+            }
         }
-        current = next;
+        seen.push(name.to_string());
+        for n in next {
+            if let Some(cycle) = walk(tunnels, ssh_hosts, &n, seen) {
+                return Some(cycle);
+            }
+        }
+        seen.pop();
+        None
     }
+    walk(tunnels, ssh_hosts, start, &mut Vec::new())
 }
 
 /// One thing to bring up. A plan is an ordered list of these: the VPN first
@@ -1048,7 +1131,13 @@ impl Catalog<'_> {
         let tunnels = self
             .tunnels
             .iter()
-            .filter(|t| matches(&t.requires_vpn) && tunnel_up(&t.name))
+            .filter(|t| {
+                // Either the tunnel needs this VPN, or the SSH host it runs
+                // over does — taking it down cuts the tunnel just the same.
+                let via = ssh_entry_of(self.ssh_hosts, t);
+                (matches(&t.requires_vpn) || via.is_some_and(|h| matches(&h.requires_vpn)))
+                    && tunnel_up(&t.name)
+            })
             .map(|t| t.name.clone())
             .collect();
         let rdp = self
@@ -1060,9 +1149,14 @@ impl Catalog<'_> {
         (tunnels, rdp)
     }
 
-    /// What the named connection needs before it can start.
-    fn requires_of(&self, step: &Step) -> Requires {
-        match step {
+    /// What the named connection needs before it can start — its own
+    /// requirements, and then those of the SSH host a tunnel rides through.
+    ///
+    /// Two sets rather than one merged one, because a tunnel and its host can
+    /// each name a tunnel of their own and both have to be up: the host is
+    /// only reachable the way the host says it is.
+    fn requires_of(&self, step: &Step) -> Vec<Requires> {
+        let own = match step {
             Step::Vpn(_) => Requires::default(),
             Step::Tunnel(n) => self
                 .tunnels
@@ -1082,7 +1176,19 @@ impl Catalog<'_> {
                 .find(|c| &c.name == name)
                 .map(RdpConnection::requires)
                 .unwrap_or_default(),
+        };
+        let mut out = vec![own];
+        if let Step::Tunnel(n) = step {
+            if let Some(host) = self
+                .tunnels
+                .iter()
+                .find(|t| &t.name == n)
+                .and_then(|t| ssh_entry_of(self.ssh_hosts, t))
+            {
+                out.push(host.requires());
+            }
         }
+        out
     }
 
     /// Fold a new VPN requirement into the ones the plan already has.
@@ -1142,14 +1248,18 @@ impl Catalog<'_> {
             chain.push(name.to_string());
             return Err(format!("dependency cycle: {}", chain.join(" → ")));
         }
-        let Some(t) = self.tunnels.iter().find(|t| t.name == name) else {
+        if !self.tunnels.iter().any(|t| t.name == name) {
             return Err(format!("tunnel '{name}' no longer exists"));
-        };
-        let requires = t.requires();
-        Self::merge_vpn(vpn, &requires.vpn)?;
+        }
+        let requires = self.requires_of(&Step::Tunnel(name.to_string()));
+        for r in &requires {
+            Self::merge_vpn(vpn, &r.vpn)?;
+        }
         chain.push(name.to_string());
-        if !requires.tunnel.is_empty() {
-            self.collect_tunnel(&requires.tunnel, steps, vpn, chain)?;
+        for r in &requires {
+            if !r.tunnel.is_empty() {
+                self.collect_tunnel(&r.tunnel, steps, vpn, chain)?;
+            }
         }
         chain.pop();
         steps.push(Step::Tunnel(name.to_string()));
@@ -1162,16 +1272,17 @@ impl Catalog<'_> {
         let mut steps: Vec<Step> = Vec::new();
         let mut vpn: Vec<String> = Vec::new();
         for target in targets {
-            let requires = self.requires_of(&target);
-            Self::merge_vpn(&mut vpn, &requires.vpn)?;
-            if !requires.tunnel.is_empty() {
-                let mut chain = match &target {
-                    // A tunnel is part of its own chain, so a loop back to it
-                    // is caught as a cycle.
-                    Step::Tunnel(n) => vec![n.clone()],
-                    _ => Vec::new(),
-                };
-                self.collect_tunnel(&requires.tunnel, &mut steps, &mut vpn, &mut chain)?;
+            for requires in self.requires_of(&target) {
+                Self::merge_vpn(&mut vpn, &requires.vpn)?;
+                if !requires.tunnel.is_empty() {
+                    let mut chain = match &target {
+                        // A tunnel is part of its own chain, so a loop back to
+                        // it is caught as a cycle.
+                        Step::Tunnel(n) => vec![n.clone()],
+                        _ => Vec::new(),
+                    };
+                    self.collect_tunnel(&requires.tunnel, &mut steps, &mut vpn, &mut chain)?;
+                }
             }
             if !steps.contains(&target) {
                 steps.push(target);
@@ -1950,6 +2061,9 @@ pub struct App {
     pub journal: Journal,
     /// The file picker, open over whichever form asked for it.
     pub browser: Option<FileBrowser>,
+    /// The list picker, open over whichever form field asked for it. The same
+    /// `Ctrl+O` as the file browser, and never both at once.
+    pub chooser: Option<(ChooserTarget, Chooser)>,
     /// Plan currently being executed, if any.
     pub activation: Option<Activation>,
     /// Tunnel-binding conflict awaiting the user's decision.
@@ -2042,6 +2156,7 @@ impl App {
             log_pane: None,
             journal: Journal::default(),
             browser: None,
+            chooser: None,
             activation: None,
             conflict: None,
             port_prompt: None,
@@ -2439,9 +2554,13 @@ impl App {
             }
             return;
         }
-        // The file picker sits on top of the form that opened it.
+        // The pickers sit on top of the form that opened them.
         if self.browser.is_some() {
             self.on_browser_key(key);
+            return;
+        }
+        if self.chooser.is_some() {
+            self.on_chooser_key(key);
             return;
         }
         // The log pane is one popup for the whole program, so it is handled
@@ -3980,7 +4099,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.open_path_browser()
+                    self.open_field_picker()
                 }
                 KeyCode::Char(c) => self.on_vpn_form_char(c),
                 _ => {}
@@ -4376,6 +4495,9 @@ impl App {
                         text.pop();
                     }
                 }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_field_picker()
+                }
                 KeyCode::Char(c) => match self.rdp_form.active_text_mut() {
                     Some(text) => text.push(c),
                     None => self.cycle_rdp_picker(true),
@@ -4718,7 +4840,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.open_path_browser()
+                    self.open_field_picker()
                 }
                 KeyCode::Char(c) => match self.ssh_form.active_text_mut() {
                     Some(text) => text.push(c),
@@ -4793,6 +4915,26 @@ impl App {
             self.ssh_form.error = Some(format!("a host named '{}' already exists", host.name));
             return;
         }
+        // A host that needs a tunnel which rides this very host can never come
+        // up. Caught here rather than at activation, because by then the
+        // config is already saved.
+        let mut candidate = self.ssh_hosts.clone();
+        match editing {
+            Some(i) => candidate[i] = host.clone(),
+            None => candidate.push(host.clone()),
+        }
+        let riding: Vec<String> = self
+            .tunnels
+            .iter()
+            .filter(|t| t.ssh_entry() == Some(host.name.as_str()))
+            .map(|t| t.name.clone())
+            .collect();
+        for name in riding {
+            if let Some(cycle) = tunnel_cycle(&self.tunnels, &candidate, &name) {
+                self.ssh_form.error = Some(format!("that makes a dependency cycle: {cycle}"));
+                return;
+            }
+        }
         // Storing a password writes it to disk in the clear; make the user say so.
         if !host.password.is_empty() && !self.ssh_form.password_ack {
             self.ssh_return_mode = self.ssh_mode.clone();
@@ -4801,7 +4943,12 @@ impl App {
         }
         let idx = match editing {
             Some(i) => {
+                let old_name = self.ssh_hosts[i].name.clone();
+                let new_name = host.name.clone();
                 self.ssh_hosts[i] = host;
+                if old_name != new_name {
+                    self.rename_ssh_dependency(&old_name, &new_name);
+                }
                 i
             }
             None => {
@@ -4824,11 +4971,22 @@ impl App {
             return;
         }
         let name = self.ssh_hosts[idx].name.clone();
+        let orphaned = self.ssh_riders_of(&name);
         self.ssh_last.remove(&name);
         self.ssh_hosts.remove(idx);
         self.rebuild_ssh_rows();
         self.save_ssh_hosts();
-        self.flash(format!("deleted '{name}'"), false);
+        if orphaned.is_empty() {
+            self.flash(format!("deleted '{name}'"), false);
+        } else {
+            self.flash(
+                format!(
+                    "deleted '{name}' — {} now run(s) through a missing ssh host",
+                    orphaned.join(", ")
+                ),
+                true,
+            );
+        }
     }
 
     /// Drop a stored cleartext password without opening the form.
@@ -4971,14 +5129,153 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // File picker
+    // Pickers
     // -----------------------------------------------------------------------
 
-    /// Ctrl+O over a path field opens the picker on the value it already holds.
-    fn open_path_browser(&mut self) {
-        match self.active_path_value() {
-            Some(current) => self.browser = Some(FileBrowser::open(&current)),
-            None => self.flash("Ctrl+O picks a file — only on the path fields", false),
+    /// `Ctrl+O` opens a picker for the field under the cursor: the file
+    /// browser where the field holds a path, the list picker where it holds
+    /// one of a list — and a line saying so where it holds neither, so the key
+    /// means the same thing everywhere rather than being dead on most fields.
+    fn open_field_picker(&mut self) {
+        if let Some(current) = self.active_path_value() {
+            self.browser = Some(FileBrowser::open(&current));
+            return;
+        }
+        let Some((target, title)) = self.active_chooser_field() else {
+            self.flash(
+                "Ctrl+O opens a picker — this field has no list behind it",
+                false,
+            );
+            return;
+        };
+        let choices = self.choices_for(target);
+        if choices.is_empty() {
+            self.flash(
+                format!("nothing to pick: no {} is configured yet", target.subject()),
+                false,
+            );
+            return;
+        }
+        let current = self.chooser_value(target);
+        self.chooser = Some((target, Chooser::open(title, choices, &current)));
+    }
+
+    /// Which list the field under the cursor picks from, and what the popup
+    /// calls it.
+    fn active_chooser_field(&self) -> Option<(ChooserTarget, &'static str)> {
+        if matches!(self.form_mode, FormMode::Add | FormMode::Edit(_)) {
+            return match self.form.field() {
+                FormField::SshHost => Some((ChooserTarget::TunnelSshHost, "ssh host")),
+                FormField::RequiresVpn => Some((ChooserTarget::TunnelVpn, "requires VPN")),
+                FormField::DependsOn => Some((ChooserTarget::TunnelDep, "requires tunnel")),
+                _ => None,
+            };
+        }
+        if matches!(self.ssh_mode, SshMode::Add | SshMode::Edit(_)) {
+            return match self.ssh_form.field() {
+                SshField::RequiresVpn => Some((ChooserTarget::SshVpn, "requires VPN")),
+                SshField::DependsOn => Some((ChooserTarget::SshDep, "requires tunnel")),
+                _ => None,
+            };
+        }
+        if matches!(self.rdp_mode, RdpMode::Add | RdpMode::Edit(_)) {
+            return match self.rdp_form.field() {
+                RdpField::RequiresVpn => Some((ChooserTarget::RdpVpn, "requires VPN")),
+                RdpField::DependsOn => Some((ChooserTarget::RdpDep, "requires tunnel")),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn choices_for(&self, target: ChooserTarget) -> Vec<Choice> {
+        match target {
+            ChooserTarget::TunnelSshHost => self.ssh_host_choices(),
+            ChooserTarget::TunnelVpn => self.form.vpn.choices(),
+            ChooserTarget::TunnelDep => self.form.dep.choices(),
+            ChooserTarget::SshVpn => self.ssh_form.vpn.choices(),
+            ChooserTarget::SshDep => self.ssh_form.dep.choices(),
+            ChooserTarget::RdpVpn => self.rdp_form.vpn.choices(),
+            ChooserTarget::RdpDep => self.rdp_form.dep.choices(),
+        }
+    }
+
+    fn chooser_value(&self, target: ChooserTarget) -> String {
+        match target {
+            ChooserTarget::TunnelSshHost => self.form.ssh_host.clone(),
+            ChooserTarget::TunnelVpn => self.form.vpn.value(),
+            ChooserTarget::TunnelDep => self.form.dep.value(),
+            ChooserTarget::SshVpn => self.ssh_form.vpn.value(),
+            ChooserTarget::SshDep => self.ssh_form.dep.value(),
+            ChooserTarget::RdpVpn => self.rdp_form.vpn.value(),
+            ChooserTarget::RdpDep => self.rdp_form.dep.value(),
+        }
+    }
+
+    /// The SSH tab's hosts, as a tunnel's "SSH host" field stores them. The
+    /// field still takes anything ssh resolves itself, so this only ever
+    /// writes into it — nothing here rejects what was typed.
+    fn ssh_host_choices(&self) -> Vec<Choice> {
+        self.ssh_hosts
+            .iter()
+            .map(|h| Choice::in_folder(ssh_entry_ref(&h.name), &h.name, &h.group))
+            .collect()
+    }
+
+    fn on_chooser_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.chooser = None;
+            return;
+        }
+        let picked = {
+            let Some((_, c)) = self.chooser.as_mut() else {
+                return;
+            };
+            match key.code {
+                KeyCode::Down | KeyCode::Tab => {
+                    c.down();
+                    None
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    c.up();
+                    None
+                }
+                // Left and right walk the tree; there is no cursor to move.
+                KeyCode::Right => {
+                    c.descend();
+                    None
+                }
+                KeyCode::Left => {
+                    c.ascend();
+                    None
+                }
+                KeyCode::Backspace => {
+                    c.backspace();
+                    None
+                }
+                KeyCode::Enter => c.accept(),
+                // Ctrl+O opened this; don't type an o with it.
+                KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => None,
+                KeyCode::Char(ch) => {
+                    c.push(ch);
+                    None
+                }
+                _ => None,
+            }
+        };
+        let Some(value) = picked else {
+            return;
+        };
+        if let Some((target, _)) = self.chooser.take() {
+            match target {
+                ChooserTarget::TunnelSshHost => self.form.ssh_host = value,
+                ChooserTarget::TunnelVpn => self.form.vpn.set(&value),
+                ChooserTarget::TunnelDep => self.form.dep.set(&value),
+                ChooserTarget::SshVpn => self.ssh_form.vpn.set(&value),
+                ChooserTarget::SshDep => self.ssh_form.dep.set(&value),
+                ChooserTarget::RdpVpn => self.rdp_form.vpn.set(&value),
+                ChooserTarget::RdpDep => self.rdp_form.dep.set(&value),
+            }
         }
     }
 
@@ -5655,7 +5952,7 @@ impl App {
         let mut names: Vec<String> = self
             .tunnels
             .iter()
-            .filter(|t| matches(&t.requires_vpn))
+            .filter(|t| self.tunnel_requirements(t).iter().any(|r| matches(&r.vpn)))
             .map(|t| format!("tun {}", t.name))
             .collect();
         names.extend(
@@ -5683,7 +5980,7 @@ impl App {
         let mut names: Vec<String> = self
             .tunnels
             .iter()
-            .filter(|t| wants(&t.requires_vpn))
+            .filter(|t| self.tunnel_requirements(t).iter().any(|r| wants(&r.vpn)))
             .map(|t| format!("tun {}", t.name))
             .collect();
         names.extend(
@@ -5706,6 +6003,34 @@ impl App {
         !dep.is_empty() && !self.tunnels.iter().any(|t| t.name == dep)
     }
 
+    /// The SSH host a tunnel rides, when it names one that is configured.
+    pub fn ssh_entry_for(&self, t: &Tunnel) -> Option<&SshHost> {
+        ssh_entry_of(&self.ssh_hosts, t)
+    }
+
+    /// Everything a tunnel needs before it can start: its own requirements,
+    /// and those of the SSH host it rides — the host has to be reachable
+    /// before a tunnel over it can be. The same two sets
+    /// [`Catalog::requires_of`] builds a plan from, for the rows that have to
+    /// show whether they hold.
+    pub fn tunnel_requirements(&self, t: &Tunnel) -> Vec<Requires> {
+        let mut out = vec![t.requires()];
+        if let Some(host) = self.ssh_entry_for(t) {
+            out.push(host.requires());
+        }
+        out
+    }
+
+    /// Whether a requirement's tunnel is up. An empty one is nothing to wait for.
+    pub fn tunnel_requirement_met(&self, dep: &str) -> bool {
+        dep.is_empty() || matches!(self.active.get(dep).map(|a| a.status), Some(Status::Up))
+    }
+
+    /// Whether a tunnel names an SSH host that has since been deleted.
+    pub fn ssh_entry_missing(&self, t: &Tunnel) -> bool {
+        t.ssh_entry().is_some() && self.ssh_entry_for(t).is_none()
+    }
+
     // -----------------------------------------------------------------------
     // Tunnel form / lifecycle (unchanged)
     // -----------------------------------------------------------------------
@@ -5722,6 +6047,9 @@ impl App {
                 if let Some(text) = self.form.active_text_mut() {
                     text.pop();
                 }
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_field_picker()
             }
             KeyCode::Char(c) => match self.form.active_text_mut() {
                 Some(text) => text.push(c),
@@ -5786,7 +6114,7 @@ impl App {
             Some(i) => candidate[i] = tunnel.clone(),
             None => candidate.push(tunnel.clone()),
         }
-        if let Some(cycle) = tunnel_cycle(&candidate, &tunnel.name) {
+        if let Some(cycle) = tunnel_cycle(&candidate, &self.ssh_hosts, &tunnel.name) {
             self.form.error = Some(format!("that makes a dependency cycle: {cycle}"));
             return;
         }
@@ -5843,6 +6171,31 @@ impl App {
                 self.flash(format!("save failed: {e}"), true);
             }
         }
+    }
+
+    /// Keep the tunnels that ride a renamed SSH host pointing at it.
+    fn rename_ssh_dependency(&mut self, old: &str, new: &str) {
+        let reference = ssh_entry_ref(new);
+        let mut touched = false;
+        for t in self.tunnels.iter_mut() {
+            if t.ssh_entry() == Some(old) {
+                t.ssh_host = reference.clone();
+                touched = true;
+            }
+        }
+        if touched {
+            self.save_tunnels();
+        }
+    }
+
+    /// The tunnels that run through an SSH host, for its details panel and for
+    /// the warning when it is deleted.
+    pub fn ssh_riders_of(&self, name: &str) -> Vec<String> {
+        self.tunnels
+            .iter()
+            .filter(|t| t.ssh_entry() == Some(name))
+            .map(|t| format!("tun {}", t.name))
+            .collect()
     }
 
     fn delete_tunnel(&mut self, idx: usize) {
@@ -5906,7 +6259,17 @@ impl App {
     fn start_tunnel(&mut self, idx: usize) {
         let t = self.tunnels[idx].clone();
         let target = LogTarget::Tunnel(t.name.clone());
-        match tunnel::spawn(&t) {
+        // A tunnel that names an SSH host it cannot find would otherwise be
+        // started against whatever ssh_config makes of the bare name.
+        if let Some(name) = t.ssh_entry() {
+            if self.ssh_entry_for(&t).is_none() {
+                let msg = format!("'{}': ssh host '{name}' is not configured", t.name);
+                self.report(target, msg, true);
+                return;
+            }
+        }
+        let via = self.ssh_entry_for(&t).cloned();
+        match tunnel::spawn(&t, via.as_ref(), &self.ssh_password_helper) {
             Ok(active) => {
                 let cmd = report::command_line(&active.argv);
                 self.reconnect.remove(&t.name);
@@ -6144,17 +6507,13 @@ impl App {
             if !t.auto_reconnect {
                 continue;
             }
-            // Retrying is pointless while what it runs through is down.
-            let requires = t.requires();
-            if !self.vpn_satisfied(&requires.vpn) {
-                continue;
-            }
-            if !requires.tunnel.is_empty()
-                && !matches!(
-                    self.active.get(&requires.tunnel).map(|a| a.status),
-                    Some(Status::Up)
-                )
-            {
+            // Retrying is pointless while what it runs through is down —
+            // including whatever the SSH host it rides needs for itself.
+            let blocked = self
+                .tunnel_requirements(&t)
+                .iter()
+                .any(|r| !self.vpn_satisfied(&r.vpn) || !self.tunnel_requirement_met(&r.tunnel));
+            if blocked {
                 continue;
             }
             let entry = self.reconnect.entry(name.clone()).or_insert(ReconnectState {
@@ -6166,7 +6525,8 @@ impl App {
             }
             let attempts = entry.attempts + 1;
             let backoff = Duration::from_secs((3 * attempts.min(10)) as u64);
-            match tunnel::spawn(&t) {
+            let via = self.ssh_entry_for(&t).cloned();
+            match tunnel::spawn(&t, via.as_ref(), &self.ssh_password_helper) {
                 Ok(mut fresh) => {
                     let prev = self.active.remove(&name);
                     if let Some(mut prev) = prev {
@@ -6277,7 +6637,7 @@ mod tests {
     fn a_tunnel_is_not_offered_as_its_own_dependency() {
         let ts = vec![tunnel("a", "", ""), tunnel("b", "", "")];
         let p = Picker::tunnels(&ts, "", Some("a"));
-        assert_eq!(p.options, vec!["".to_string(), "b".to_string()]);
+        assert_eq!(p.values(), vec!["", "b"]);
     }
 
     #[test]
@@ -6351,7 +6711,7 @@ mod tests {
         let p = Picker::vpn(&view, VPN_ANY);
         assert_eq!(p.label(), "any VPN");
         assert_eq!(
-            p.options,
+            p.values(),
             vec![
                 "",
                 "*",
@@ -6377,13 +6737,13 @@ mod tests {
         let mut view = view_with(&[(ProviderId::Wireguard, &["home"])]);
         view.providers[ProviderId::Wireguard.index()].installed = false;
         let p = Picker::vpn(&view, "");
-        assert!(p.options.contains(&"wireguard:home".to_string()));
+        assert!(p.values().contains(&"wireguard:home"));
     }
 
     #[test]
     fn a_client_with_neither_an_install_nor_profiles_is_left_out() {
         let view = view_with(&[]);
-        assert_eq!(Picker::vpn(&view, "").options, vec!["", "*"]);
+        assert_eq!(Picker::vpn(&view, "").values(), vec!["", "*"]);
     }
 
     #[test]
@@ -6775,10 +7135,106 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_riding_an_ssh_host_takes_on_what_that_host_needs() {
+        let mut t = tunnel("app", "", "");
+        t.ssh_host = ssh_entry_ref("jump");
+        // The host itself is only reachable over a VPN and another tunnel.
+        let hosts = vec![ssh_host("jump", "wireguard:office", "base")];
+        let ts = vec![t, tunnel("base", "", "")];
+        let plan = catalog(&ts, &hosts)
+            .build_plan(vec![Step::Tunnel("app".into())])
+            .unwrap();
+        assert_eq!(
+            names(&plan),
+            vec!["vpn wireguard: office", "tun base", "tun app"]
+        );
+        // No ssh session is opened: the host is how the tunnel connects, not
+        // something that has to be up first.
+        assert!(!plan.iter().any(|s| matches!(s, Step::Ssh(_))));
+    }
+
+    #[test]
+    fn a_tunnel_and_the_host_it_rides_can_need_different_vpns() {
+        let mut t = tunnel("app", "netbird:work", "");
+        t.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "wireguard:office", "")];
+        let ts = vec![t];
+        let plan = catalog(&ts, &hosts)
+            .build_plan(vec![Step::Tunnel("app".into())])
+            .unwrap();
+        assert_eq!(
+            names(&plan),
+            vec!["vpn netbird: work", "vpn wireguard: office", "tun app"]
+        );
+    }
+
+    #[test]
+    fn two_profiles_of_one_client_still_clash_when_one_comes_from_the_host() {
+        let mut t = tunnel("app", "wireguard:home", "");
+        t.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "wireguard:office", "")];
+        let ts = vec![t];
+        let err = catalog(&ts, &hosts)
+            .build_plan(vec![Step::Tunnel("app".into())])
+            .unwrap_err();
+        assert!(err.contains("at the same time"), "{err}");
+    }
+
+    #[test]
+    fn a_tunnel_stacked_on_one_that_rides_a_host_gets_the_whole_chain() {
+        let mut base = tunnel("base", "", "");
+        base.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "netbird:work", "")];
+        let ts = vec![tunnel("app", "", "base"), base];
+        let plan = catalog(&ts, &hosts)
+            .build_plan(vec![Step::Tunnel("app".into())])
+            .unwrap();
+        assert_eq!(names(&plan), vec!["vpn netbird: work", "tun base", "tun app"]);
+    }
+
+    #[test]
+    fn a_tunnel_that_rides_a_host_needing_that_very_tunnel_is_a_cycle() {
+        let mut t = tunnel("app", "", "");
+        t.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "", "app")];
+        let ts = vec![t];
+        let err = catalog(&ts, &hosts)
+            .build_plan(vec![Step::Tunnel("app".into())])
+            .unwrap_err();
+        assert!(err.contains("dependency cycle"), "{err}");
+    }
+
+    #[test]
+    fn taking_a_vpn_down_counts_a_tunnel_that_only_needs_it_through_its_host() {
+        let mut t = tunnel("app", "", "");
+        t.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "netbird:work", "")];
+        let ts = vec![t];
+        let (tunnels, _) = catalog(&ts, &hosts).riders_of("netbird:work", &|_| true, &|_| false);
+        assert_eq!(tunnels, vec!["app".to_string()]);
+    }
+
+    #[test]
     fn saving_a_tunnel_that_closes_a_loop_is_caught() {
         let ts = vec![tunnel("a", "", "b"), tunnel("b", "", "a")];
-        assert!(tunnel_cycle(&ts, "a").is_some());
+        assert!(tunnel_cycle(&ts, &[], "a").is_some());
         let fine = vec![tunnel("a", "", ""), tunnel("b", "", "a")];
-        assert!(tunnel_cycle(&fine, "b").is_none());
+        assert!(tunnel_cycle(&fine, &[], "b").is_none());
+    }
+
+    #[test]
+    fn a_loop_that_runs_through_an_ssh_host_is_caught_too() {
+        // The tunnel rides a host that cannot be reached without the tunnel.
+        let mut a = tunnel("a", "", "");
+        a.ssh_host = ssh_entry_ref("jump");
+        let hosts = vec![ssh_host("jump", "", "a")];
+        assert_eq!(
+            tunnel_cycle(&[a.clone()], &hosts, "a").as_deref(),
+            Some("a → a")
+        );
+        // And is not reported when the host needs a different tunnel.
+        let hosts = vec![ssh_host("jump", "", "b")];
+        let ts = vec![a, tunnel("b", "", "")];
+        assert!(tunnel_cycle(&ts, &hosts, "a").is_none());
     }
 }

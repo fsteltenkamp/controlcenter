@@ -33,6 +33,18 @@ impl SessionOutcome {
 
 /// The ssh arguments for an interactive login, in the order they are passed.
 pub fn build_args(host: &SshHost) -> Vec<String> {
+    let mut args = connection_args(host);
+    args.push(host.destination());
+    args
+}
+
+/// Everything a host says about *how* to reach it — port, key, host-key
+/// handling, its own extra args — without the destination itself.
+///
+/// Split out because a tunnel riding this host puts its own forward and extra
+/// args between the two, and there must be one function that decides what a
+/// configured host turns into on a command line.
+pub fn connection_args(host: &SshHost) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if host.port != 22 {
         args.push("-p".into());
@@ -61,7 +73,6 @@ pub fn build_args(host: &SshHost) -> Vec<String> {
         args.push("NumberOfPasswordPrompts=1".into());
     }
     args.extend(host.extra_args.split_whitespace().map(String::from));
-    args.push(host.destination());
     args
 }
 
@@ -181,7 +192,7 @@ pub const ASKPASS_ENV: &str = "CONTROLCENTER_ASKPASS";
 
 /// Put the password where the chosen helper will find it, and — for askpass —
 /// point ssh at the helper. Never an argument, on either path.
-fn carry_password(cmd: &mut Command, password: &str, helper: &PasswordHelper) {
+pub fn carry_password(cmd: &mut Command, password: &str, helper: &PasswordHelper) {
     if password.is_empty() {
         return;
     }

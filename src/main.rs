@@ -1,5 +1,6 @@
 mod app;
 mod browser;
+mod chooser;
 mod config;
 mod logs;
 mod platform;

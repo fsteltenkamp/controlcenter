@@ -23,7 +23,9 @@ cargo build --release
 | 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
 
 Entries on any of these tabs can share a **group** name to stack under one header and be
-acted on together, and can **require** a VPN profile or a tunnel — see
+acted on together, and can **require** a VPN profile or a tunnel. A tunnel can also run
+**through** a host configured on the SSH tab, taking its port, user, key and password from
+it — which is what lets `~/.ssh/config` stay out of it. See
 [docs/connections.md](docs/connections.md).
 
 ## Keys
@@ -58,7 +60,7 @@ Moving about:
 | `←` `→` | switch pane (VPN) · change the field under the cursor (forms) |
 | `Esc` | cancel a form, close a popup |
 | `y` | confirm in a prompt |
-| `Ctrl+O` | open the file picker on a path field |
+| `Ctrl+O` | open a picker for the field under the cursor — files on a path field, the whole list on a VPN, tunnel or ssh-host field |
 
 There is no vim navigation: `h` `j` `k` `l` are action keys here, so the arrows do the
 moving.
@@ -145,7 +147,8 @@ Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 
 Tunnels run ssh with `BatchMode=yes` (no interactive prompts), so use key- or agent-based
 authentication for the hosts you tunnel through; SSH-tab sessions are interactive and may
-prompt normally.
+prompt normally. A tunnel that runs through an SSH-tab host with a stored password is the
+exception — it drops batch mode and answers that one prompt, the same way a session does.
 
 Optional, each detected on startup and only greying out its own feature when missing:
 

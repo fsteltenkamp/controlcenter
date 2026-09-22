@@ -83,7 +83,7 @@ that is left knows how to reach them; `keep` is how orphans are made on purpose.
 [[tunnels]]
 name = "prod-db"
 group = "prod"                     # optional, empty = ungrouped
-ssh_host = "bastion.example.com"   # anything ssh accepts: alias, user@host
+ssh_host = "bastion.example.com"   # a destination ssh resolves, or "ssh:<name>"
 forward = "local"                  # local | remote | dynamic
 local_port = 5432                  # listen port (-L/-D) or local dest port (-R)
 remote_host = "db.internal"        # destination host (-L) / local dest host (-R)
@@ -103,7 +103,21 @@ local_port = 8080
 remote_host = "app.internal"
 remote_port = 80
 depends_on = "prod-db"
+
+# Or point the whole thing at a host on the SSH tab, which is where its port,
+# user, key, password and extra args then come from — see connections.md.
+[[tunnels]]
+name = "prod-cache"
+ssh_host = "ssh:prod-bastion"      # the `name` of an entry in ssh.toml
+forward = "local"
+local_port = 6379
+remote_host = "cache.internal"
+remote_port = 6379
 ```
+
+`ssh_host` is either a destination ssh works out for itself — an `ssh_config` alias,
+`user@host`, an `ssh://` URI — or `ssh:<name>`, naming an entry in `ssh.toml`. Only the
+`ssh:` prefix makes it a reference; `ssh://` is a destination like any other.
 
 ## ssh.toml
 
@@ -126,6 +140,11 @@ depends_on = "prod-db"             # optional, tunnel to bring up first
 
 `skip_host_key_check` is there for tunnelled localhost targets, where the key changes with
 whatever is on the far end of the tunnel.
+
+An entry here is not only an interactive login: a tunnel can name it as its `ssh_host`,
+and then runs with everything set here — see
+[connections.md](connections.md#tunnels-through-a-configured-host). Renaming the entry
+follows through to the tunnels that ride it.
 
 ## rdp.toml
 
