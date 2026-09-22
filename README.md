@@ -81,7 +81,11 @@ list keeps the shape it is drawn in; `Ctrl+↑` `Ctrl+↓` on a group's first or
 says so rather than moving it into the neighbouring group.
 
 NetBird profiles and Pangolin accounts belong to those clients, so `a` `e` `d` `Ctrl+↑`
-`Ctrl+↓` say so instead of editing them.
+`Ctrl+↓` say so instead of editing them. A NetBird **user-device** profile is logged in
+through a browser rather than with a setup key: connecting one shows the URL and code
+netbird is waiting for — `o` opens the browser, `c` gives up, `Esc` hides the popup while
+the login carries on — and says so plainly when the login is what is missing. The SSO
+session expires, so it asks again; see [docs/vpn.md](docs/vpn.md).
 Reconnecting an RDP session asks for the password again, because nothing keeps a copy.
 
 ### Connections that are not ours

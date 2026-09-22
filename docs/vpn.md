@@ -43,6 +43,50 @@ Profiles are netbird's own, so they are listed and switched but never edited her
 `e` and `d` say so instead. Only one profile is active at a time, so switching prompts as
 a conflict when something is riding on the profile going down.
 
+### User devices, and the browser login
+
+A NetBird peer is registered either with a **setup key**, which it keeps and can use
+unattended, or as a **user device** bound to an account. A user device is logged in through
+a browser, and that SSO session expires — daily, on the cloud default — so the login comes
+round again however long the profile has worked for.
+
+`netbird up` performs that login itself, by opening a browser and printing a URL and a code
+before it waits. controlcenter reads that output as it arrives rather than after the fact,
+so connecting a user-device profile puts what netbird is waiting for in front of you:
+
+```
+┌ netbird: browser login ─────────────────────────────────────┐
+│ profile   'tn'                                              │
+│ waiting   12s so far                                        │
+│                                                             │
+│ open      https://login.example.com/device?user_code=WDXQ…  │
+│ code      WDXQ-KRFL                                         │
+│                                                             │
+│ o open it in a browser · c give up on it · q/Esc hide this   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+- `o` opens the URL in a browser, for when netbird's own attempt did not — a code line
+  appears only when the URL does not already carry it, which is the only case where
+  anything has to be typed
+- `c` gives up: the waiting `netbird up` is stopped, so a login answered ten minutes later
+  cannot bring the profile up behind you, and the client is free for the next thing
+- `q` and `Esc` only hide the popup. The login carries on, the status panel keeps the URL,
+  and `Enter` on the profile brings it back
+
+A plan that needs the profile waits for the login rather than timing out underneath it,
+and the whole exchange is in the profile's log — see [logs](logs.md).
+
+When a login does not happen, the daemon says so: the status panel reads *no SSO session*
+and a popup explains that the profile is a user device, quotes what netbird said and offers
+another go, or `netbird login --profile <name>` outside controlcenter. That is also what a
+profile that has never been logged in looks like, which is the usual way a fresh
+user-device profile fails: `netbird up` reports every refusal as `daemon up failed`, and
+without this it would look like nothing happened at all.
+
+Taking the client down, the panic button and quitting all call a waiting login off first,
+for the same reason `c` does.
+
 ## WireGuard
 
 Polled with `ip`, not `wg show`, because `ip` needs no privileges: an interface named

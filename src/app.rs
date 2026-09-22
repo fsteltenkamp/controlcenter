@@ -14,12 +14,15 @@ use crate::types::{
 use crate::ui;
 use crate::vpn::openvpn::{self, ActiveOvpn, OvpnStatus};
 use crate::vpn::scan::{self, Foreign, LinkKind, Scan};
-use crate::vpn::{self, privileged, wireguard, ProviderId, VpnEnv, VpnMsg, VpnProfile, VpnStatus};
+use crate::vpn::{
+    self, privileged, wireguard, ProviderId, Verification, VpnEnv, VpnMsg, VpnProfile, VpnStatus,
+};
 use crate::Tui;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const THROUGHPUT_HISTORY: usize = 120;
@@ -35,6 +38,12 @@ const TICKET_REFRESH: Duration = Duration::from_secs(120);
 const DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bringing a VPN up may sit through a browser login, so it gets much longer.
 const VPN_TIMEOUT: Duration = Duration::from_secs(120);
+/// And while a browser login is actually waiting, the clock is on the person at
+/// the keyboard rather than on the client: picking an account and getting past
+/// whatever the provider asks for takes as long as it takes, and a plan that
+/// gave up underneath it would report a timeout for a login that then succeeds.
+/// This is only the point at which the device code itself has certainly expired.
+const VPN_LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -1244,6 +1253,36 @@ impl ConflictPrompt {
 // VPN state
 // ---------------------------------------------------------------------------
 
+/// A browser login a client is waiting on, as it reported it.
+#[derive(Debug, Clone)]
+pub struct SsoLogin {
+    pub profile: String,
+    pub url: String,
+    /// Only where the URL does not already carry it — see [`Verification`].
+    pub code: Option<String>,
+    /// The client process waiting on the browser, where it named one; what
+    /// [`App::cancel_login`] stops.
+    pub pid: Option<u32>,
+    pub since: Instant,
+}
+
+/// The popup a login raises, in either of the two shapes it comes in: the login
+/// that is waiting on a browser right now, and the one that has already failed
+/// and has to be dealt with before the profile can come up.
+///
+/// It is held by the app rather than by the VPN tab because a plan started from
+/// any tab can need a login: a tunnel that requires a user-device profile hits
+/// exactly the same wall.
+pub struct SsoPrompt {
+    pub provider: ProviderId,
+    pub profile: String,
+    /// `None` when the attempt never got as far as a URL, i.e. when all that is
+    /// known is that this profile has no session.
+    pub login: Option<SsoLogin>,
+    /// What the client said when it gave up, for the failed shape.
+    pub error: Option<String>,
+}
+
 /// One VPN client as the tab sees it.
 pub struct ProviderState {
     pub id: ProviderId,
@@ -1254,6 +1293,20 @@ pub struct ProviderState {
     /// Description of the action currently running in the background.
     pub busy: Option<String>,
     pub error: Option<String>,
+    /// What the client itself printed, for the clients driven by a command whose
+    /// output is worth reading as it arrives: netbird's `up` says what a login is
+    /// waiting on. One ring per client, merged into the pane by
+    /// [`App::rings_for`] like any child process's.
+    pub log: Arc<Ring>,
+    /// A browser login this client is sitting on, while it sits on it. Kept on
+    /// the client rather than in the popup, so dismissing the popup does not
+    /// lose what the client is still waiting for.
+    pub sso: Option<SsoLogin>,
+    /// Set when controlcenter called a login off itself, so that the failure
+    /// which follows — the client giving up, as asked — is not put back in front
+    /// of the user as something to do something about. It holds until the next
+    /// attempt on this client, because until then it is still the answer.
+    login_cancelled: bool,
     last_refresh: Instant,
 }
 
@@ -1267,6 +1320,9 @@ impl ProviderState {
             selected: 0,
             busy: None,
             error: None,
+            log: Arc::new(Ring::new(id.slug())),
+            sso: None,
+            login_cancelled: false,
             // Far enough in the past that the first tick refreshes.
             last_refresh: Instant::now() - Duration::from_secs(VPN_REFRESH_SECS * 2),
         }
@@ -1885,6 +1941,10 @@ pub struct App {
     pub activation: Option<Activation>,
     /// Tunnel-binding conflict awaiting the user's decision.
     pub conflict: Option<ConflictPrompt>,
+    /// A VPN login waiting on a browser, or one that has already failed, while
+    /// it is in front of the user. Dismissing it leaves the login itself alone;
+    /// what the client is still waiting on lives on the client.
+    pub sso_prompt: Option<SsoPrompt>,
     /// Name of the host cleared to run; the main loop owns the terminal and
     /// hands it to ssh.
     /// Sessions waiting for the main loop to open them. A queue, because a
@@ -1969,6 +2029,7 @@ impl App {
             browser: None,
             activation: None,
             conflict: None,
+            sso_prompt: None,
             ssh_launch: VecDeque::new(),
             vpn_tx,
             vpn_rx,
@@ -2017,6 +2078,11 @@ impl App {
         }
         for (_, mut t) in self.active.drain() {
             t.stop();
+        }
+        // A login still waiting on a browser would come back to nothing: there
+        // would be no controlcenter left to hold what it brought up.
+        for id in ProviderId::ALL {
+            self.cancel_login(id, "controlcenter is exiting");
         }
         // RDP sessions are user-facing windows; leave them running on quit.
         Ok(())
@@ -2144,6 +2210,14 @@ impl App {
         for (name, a) in &self.ovpn_active {
             if target.covers(&LogTarget::Vpn(ProviderId::Openvpn, name.clone())) {
                 rings.push(&a.log);
+            }
+        }
+        // What a client printed itself, as opposed to what one of its sessions
+        // did: netbird's `up` carries the login exchange, and a pane on any of
+        // its profiles is where that belongs.
+        for st in &self.vpn.providers {
+            if target.covers(&LogTarget::vpn(st.id)) {
+                rings.push(&st.log);
             }
         }
         rings
@@ -2331,6 +2405,12 @@ impl App {
             }
             return;
         }
+        // A login prompt holds a connect the same way: the client is waiting on
+        // the browser, and nothing else on screen can answer for it.
+        if self.sso_prompt.is_some() {
+            self.on_sso_key(key);
+            return;
+        }
         // The file picker sits on top of the form that opened it.
         if self.browser.is_some() {
             self.on_browser_key(key);
@@ -2490,6 +2570,9 @@ impl App {
         }
         self.ssh_windows.clear();
         for id in ProviderId::ALL {
+            // Before the client is told to go down, so a login cannot land after
+            // it and put the tunnel back up.
+            self.cancel_login(id, "the panic button");
             self.vpn_disconnect_all(id);
         }
         self.report(
@@ -2750,10 +2833,11 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// What the provider modules need from the app to act.
-    fn vpn_env(&self) -> VpnEnv<'_> {
+    fn vpn_env(&self, id: ProviderId) -> VpnEnv<'_> {
         VpnEnv {
             cfg: &self.vpn_cfg,
             wireguard_dir: &self.paths.wireguard_dir,
+            log: &self.vpn.get(id).log,
         }
     }
 
@@ -3037,7 +3121,7 @@ impl App {
             return;
         }
         let tx = self.vpn_tx.clone();
-        vpn::refresh(id, tx, self.vpn_env());
+        vpn::refresh(id, tx, self.vpn_env(id));
     }
 
     /// Enter on a profile: bring it up, or take it down if it already is.
@@ -3078,15 +3162,23 @@ impl App {
 
     fn vpn_connect_selected(&mut self) {
         let id = self.vpn.current_id();
-        if !self.vpn.get(id).installed {
-            self.flash(format!("{} is not installed", id.slug()), true);
-            return;
-        }
         let profile = self
             .vpn
             .get(id)
             .selected_profile()
             .map(|p| p.name.clone());
+        self.vpn_connect(id, profile);
+    }
+
+    /// Bring one named profile up, from the tab or from a login prompt asking to
+    /// be tried again. Everything a connect has to settle first — the client
+    /// being there, what a profile switch would cut — is settled here, so a
+    /// retry goes through the same gates the first attempt did.
+    fn vpn_connect(&mut self, id: ProviderId, profile: Option<String>) {
+        if !self.vpn.get(id).installed {
+            self.flash(format!("{} is not installed", id.slug()), true);
+            return;
+        }
         // Switching an exclusive client's profile here cuts whatever rides on
         // the one going down, exactly as it does inside a dependency plan, so
         // it asks with the same prompt rather than pulling the rug silently.
@@ -3135,7 +3227,23 @@ impl App {
     /// Kick off a connect or disconnect and mark the provider busy. One action
     /// per provider at a time, so a slow login cannot be stacked on itself.
     fn vpn_start(&mut self, id: ProviderId, desc: String, profile: Option<&str>, up: bool) {
+        // Asking for the client to go down while a login is waiting answers the
+        // login: it is called off rather than left to bring the client up behind
+        // the stop. This runs before the busy check, because the login is what is
+        // keeping the client busy.
+        if !up {
+            self.cancel_login(id, "it was asked to disconnect");
+        } else {
+            self.vpn.get_mut(id).login_cancelled = false;
+        }
         if let Some(busy) = &self.vpn.get(id).busy {
+            // A client sitting on a browser login is not a client that is merely
+            // busy: it is waiting for the person who just pressed the key, so
+            // show them what it is waiting for rather than telling them to wait.
+            if up && self.vpn.get(id).sso.is_some() {
+                self.show_sso_prompt(id);
+                return;
+            }
             self.flash(format!("{} is busy ({busy})", id.slug()), true);
             return;
         }
@@ -3143,7 +3251,7 @@ impl App {
         let target = LogTarget::Vpn(id, profile.clone().unwrap_or_default());
         let tx = self.vpn_tx.clone();
         let result = {
-            let env = self.vpn_env();
+            let env = self.vpn_env(id);
             if up {
                 vpn::connect(id, tx, env, profile.as_deref())
             } else {
@@ -3164,6 +3272,176 @@ impl App {
                 self.vpn.get_mut(id).error = Some(e.clone());
                 self.report(target, format!("{}: {e}", id.slug()), true);
             }
+        }
+    }
+
+    // ----- browser logins ---------------------------------------------------
+
+    /// How a profile is named in a line about it. A connect with no profile is
+    /// the client being brought up on whatever it already had selected.
+    fn profile_label(id: ProviderId, profile: &str) -> String {
+        if profile.is_empty() {
+            id.slug().to_string()
+        } else {
+            format!("{} profile '{profile}'", id.slug())
+        }
+    }
+
+    /// A client has asked for a browser login, or has just failed for want of
+    /// one. Both arrive as [`VpnMsg::LoginNeeded`], because from here they are
+    /// the same fact — this profile has no session — at two different points.
+    fn on_login_needed(
+        &mut self,
+        provider: ProviderId,
+        profile: String,
+        waiting: Option<Verification>,
+        error: Option<String>,
+    ) {
+        let target = LogTarget::Vpn(provider, profile.clone());
+        let label = Self::profile_label(provider, &profile);
+        match waiting {
+            Some(v) => {
+                let note = match &v.code {
+                    Some(code) => format!("{label}: waiting for a browser login — {} (code {code})", v.url),
+                    None => format!("{label}: waiting for a browser login — {}", v.url),
+                };
+                self.note(target, note);
+                self.vpn.get_mut(provider).login_cancelled = false;
+                self.vpn.get_mut(provider).sso = Some(SsoLogin {
+                    profile: profile.clone(),
+                    url: v.url,
+                    code: v.code,
+                    pid: v.pid,
+                    since: Instant::now(),
+                });
+                self.show_sso_prompt(provider);
+            }
+            None if self.vpn.get(provider).login_cancelled => {
+                // Asked for and got: the login stopped because it was called off
+                // here, so there is nothing to put in front of anyone.
+                self.note(target, format!("{label} was left without a login"));
+            }
+            None => {
+                // The attempt is over and there is no URL left to open, so all
+                // there is to do is say what is missing and offer another go.
+                self.vpn.get_mut(provider).sso = None;
+                self.report(target, format!("{label} has no SSO session"), true);
+                self.sso_prompt = Some(SsoPrompt {
+                    provider,
+                    profile,
+                    login: None,
+                    error,
+                });
+            }
+        }
+    }
+
+    /// Put the login a client is waiting on back in front of the user, after the
+    /// popup was dismissed or a key asked for it again.
+    fn show_sso_prompt(&mut self, id: ProviderId) {
+        let Some(login) = self.vpn.get(id).sso.clone() else {
+            return;
+        };
+        self.sso_prompt = Some(SsoPrompt {
+            provider: id,
+            profile: login.profile.clone(),
+            login: Some(login),
+            error: None,
+        });
+    }
+
+    /// Drop the popup and whatever the client was waiting on, because the
+    /// attempt it belonged to has finished one way or the other.
+    fn clear_sso(&mut self, id: ProviderId) {
+        self.vpn.get_mut(id).sso = None;
+        if self.sso_prompt.as_ref().is_some_and(|p| p.provider == id) {
+            self.sso_prompt = None;
+        }
+    }
+
+    /// Give up on a login that is waiting on a browser, because something has
+    /// asked for this client to be down or to be left alone.
+    ///
+    /// The waiting process is stopped rather than only forgotten. It is the one
+    /// that would call the client up once the browser was finally answered, and a
+    /// VPN that comes up minutes after a panic button — with nothing here holding
+    /// it — is exactly the leak that button exists to prevent.
+    fn cancel_login(&mut self, id: ProviderId, why: &str) {
+        let Some(login) = self.vpn.get_mut(id).sso.take() else {
+            return;
+        };
+        self.vpn.get_mut(id).login_cancelled = true;
+        if self.sso_prompt.as_ref().is_some_and(|p| p.provider == id) {
+            self.sso_prompt = None;
+        }
+        let target = LogTarget::Vpn(id, login.profile.clone());
+        let Some(pid) = login.pid else {
+            self.note(target, format!("gave up on the browser login: {why}"));
+            return;
+        };
+        let argv = crate::platform::kill_argv(pid, false);
+        let ran = report::command_line(&argv);
+        let outcome = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output();
+        self.note(
+            target,
+            match outcome {
+                Ok(out) if out.status.success() => {
+                    format!("gave up on the browser login ({why}): {ran}")
+                }
+                Ok(out) => format!(
+                    "gave up on the browser login ({why}): {ran} — {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => format!("gave up on the browser login ({why}): {ran} — {e}"),
+            },
+        );
+    }
+
+    fn on_sso_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = &self.sso_prompt else {
+            return;
+        };
+        let (id, profile, waiting) = (
+            prompt.provider,
+            prompt.profile.clone(),
+            prompt.login.clone(),
+        );
+        match key.code {
+            KeyCode::Char('o') => match waiting {
+                Some(login) => {
+                    let target = LogTarget::Vpn(id, profile);
+                    match crate::platform::open_url(&login.url) {
+                        Ok(()) => self.note(target, format!("opened {} in a browser", login.url)),
+                        Err(e) => self.report(target, e, true),
+                    }
+                }
+                None => self.flash("there is no login URL to open — Enter asks for one", false),
+            },
+            // A login that is still waiting cannot be retried: netbird is sitting
+            // on this one, and a second `up` would only be refused.
+            KeyCode::Enter if waiting.is_some() => {
+                self.flash("the login is still waiting on the browser — o opens it again", false)
+            }
+            KeyCode::Enter => {
+                self.sso_prompt = None;
+                self.vpn_connect(id, (!profile.is_empty()).then_some(profile));
+            }
+            // `c` clears what is finished everywhere else; here what it clears is
+            // a login nobody is going to answer, which is also what frees the
+            // client up for the next thing asked of it.
+            KeyCode::Char('c') if waiting.is_some() => {
+                self.cancel_login(id, "asked to give up on it");
+                self.flash("gave up on the login", false);
+            }
+            KeyCode::Char('c') => {
+                self.flash("nothing is waiting — Enter asks for the login again", false)
+            }
+            // Closing the popup says nothing about the login: the client is what
+            // is waiting, and its URL stays in the log pane and in the status.
+            KeyCode::Char('q') | KeyCode::Esc => self.sso_prompt = None,
+            _ => {}
         }
     }
 
@@ -4907,11 +5185,27 @@ impl App {
     }
 
     /// How long a step may take before the plan gives up. `netbird up` can sit
-    /// through a login, so it gets much longer than an ssh forward.
-    fn step_timeout(step: &Step) -> Duration {
+    /// through a login, so it gets much longer than an ssh forward — and longer
+    /// again while the login is genuinely in front of somebody, because what the
+    /// step is waiting for then is a person and not a client.
+    fn step_timeout(&self, step: &Step) -> Duration {
         match step {
+            Step::Vpn(_) if self.awaiting_login(step) => VPN_LOGIN_TIMEOUT,
             Step::Vpn(_) => VPN_TIMEOUT,
             _ => DEPENDENCY_TIMEOUT,
+        }
+    }
+
+    /// Whether the client this step needs is sitting on a browser login.
+    fn awaiting_login(&self, step: &Step) -> bool {
+        let Step::Vpn(req) = step else {
+            return false;
+        };
+        match parse_vpn_requirement(req).and_then(|p| p.provider) {
+            Some(id) => self.vpn.get(id).sso.is_some(),
+            // "any VPN" is whichever one the plan picked, and only one client
+            // can be waiting on a login at a time in practice.
+            None => self.vpn.providers.iter().any(|p| p.sso.is_some()),
         }
     }
 
@@ -4972,7 +5266,7 @@ impl App {
                 };
                 let tx = self.vpn_tx.clone();
                 let result = {
-                    let env = self.vpn_env();
+                    let env = self.vpn_env(id);
                     vpn::connect(id, tx, env, profile.as_deref())
                 };
                 let target = LogTarget::Vpn(id, profile.unwrap_or_default());
@@ -5155,7 +5449,7 @@ impl App {
                         act.waiting = None;
                         act.done += 1;
                     }
-                    StepState::Waiting if since.elapsed() < Self::step_timeout(&step) => {
+                    StepState::Waiting if since.elapsed() < self.step_timeout(&step) => {
                         self.activation = Some(act);
                         return;
                     }
@@ -5751,12 +6045,22 @@ impl App {
                         self.journal.fail(LogTarget::vpn(id), format!("status: {e}"));
                     }
                 }
+                VpnMsg::LoginNeeded {
+                    provider,
+                    profile,
+                    waiting,
+                    error,
+                } => self.on_login_needed(provider, profile, waiting, error),
                 VpnMsg::ActionDone {
                     provider: id,
                     desc,
                     error,
                 } => {
                     self.vpn.get_mut(id).busy = None;
+                    // The attempt is over, so nothing is waiting on a browser any
+                    // more. A login that is what went wrong says so for itself,
+                    // in the prompt the client raises next.
+                    self.clear_sso(id);
                     // Whatever it was, the machine is not what it was.
                     self.scan_soon();
                     match error {

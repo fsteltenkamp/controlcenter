@@ -423,6 +423,7 @@ fn status_for(profile: &WireguardProfile, iface: &str) -> VpnStatus {
         active_profile: Some(profile.name.clone()),
         fields,
         error: None,
+        ..Default::default()
     }
 }
 

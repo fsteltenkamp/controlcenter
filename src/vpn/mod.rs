@@ -13,9 +13,11 @@ pub mod scan;
 pub mod tailscale;
 pub mod wireguard;
 
+use crate::logs::Ring;
 use crate::types::{VpnConfig, WireguardProfile};
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 /// The VPN clients controlcenter knows about. The declaration order is also the
 /// order VPN steps are run in when one plan needs more than one of them.
@@ -157,6 +159,15 @@ pub struct VpnStatus {
     pub active_profile: Option<String>,
     pub fields: Vec<(String, String)>,
     pub error: Option<String>,
+    /// The client is up and talking but has no session: a peer that is bound to
+    /// a person rather than to a setup key, and whose browser login has either
+    /// never happened or has run out.
+    ///
+    /// Only [`netbird`] sets this, because it is the one client whose login
+    /// controlcenter can drive — see [`VpnMsg::LoginNeeded`]. Tailscale reports
+    /// the same state as an `error` carrying its own auth URL, which is all
+    /// there is to do about it from here.
+    pub needs_login: bool,
 }
 
 impl VpnStatus {
@@ -176,6 +187,20 @@ impl VpnStatus {
     }
 }
 
+/// What a client asks a person to do in a browser to finish a login: the device
+/// flow's URL, and its code where the URL does not already carry one.
+#[derive(Debug, Clone)]
+pub struct Verification {
+    pub url: String,
+    /// `None` when the URL already contains the code, which is the usual case
+    /// and the one where nothing has to be typed.
+    pub code: Option<String>,
+    /// The client process that is sitting on this login, where there is one to
+    /// name. It is what would bring the VPN up once the browser is done, so it
+    /// is also what a stop has to stop — see [`crate::app::App::cancel_login`].
+    pub pid: Option<u32>,
+}
+
 pub enum VpnMsg {
     Refreshed {
         provider: ProviderId,
@@ -185,6 +210,18 @@ pub enum VpnMsg {
     ActionDone {
         provider: ProviderId,
         desc: String,
+        error: Option<String>,
+    },
+    /// A login is what stands between a profile and being up.
+    ///
+    /// Sent twice over one attempt at most: once with `waiting` set, the moment
+    /// the client prints the URL it is sitting on, so the person can be shown
+    /// what it is waiting for; and once with `error` set when the attempt ended
+    /// without a session, which is the answer to "why did that do nothing".
+    LoginNeeded {
+        provider: ProviderId,
+        profile: String,
+        waiting: Option<Verification>,
         error: Option<String>,
     },
     /// What is on the machine, whoever started it. Belongs to no one client.
@@ -203,12 +240,17 @@ pub fn installed(p: ProviderId) -> bool {
         .all(|b| crate::platform::which_bin(b).is_some())
 }
 
-/// What the providers need from the app to act: the stored profiles, plus where
-/// controlcenter keeps the files it generates and the pid files it reads back.
+/// What the providers need from the app to act: the stored profiles, where
+/// controlcenter keeps the files it generates and the pid files it reads back,
+/// and the ring the client's own output goes into.
 #[derive(Clone, Copy)]
 pub struct VpnEnv<'a> {
     pub cfg: &'a VpnConfig,
     pub wireguard_dir: &'a Path,
+    /// The log ring of the provider being acted on, for a client that is driven
+    /// by a command worth reading as it runs rather than after it: netbird's
+    /// `up` prints a login URL that is worth nothing once it has finished.
+    pub log: &'a Arc<Ring>,
 }
 
 /// Fetch profiles and status on a background thread; the result arrives as
@@ -239,7 +281,7 @@ pub fn connect(
     profile: Option<&str>,
 ) -> Result<Vec<String>, String> {
     match p {
-        ProviderId::Netbird => Ok(netbird::connect(tx, profile)),
+        ProviderId::Netbird => Ok(netbird::connect(tx, profile, Arc::clone(env.log))),
         ProviderId::Pangolin => pangolin::connect(tx, profile),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
@@ -276,7 +318,7 @@ pub fn disconnect(
     profile: Option<&str>,
 ) -> Result<Vec<String>, String> {
     match p {
-        ProviderId::Netbird => Ok(netbird::disconnect(tx)),
+        ProviderId::Netbird => Ok(netbird::disconnect(tx, Arc::clone(env.log))),
         ProviderId::Pangolin => Ok(pangolin::disconnect(tx)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;

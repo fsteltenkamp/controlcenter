@@ -132,6 +132,12 @@ pub fn render(f: &mut Frame, app: &App) {
         render_conflict_prompt(f, app, area);
     }
 
+    // A login prompt holds a connect the same way a conflict does: nothing else
+    // on screen can finish the login it is waiting for.
+    if app.sso_prompt.is_some() {
+        render_sso_prompt(f, app, area);
+    }
+
     // The panic button asks over the top of anything else on screen.
     if app.panic.is_some() {
         render_panic_prompt(f, app, area);
@@ -1116,6 +1122,29 @@ fn render_vpn_status(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(v.clone(), Style::default().fg(TEXT())),
         ]));
     }
+    // A login that is waiting outranks the client's own state: it is the only
+    // thing standing between the profile and being up, and it needs a person.
+    if let Some(sso) = &provider.sso {
+        lines.push(Line::from(""));
+        lines.push(kv(
+            "login",
+            Span::styled(
+                format!("waiting on the browser, {}", fmt_duration(sso.since.elapsed())),
+                Style::default().fg(WARN()).bold(),
+            ),
+        ));
+        lines.push(kv(
+            "open",
+            Span::styled(sso.url.clone(), Style::default().fg(ACCENT())),
+        ));
+        if let Some(code) = &sso.code {
+            lines.push(kv("code", Span::styled(code.clone(), Style::default().fg(WARN()))));
+        }
+        lines.push(Line::from(Span::styled(
+            " Enter shows it again, with a key to reopen the browser.",
+            Style::default().fg(DIM()),
+        )));
+    }
     if let Some(err) = st.error.as_ref().or(provider.error.as_ref()) {
         lines.push(Line::from(""));
         for line in err.lines() {
@@ -1260,6 +1289,8 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
             " Enter switches to the selected profile and connects.",
             " Anything that requires the profile being left is disconnected.",
             " Profiles are netbird's own; add them with the netbird CLI.",
+            " A user-device profile asks for a browser login, here and again",
+            " whenever its SSO session expires; a setup key never does.",
         ],
         ProviderId::Wireguard if cfg!(windows) => vec![
             " Enter installs the selected profile as a tunnel service; Enter again removes it.",
@@ -2754,6 +2785,140 @@ fn render_conflict_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
+/// The browser-login popup, in the two shapes a login comes in: the one that is
+/// waiting on a browser right now, and the one that is already lost.
+///
+/// The URL is never shortened. It is the whole point of the popup, and a user
+/// device whose terminal cannot be clicked has to be able to read it off.
+fn render_sso_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(prompt) = &app.sso_prompt else {
+        return;
+    };
+    let slug = prompt.provider.slug();
+    let name = if prompt.profile.is_empty() {
+        slug.to_string()
+    } else {
+        format!("'{}'", prompt.profile)
+    };
+    let field = |k: &str, v: Span<'static>| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<9}"), Style::default().fg(DIM())),
+            v,
+        ])
+    };
+    let prose = |t: String| Line::from(Span::styled(format!(" {t}"), Style::default().fg(TEXT())));
+
+    let mut lines = vec![field(
+        "profile",
+        Span::styled(name.clone(), Style::default().fg(ACCENT()).bold()),
+    )];
+    match &prompt.login {
+        Some(login) => {
+            lines.push(field(
+                "waiting",
+                Span::styled(
+                    format!("{} so far", fmt_duration(login.since.elapsed())),
+                    Style::default().fg(WARN()),
+                ),
+            ));
+            lines.push(Line::from(""));
+            lines.push(prose(format!(
+                "{name} is a user device, so it is logged in through a browser"
+            )));
+            lines.push(prose("rather than with a setup key. Finish the login there:".into()));
+            lines.push(Line::from(""));
+            lines.push(field(
+                "open",
+                Span::styled(login.url.clone(), Style::default().fg(ACCENT())),
+            ));
+            if let Some(code) = &login.code {
+                lines.push(field(
+                    "code",
+                    Span::styled(code.clone(), Style::default().fg(WARN()).bold()),
+                ));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" o", Style::default().fg(ACCENT()).bold()),
+                Span::styled(" open it in a browser · ", Style::default().fg(DIM())),
+                Span::styled("c", Style::default().fg(ACCENT()).bold()),
+                Span::styled(" give up on it · ", Style::default().fg(DIM())),
+                Span::styled("q/Esc", Style::default().fg(ACCENT())),
+                Span::styled(
+                    " hide this — the login keeps waiting",
+                    Style::default().fg(DIM()),
+                ),
+            ]));
+        }
+        None => {
+            if let Some(err) = &prompt.error {
+                lines.push(field(
+                    slug,
+                    Span::styled(err.clone(), Style::default().fg(DANGER())),
+                ));
+            }
+            lines.push(Line::from(""));
+            lines.push(prose(format!(
+                "{name} has no SSO session. A user device is logged in through"
+            )));
+            lines.push(prose(
+                "a browser and that session expires; a peer registered with a".into(),
+            ));
+            lines.push(prose("setup key never asks for one.".into()));
+            lines.push(Line::from(""));
+            lines.push(prose(
+                "Enter tries again: the browser opens and the code, if there is".into(),
+            ));
+            lines.push(prose("one to type, appears here. Or do it outside:".into()));
+            lines.push(Line::from(""));
+            let cmd = match prompt.profile.is_empty() {
+                true => format!("   {slug} login"),
+                false => format!("   {slug} login --profile {}", prompt.profile),
+            };
+            lines.push(Line::from(Span::styled(
+                cmd,
+                Style::default().fg(ACCENT()),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" Enter", Style::default().fg(WARN()).bold()),
+                Span::styled(" log in · ", Style::default().fg(DIM())),
+                Span::styled("q/Esc", Style::default().fg(ACCENT())),
+                Span::styled(" close", Style::default().fg(DIM())),
+            ]));
+        }
+    }
+
+    let title = match prompt.login {
+        Some(_) => format!(" {slug}: browser login "),
+        None => format!(" {slug}: login required "),
+    };
+    // A login URL is as long as the provider makes it and is never shortened, so
+    // the box is measured after wrapping rather than by counting lines: a footer
+    // pushed off the bottom would take the keys that answer the popup with it.
+    const WIDTH: u16 = 74;
+    let wrapped: usize = lines.iter().map(|l| wrapped_height(l, WIDTH - 2)).sum();
+    let rect = centered_rect(WIDTH, (wrapped + 2) as u16, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(title, Style::default().fg(WARN()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+/// How many rows a line takes once it has been wrapped to `width`.
+fn wrapped_height(line: &Line, width: u16) -> usize {
+    let chars: usize = line
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
+    chars.div_ceil(width.max(1) as usize).max(1)
+}
+
 fn render_help_overlay(f: &mut Frame, area: Rect) {
     let entry = |k: &str, d: &str| {
         Line::from(vec![
@@ -2897,6 +3062,8 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("esc", "cancel a form, close a popup"),
         entry("y", "confirm in a prompt"),
         entry("ctrl+o", "open the file picker on a path field"),
+        entry("o", "open the login URL — in a VPN browser-login prompt,"),
+        entry("", "where c gives up on the login instead"),
         Line::from(""),
         section("what each one acts on"),
         row("", "VPN", "TUNNELS", "SSH", "RDP"),

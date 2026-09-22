@@ -13,7 +13,8 @@ A pane merges two things, in the order they happened:
 - **what controlcenter did** — the plan it built, the command line it ran, the exit code
   it saw, the reason it gave up
 - **what the process printed** — ssh's stderr for a tunnel, the RDP client's output for an
-  RDP session, openvpn's log for a VPN session
+  RDP session, openvpn's log for a VPN session, and what the VPN client itself said while
+  it was being driven: the browser login NetBird asks for is printed there and nowhere else
 
 Each line is stamped with the time and marked with who said it, so a refused key and the
 command that asked for it read as one story. Lines controlcenter wrote itself are bright;
@@ -22,7 +23,7 @@ a process's own output is dim; anything that failed is red.
 | tab | `l` opens |
 | --- | --- |
 | Dashboard | everything, in one list — the whole run |
-| VPN | the selected profile: its session log, and what was run to bring it up |
+| VPN | the selected profile: its session log, what the client printed, and what was run to bring it up |
 | Tunnels | the selected tunnel: its ssh output and its starts, restarts and failures |
 | SSH | the selected host: the command line, where the session opened, how it ended |
 | RDP | the selected connection: the client's log |

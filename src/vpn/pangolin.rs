@@ -272,6 +272,7 @@ fn parse_status(raw: &str) -> VpnStatus {
         active_profile: None,
         fields,
         error: str_at(&v, "error").map(str::to_string),
+        ..Default::default()
     }
 }
 

@@ -109,6 +109,7 @@ fn parse_status(raw: &str) -> VpnStatus {
         active_profile: None, // filled in from prefs by refresh
         fields,
         error,
+        ..Default::default()
     }
 }
 

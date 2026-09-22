@@ -8,7 +8,6 @@
 //! tested on the machine the tests actually run on.
 
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
 
 /// The path that means "throw this away". ssh is pointed at it for the known
@@ -244,6 +243,44 @@ fn icacls(path: &Path, dir: bool) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Spawning
 // ---------------------------------------------------------------------------
+
+/// Hand a URL to whatever opens one here, for a login that can only be finished
+/// in a browser. Nothing is read back and nothing is waited for: the browser is
+/// the user's, and a handler that writes to its stdout must not write to the
+/// terminal the TUI is drawing in.
+///
+/// Only `http` and `https` are passed on. The URL comes from a client's output,
+/// and a desktop handler will open very nearly anything — a file, a helper, a
+/// scheme some other program registered — so what is accepted is narrowed here
+/// rather than at the call site.
+///
+/// `explorer.exe` rather than `cmd /C start` on Windows: `start` is a shell
+/// builtin and `cmd` splits on the `&` that every device-login URL is full of,
+/// which would open a truncated page and run the rest as commands.
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("not a web address: {url}"));
+    }
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("explorer.exe");
+        cmd.arg(url);
+        hidden(&mut cmd);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("opening a browser: {e}"))
+}
 
 /// Keep a helper process from flashing a console window of its own.
 /// Windows only — nothing else opens one uninvited.
