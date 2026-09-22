@@ -22,7 +22,7 @@ use crate::ssh;
 use crate::tunnel::{self, Status};
 use crate::types::{vpn_requirement_label, RdpConnection, SshHost, Tunnel};
 use crate::ui::fmt_duration;
-use crate::vpn::{openvpn, ProviderId};
+use crate::vpn::{openvpn, pangolin, ProviderId};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -594,11 +594,15 @@ fn vpn_profile_block(out: &mut String, app: &App, provider: ProviderId, profile:
         }
         ProviderId::Pangolin => {
             field(out, "accounts", "pangolin's own — controlcenter only reads them");
-            field(
-                out,
-                "command",
-                command_line(&["pangolin".into(), "up".into(), "--silent".into()]),
-            );
+            // Both of these come from the same place the action does, so what
+            // is reported is what ran. The `up` is the last step of every plan;
+            // the stop is the first whenever a client was already running,
+            // which is every switch.
+            for step in pangolin::connect_plan(None, false) {
+                field(out, "command", step.describe());
+            }
+            field(out, "stop", pangolin::Step::Stop.describe());
+            field(out, "status", pangolin::status_probe());
             // The escalation is the CLI's, not ours, and a report that did not
             // say so would send the reader to privileged.rs for a sudo that
             // never happened there.

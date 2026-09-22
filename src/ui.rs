@@ -1280,7 +1280,8 @@ fn vpn_status_block(lines: Vec<Line>) -> Paragraph {
 fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
     match id {
         ProviderId::Pangolin => vec![
-            " Enter selects the account and brings the client up.",
+            " Enter selects the account and brings the client up; a switch stops",
+            " whatever is up first, because pangolin's own `up` refuses otherwise.",
             " Anything that requires the account being left is disconnected.",
             " Accounts are pangolin's own; add one with `pangolin login`.",
             " pangolin runs its own sudo, so it needs controlcenter's sudo ticket.",

@@ -1,9 +1,17 @@
 //! VPN providers.
 //!
-//! Every provider is a CLI shell-out that runs on a background thread and reports
-//! back over one shared [`VpnMsg`] channel, the same pattern the NetBird
-//! integration has always used. `mod.rs` holds the shapes they all share plus the
-//! dispatch; the per-provider modules hold the argv and the parsing.
+//! Every provider runs on a background thread and reports back over one shared
+//! [`VpnMsg`] channel, the same pattern the NetBird integration has always used.
+//! `mod.rs` holds the shapes they all share plus the dispatch; the per-provider
+//! modules hold the argv and the parsing.
+//!
+//! Driving a client means shelling out to its CLI, except where its CLI cannot
+//! be driven headlessly. [`pangolin`] is the one such client so far: two of its
+//! subcommands open `/dev/tty` or share stdout with a banner, so status and
+//! stopping go to the socket its own CLI dials instead. A provider may do that
+//! when the CLI leaves it no choice, and it says which requests it makes and why
+//! where the argv would otherwise be — it is still the client's own published
+//! interface, and a status poll that reaches it still escalates nothing.
 
 pub mod netbird;
 pub mod openvpn;

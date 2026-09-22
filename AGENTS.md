@@ -121,6 +121,15 @@ justify a decision that would otherwise look arbitrary — why WireGuard is poll
 rather than `wg show`, why openvpn is stopped through a pid file. Do not add comments that
 restate the code.
 
+**A client is driven through its CLI, unless its CLI cannot be driven.** Every
+provider shells out; `vpn/pangolin.rs` is the one that also talks to its client's
+control socket, because two of the pangolin CLI's subcommands are unusable from a
+full-screen program — `down` opens `/dev/tty` to draw a progress view and exits
+non-zero on a no-op, and `status --json` shares its stdout with the CLI's update
+banner. Reaching past a CLI needs that kind of reason written down beside it, and
+it stays inside the same two rules as everything else: the client's own published
+interface, and no escalation for anything that only looks.
+
 **The UI thread never blocks.** Every connect, disconnect and status poll runs on a thread
 and reports back through `vpn_tx`/`vpn_rx`. A new long-running operation follows the same
 shape.

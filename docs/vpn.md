@@ -10,10 +10,10 @@ poll runs in the background; the UI never blocks.
 | --- | --- | --- | --- | --- | --- |
 | needs | `netbird` | `wg`, `wg-quick` | `openvpn` | `tailscale` | `pangolin` |
 | profiles come from | `netbird profile list` | `vpn.toml` | `vpn.toml` | `vpn.toml` | pangolin's account store |
-| status poll | `netbird status` | `ip link show type wireguard` | the child process | `tailscale status --json` | `pangolin status --json` |
+| status poll | `netbird status` | `ip link show type wireguard` | the child process | `tailscale status --json` | the client's control socket |
 | also swept | — | strays | orphans and leftover devices | — | — |
 | poll needs root | no | no | no | no | no |
-| connect | `profile select` + `up` | `wg-quick up <conf>` | `openvpn --config …` | `tailscale up --reset …` | `select account` + `up --silent` |
+| connect | `profile select` + `up` | `wg-quick up <conf>` | `openvpn --config …` | `tailscale up --reset …` | stop, `select account`, `up --silent` |
 
 ### On Windows
 
@@ -211,11 +211,35 @@ non-interactive listing. Only the email, host and organisation are taken from it
 logins with the same email on different hosts are listed as `email @ host`; a single one
 is listed as just the email.
 
-Status is `pangolin status --json`, which needs no privileges — when nothing is up the CLI
-says so in prose and that is read as a state, not an error. A tunnel counts as connected
-only when the client is both connected *and* registered: a client the server has not
-accepted holds the tunnel open and carries nothing, and the panel says which of the two is
-missing.
+A row is green when that account is the selected one **and** a client is actually up. The
+selection outlives every client started from it, so the two are not the same question:
+going by the selection alone would leave a row green over a tunnel that is not there, and
+`Enter` on it would try to disconnect something that had already gone.
+
+Status and stopping do not go through the CLI. They go to the small HTTP server the
+running client listens on — `/var/run/olm.sock`, or the named pipe `\\.\pipe\pangolin-olm`
+on Windows — which is the same address `pangolin status` and `pangolin down` dial and which
+the client deliberately leaves open to everyone, so neither needs privileges. The CLI's own
+two subcommands cannot be used from inside a full-screen program: `pangolin down` opens
+`/dev/tty` to draw a progress view, which here is controlcenter's own terminal, and it
+exits non-zero when there was nothing to stop; and `pangolin status --json` shares its
+stdout with the CLI's update banner, so its JSON is only parseable until the next release.
+Nothing about the socket file's *existence* is taken as an answer either — the client
+leaves it behind when it exits, so only a reply counts.
+
+A tunnel counts as connected only when the client is both connected *and* registered: a
+client the server has not accepted holds the tunnel open and carries nothing, and the panel
+says which of the two is missing. The panel also lists the tunnel address, the DNS servers
+and MTU the client installed, the link to the Pangolin server, and how many sites are up —
+naming only the sites that are down or are being reached over a relay, since a site that is
+up and direct needs no telling.
+
+Switching stops the running client and waits for it to be gone before it selects the new
+account. That order is forced by the client: `pangolin up` refuses outright while any
+client is running, and `pangolin select account` tears one down itself without waiting for
+it to finish. Left to those two, a switch reliably ended with the old account down, the
+`up` refused, and nothing connected — while the tab, reading the selection, showed the new
+account as if it were up.
 
 Bringing the client up needs root, and pangolin gets it for itself: `pangolin up`
 re-executes under `sudo` to create the tunnel device. controlcenter therefore runs it
