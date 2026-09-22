@@ -398,6 +398,96 @@ pub fn kill_argv(pid: u32, force: bool) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Privileged ports
+// ---------------------------------------------------------------------------
+
+/// One paragraph of [`port_refused_advice`]: something to read, or something to
+/// run. The two are kept apart here so the popup can set a command off from the
+/// prose around it rather than the drawing code guessing which line is which.
+pub enum Advice {
+    Say(String),
+    Run(String),
+}
+
+impl Advice {
+    /// The paragraph as one line, for the journal — a command is written down
+    /// exactly as it would be run.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Say(s) | Self::Run(s) => s,
+        }
+    }
+}
+
+impl From<&str> for Advice {
+    fn from(s: &str) -> Self {
+        Self::Say(s.to_string())
+    }
+}
+
+/// Why the kernel refused a listening socket on `port`, and what to do about
+/// it, one entry per paragraph, in the words the popup shows.
+///
+/// This is a fact about the operating system and about no client, so it lives
+/// here rather than in `tunnel.rs`: Unix reserves everything below 1024 for
+/// root and lifts that for one binary at a time with `CAP_NET_BIND_SERVICE`,
+/// while Windows reserves nothing by rank and refuses for an unrelated reason —
+/// the port falls in a range Hyper-V or WinNAT has already taken off the table.
+///
+/// The Unix answer is the capability on *this* binary rather than a privileged
+/// controlcenter: the relay in `tunnel.rs` binds the tunnel's local port in
+/// this process, ssh only ever listens on a loopback port behind it, and a file
+/// capability is not inherited by a child. So the one thing that needs the port
+/// gets it, and nothing controlcenter spawns is any more privileged than before.
+#[cfg(unix)]
+pub fn port_refused_advice(port: u16) -> Vec<Advice> {
+    if port >= 1024 {
+        return vec![Advice::Say(format!(
+            "Port {port} is not a reserved one, so this is not the 1024 rule: \
+             something outside controlcenter refused the socket — SELinux, \
+             AppArmor, a seccomp filter, or a container started without \
+             CAP_NET_BIND_SERVICE."
+        ))];
+    }
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "controlcenter".into());
+    vec![
+        "Ports below 1024 are reserved for root, and controlcenter is not root — on \
+         purpose. It binds the tunnel's local port itself, with ssh listening on a \
+         loopback port behind the relay, so the capability goes on this binary and \
+         not on ssh:"
+            .into(),
+        Advice::Run(format!("sudo setcap cap_net_bind_service=+ep {exe}")),
+        "That grants low ports and nothing else, and a file capability is not \
+         inherited, so ssh and every other child stay as unprivileged as they are \
+         now."
+            .into(),
+        "It is stored on the file itself: a rebuild, an upgrade or a reinstall \
+         replaces the file and drops it, and it has to be granted again."
+            .into(),
+    ]
+}
+
+/// Windows reserves no range by rank, so a refusal there is never about being a
+/// low port: it is a port something has already excluded, which `netsh` prints.
+#[cfg(windows)]
+pub fn port_refused_advice(port: u16) -> Vec<Advice> {
+    vec![
+        Advice::Say(format!(
+            "Windows does not reserve low ports, so {port} was not refused for being \
+             one. It falls in a range something else has claimed — Hyper-V, WSL and \
+             WinNAT reserve blocks at boot, and a reserved port is refused even when \
+             nothing is listening on it."
+        )),
+        Advice::Run("netsh int ipv4 show excludedportrange protocol=tcp".into()),
+        "If the port is listed there, either move the tunnel to another local port \
+         or reserve this one for good, so the dynamic range stops claiming it."
+            .into(),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Being root
 // ---------------------------------------------------------------------------
 

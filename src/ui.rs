@@ -4,6 +4,7 @@ use crate::app::{
 };
 use crate::browser::FileBrowser;
 use crate::logs;
+use crate::platform::Advice;
 use crate::rdp::RdpStatus;
 use crate::ssh;
 use crate::theme::{self, Theme};
@@ -125,6 +126,12 @@ pub fn render(f: &mut Frame, app: &App) {
     // The file picker covers the form that opened it.
     if let Some(browser) = &app.browser {
         render_browser_overlay(f, browser, area);
+    }
+
+    // A refused port explains a start that has already failed, so it draws
+    // under anything still holding one up — the same order the keys are in.
+    if app.port_prompt.is_some() {
+        render_port_prompt(f, app, area);
     }
 
     // A conflict prompt holds a tunnel start hostage; it wins over everything.
@@ -2791,6 +2798,82 @@ fn render_conflict_prompt(f: &mut Frame, app: &App, area: Rect) {
 ///
 /// The URL is never shortened. It is the whole point of the popup, and a user
 /// device whose terminal cannot be clicked has to be able to read it off.
+/// The port a tunnel could not have, and the command that would grant it.
+///
+/// Wide and wrapped rather than cut to fit: what it says is a command to be
+/// typed somewhere else, and a path elided to make a box tidy is a command that
+/// cannot be typed at all.
+fn render_port_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(prompt) = &app.port_prompt else {
+        return;
+    };
+    let field = |k: &str, v: Span<'static>| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<9}"), Style::default().fg(DIM())),
+            v,
+        ])
+    };
+    let mut lines = vec![
+        field(
+            "tunnel",
+            Span::styled(
+                format!("'{}'", prompt.tunnel),
+                Style::default().fg(ACCENT()).bold(),
+            ),
+        ),
+        field(
+            "port",
+            Span::styled(
+                format!("{} — refused by the kernel", prompt.port),
+                Style::default().fg(DANGER()),
+            ),
+        ),
+    ];
+    for para in &prompt.advice {
+        lines.push(Line::from(""));
+        match para {
+            Advice::Say(text) => lines.push(Line::from(Span::styled(
+                format!(" {text}"),
+                Style::default().fg(TEXT()),
+            ))),
+            Advice::Run(cmd) => lines.push(Line::from(Span::styled(
+                format!("   {cmd}"),
+                Style::default().fg(ACCENT()),
+            ))),
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" q/Esc", Style::default().fg(ACCENT())),
+        Span::styled(
+            " close · the tunnel is not running and nothing is retrying it",
+            Style::default().fg(DIM()),
+        ),
+    ]));
+
+    // Wide, and measured after wrapping against the width it will actually get:
+    // the prose is paragraphs and the command carries the install path, so a
+    // height counted in lines would push the footer — the keys that close this —
+    // off the bottom of the box.
+    let width = 86.min(area.width);
+    let wrapped: usize = lines
+        .iter()
+        .map(|l| wrapped_height(l, width.saturating_sub(2)))
+        .sum();
+    let rect = centered_rect(width, (wrapped + 2) as u16, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DANGER()))
+            .title(Span::styled(
+                " port refused ",
+                Style::default().fg(DANGER()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
+}
+
 fn render_sso_prompt(f: &mut Frame, app: &App, area: Rect) {
     let Some(prompt) = &app.sso_prompt else {
         return;
@@ -2911,13 +2994,18 @@ fn render_sso_prompt(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// How many rows a line takes once it has been wrapped to `width`.
+///
+/// Wrapped the way it will be drawn, words kept whole, rather than by dividing
+/// a character count: a paragraph that has to break early to keep a word
+/// together takes more rows than the division says, and a popup measured that
+/// way loses its last rows — the keys that answer it — off the bottom of the
+/// screen. The indent is charged to every row, which can only make the box a
+/// row too tall; the other way round is the one that costs the footer.
 fn wrapped_height(line: &Line, width: u16) -> usize {
-    let chars: usize = line
-        .spans
-        .iter()
-        .map(|s| s.content.chars().count())
-        .sum();
-    chars.div_ceil(width.max(1) as usize).max(1)
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let indent = text.chars().take_while(|c| *c == ' ').count();
+    let usable = (width as usize).saturating_sub(indent).max(1);
+    wrap_text(text.trim_start(), usable).len()
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {

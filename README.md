@@ -183,6 +183,25 @@ an elevated terminal. Started normally it still runs everything else, and says o
 tab that it cannot start or stop those two. NetBird and Tailscale on Windows take their
 commands from the signed-in user and need nothing; Pangolin asks for elevation itself.
 
+### Ports below 1024
+
+A tunnel's local port is bound by controlcenter itself — the relay that counts its
+throughput — and not by ssh, which only listens on a loopback port behind it. So a tunnel
+on 80 or 443 needs one capability on this binary and nothing on ssh:
+
+```sh
+sudo setcap cap_net_bind_service=+ep /path/to/controlcenter
+```
+
+It grants low ports and nothing else, and is not inherited by ssh or any other child, so
+nothing controlcenter runs becomes more privileged. It lives on the file, so an upgrade or
+a rebuild drops it and it has to be granted again. Without it the tunnel does not start
+and a popup says so, with the command for the binary you are running.
+
+Windows reserves no port by number; a refusal there is a range Hyper-V or WinNAT has
+excluded, which `netsh int ipv4 show excludedportrange protocol=tcp` lists. See
+[docs/connections.md](docs/connections.md) for both.
+
 ## Configuration
 
 Everything is edited in the TUI and stored as TOML — under `~/.config/controlcenter/` on

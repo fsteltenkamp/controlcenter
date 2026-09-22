@@ -191,6 +191,18 @@ prevent, and `privileged::command`, which streams openvpn's log, refuses rather 
 starting one. `ProviderId::needs_root` is what decides whether an action goes through this
 file at all, and it is platform-aware: Tailscale on Windows needs nothing.
 
+**A low port is a capability on the binary, never root.** The relay in `tunnel.rs` binds
+the tunnel's local port in this process, so a tunnel on 80 or 443 is answered by
+`setcap cap_net_bind_service=+ep` on the controlcenter binary — not by running the TUI
+under sudo, and not by touching ssh, which only ever binds a loopback port behind the
+relay. A bind that comes back `EACCES` is therefore a different failure from `EADDRINUSE`:
+one can be evicted and retried, the other never can, so `tunnel::bind_error` gives the
+refusal its own type and `App::start_tunnel` raises the popup that carries the exact
+command. What the popup says is `platform::port_refused_advice`, because what is reserved
+and why is the operating system's business — Windows reserves nothing by rank, and its
+refusals are excluded ranges instead. Never retry a refused port and never make the
+advice a guess at the binary's path: it comes from `current_exe`.
+
 **Config is edited in the TUI and is hand-editable.** Adding a field means adding it to
 the type in `types.rs`, the form in `app.rs`, the panel in `ui.rs`, and
 `docs/configuration.md`. Old files must keep loading — see how unqualified `requires_vpn`

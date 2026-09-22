@@ -262,6 +262,39 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// The port was refused outright: this process may not have it at all.
+///
+/// A type of its own rather than a message, because the answer is a command the
+/// user has to run outside the program — see [`crate::platform::port_refused_advice`] —
+/// and the UI raises a popup for it instead of a status line that scrolls away.
+#[derive(Debug, Clone, Copy)]
+pub struct PortRefused {
+    pub port: u16,
+}
+
+impl std::fmt::Display for PortRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "binding 127.0.0.1:{}: permission denied", self.port)
+    }
+}
+
+impl std::error::Error for PortRefused {}
+
+/// Tell the two ways a bind fails apart.
+///
+/// `EADDRINUSE` is someone else holding the port, which stopping them fixes;
+/// `EACCES` is a port this process is not allowed to have at all — on Linux
+/// every port below 1024 — which no retry and no eviction will ever fix. Saying
+/// "port in use?" to the second is what sends a user looking for a process that
+/// was never there.
+fn bind_error(port: u16, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        anyhow::Error::new(PortRefused { port })
+    } else {
+        anyhow::Error::new(err).context(format!("binding 127.0.0.1:{port} (port in use?)"))
+    }
+}
+
 /// Listen on `listen_port` and relay every connection to 127.0.0.1:`internal_port`
 /// (where ssh listens), counting bytes in both directions.
 fn start_relay(
@@ -270,8 +303,8 @@ fn start_relay(
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>> {
-    let listener = TcpListener::bind(("127.0.0.1", listen_port))
-        .with_context(|| format!("binding 127.0.0.1:{listen_port} (port in use?)"))?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", listen_port)).map_err(|e| bind_error(listen_port, e))?;
     listener
         .set_nonblocking(true)
         .context("setting listener non-blocking")?;
@@ -520,6 +553,19 @@ mod tests {
             }
         }
         panic!("port never came free: {:?}", refused);
+    }
+
+    #[test]
+    fn a_refused_port_is_told_apart_from_a_taken_one() {
+        // Both come back from the same call and only one of them is worth
+        // offering a fix for, so the classification is exercised directly:
+        // binding 443 for real needs a machine the tests cannot count on.
+        use std::io::{Error, ErrorKind};
+        let refused = bind_error(443, Error::from(ErrorKind::PermissionDenied));
+        assert!(refused.downcast_ref::<PortRefused>().is_some_and(|r| r.port == 443));
+        let taken = bind_error(8443, Error::from(ErrorKind::AddrInUse));
+        assert!(taken.downcast_ref::<PortRefused>().is_none());
+        assert!(taken.to_string().contains("port in use"));
     }
 
     #[test]

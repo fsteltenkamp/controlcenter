@@ -1249,6 +1249,19 @@ impl ConflictPrompt {
     }
 }
 
+/// A tunnel whose local port the kernel refused outright, with what to do about
+/// it on this system.
+///
+/// A popup of its own rather than a flash: the answer is a command the user has
+/// to run in a shell, and a status line that clears itself after a few seconds
+/// is gone before they have switched windows to act on it.
+pub struct PortPrompt {
+    pub tunnel: String,
+    pub port: u16,
+    /// From [`crate::platform::port_refused_advice`], one paragraph per entry.
+    pub advice: Vec<crate::platform::Advice>,
+}
+
 // ---------------------------------------------------------------------------
 // VPN state
 // ---------------------------------------------------------------------------
@@ -1941,6 +1954,8 @@ pub struct App {
     pub activation: Option<Activation>,
     /// Tunnel-binding conflict awaiting the user's decision.
     pub conflict: Option<ConflictPrompt>,
+    /// A local port the kernel would not give us, and the fix for it.
+    pub port_prompt: Option<PortPrompt>,
     /// A VPN login waiting on a browser, or one that has already failed, while
     /// it is in front of the user. Dismissing it leaves the login itself alone;
     /// what the client is still waiting on lives on the client.
@@ -2029,6 +2044,7 @@ impl App {
             browser: None,
             activation: None,
             conflict: None,
+            port_prompt: None,
             sso_prompt: None,
             ssh_launch: VecDeque::new(),
             vpn_tx,
@@ -2409,6 +2425,18 @@ impl App {
         // the browser, and nothing else on screen can answer for it.
         if self.sso_prompt.is_some() {
             self.on_sso_key(key);
+            return;
+        }
+        // A refused port resumes nothing when it is dismissed — it explains a
+        // start that has already failed — so it is answered after the prompts
+        // that are still holding something up, which is also the order they are
+        // drawn in. Modal all the same: the key that closes it must not also act
+        // on the list underneath.
+        if self.port_prompt.is_some() {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => self.port_prompt = None,
+                _ => {}
+            }
             return;
         }
         // The file picker sits on top of the form that opened it.
@@ -5885,7 +5913,24 @@ impl App {
                 self.active.insert(t.name.clone(), active);
                 self.note(target, format!("starting: {cmd}"));
             }
-            Err(e) => self.report(target, format!("'{}': {e:#}", t.name), true),
+            Err(e) => {
+                let refused = e.downcast_ref::<tunnel::PortRefused>().copied();
+                self.report(target.clone(), format!("'{}': {e:#}", t.name), true);
+                // The fix goes in the log as well as in the popup: the popup is
+                // dismissed, the report exported afterwards still has to say
+                // what the failure was and what would have answered it.
+                if let Some(refused) = refused {
+                    let advice = crate::platform::port_refused_advice(refused.port);
+                    for line in &advice {
+                        self.note(target.clone(), line.text().to_string());
+                    }
+                    self.port_prompt = Some(PortPrompt {
+                        tunnel: t.name.clone(),
+                        port: refused.port,
+                        advice,
+                    });
+                }
+            }
         }
     }
 

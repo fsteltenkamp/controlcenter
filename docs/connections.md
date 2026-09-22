@@ -172,3 +172,46 @@ Throughput is measured by relaying `-L`/`-D` forwards through controlcenter itse
 binds an internal loopback port and controlcenter listens on your configured port,
 counting bytes in both directions. Remote (`-R`) forwards have no local socket, so they
 show status only.
+
+## Ports below 1024
+
+That relay is also what decides where the permission for a privileged port has to go. The
+socket on your configured port is opened by controlcenter, in its own process; ssh only
+ever listens on the loopback port behind it. So a tunnel on 80 or 443 needs one capability
+on the controlcenter binary, and nothing at all on ssh:
+
+```sh
+sudo setcap cap_net_bind_service=+ep /path/to/controlcenter
+getcap /path/to/controlcenter          # says whether it is still there
+```
+
+`cap_net_bind_service` grants low ports and nothing else, and a file capability is not
+inherited, so ssh and every other process controlcenter starts stay exactly as
+unprivileged as they were. Running the whole TUI under `sudo` would do the opposite —
+every ssh, every RDP client and every config file it writes would be root's — so that is
+not the answer here.
+
+The capability lives on the file itself, so a rebuild, an upgrade or a reinstall replaces
+the file and drops it, and it has to be granted again.
+
+Without it the tunnel does not start. Controlcenter says so in a popup that carries the
+exact command for the binary you are running, and puts the same lines in that tunnel's
+log, so a report exported afterwards still explains the failure. Nothing retries — a
+refused port is not a race, and waiting will not change the answer.
+
+If you would rather not single out one binary,
+`sysctl net.ipv4.ip_unprivileged_port_start=80` lowers the reserved range for everything
+on the machine: one file in `/etc/sysctl.d/`, nothing to re-apply after an upgrade, at the
+cost of letting any program you run bind those ports.
+
+A remote (`-R`) forward binds on the server instead, so a low port there is sshd's
+business — `GatewayPorts`, and what the remote user is allowed — and not something setcap
+here can help with.
+
+On Windows no port is reserved by number. A bind refused there means the port falls inside
+a range something else has already excluded: Hyper-V, WSL and WinNAT reserve blocks at
+boot, and a reserved port is refused even when nothing is listening on it.
+
+```powershell
+netsh int ipv4 show excludedportrange protocol=tcp
+```
