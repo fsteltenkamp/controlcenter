@@ -76,6 +76,22 @@ pub fn connection_args(host: &SshHost) -> Vec<String> {
     args
 }
 
+/// The same options for the file-transfer clients. `sftp` and `scp` take
+/// everything ssh does bar the port, which they spell `-P` because `-p` means
+/// "preserve the timestamps" to them.
+///
+/// Derived from [`connection_args`] rather than written out again, so a field
+/// added to `SshHost` reaches a transfer along with everything else. The flag
+/// is swapped by position — it is the one this function put there — and never
+/// by search, because `extra_args` is free text and may hold a `-p` of its own.
+pub fn transfer_args(host: &SshHost) -> Vec<String> {
+    let mut args = connection_args(host);
+    if host.port != 22 && args.first().map(String::as_str) == Some("-p") {
+        args[0] = "-P".into();
+    }
+    args
+}
+
 /// The command line as the user would type it, for the details panel.
 /// A stored password is never shown — it goes through the environment.
 pub fn command_preview(host: &SshHost, helper: &PasswordHelper) -> String {
@@ -531,6 +547,7 @@ mod tests {
             extra_args: String::new(),
             depends_on: String::new(),
             requires_vpn: String::new(),
+            remote_dir: String::new(),
         }
     }
 
@@ -561,6 +578,33 @@ mod tests {
                 "root@example.com",
             ]
         );
+    }
+
+    #[test]
+    fn a_transfer_gets_the_same_options_with_the_port_flag_sftp_understands() {
+        let h = SshHost {
+            port: 2222,
+            key_path: "/keys/id_ed25519".into(),
+            // A `-p` of the user's own must not be mistaken for the port flag.
+            extra_args: "-o Compression=yes -p".into(),
+            ..host()
+        };
+        assert_eq!(
+            transfer_args(&h),
+            vec![
+                "-P",
+                "2222",
+                "-i",
+                "/keys/id_ed25519",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "Compression=yes",
+                "-p",
+            ]
+        );
+        // A default port is not on the command line at all, so nothing is swapped.
+        assert_eq!(transfer_args(&host()), Vec::<String>::new());
     }
 
     #[test]

@@ -19,7 +19,7 @@ cargo build --release
 | 1 | **Dashboard** | everything that is up: VPN state, tunnel counts and traffic, running RDP sessions, and the aggregate throughput sparkline |
 | 2 | **VPN** | NetBird, WireGuard, OpenVPN, Tailscale and Pangolin side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
-| 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running |
+| 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running — and `f`, a two-pane file browser for copying files to and from the host |
 | 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
 
 Entries on any of these tabs can share a **group** name to stack under one header and be
@@ -40,6 +40,7 @@ Every key means the same thing on every tab. Only what it acts on changes.
 | `d` | delete |
 | `r` | reconnect / reload |
 | `p` | remove the stored password |
+| `f` | files — the two-pane transfer browser |
 | `l` | log |
 | `s` | save a report to a file |
 | `c` | clear — the log, or the entries that have finished |
@@ -73,6 +74,7 @@ moving.
 | `a` `e` `d` | profile | tunnel | host | connection |
 | `r` | refresh this client now | restart it | open another session | reconnect |
 | `p` | forget an OpenVPN password | — keys only | forget the stored password | — never stored |
+| `f` | — files go over SSH | — files go over SSH | the transfer browser | — files go over SSH |
 | `l` | the profile's log | the tunnel's log | the host's log | the connection's log |
 | `s` | a report about it | a report about it | a report about it | a report about it |
 | `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions |
@@ -89,6 +91,29 @@ netbird is waiting for — `o` opens the browser, `c` gives up, `Esc` hides the 
 the login carries on — and says so plainly when the login is what is missing. The SSO
 session expires, so it asks again; see [docs/vpn.md](docs/vpn.md).
 Reconnecting an RDP session asks for the password again, because nothing keeps a copy.
+
+### Transfers
+
+`f` on an SSH host opens a **two-pane browser**: this machine on the left, the host on the
+right. `Tab` moves between them, `↑` `↓` select, `→` opens a folder and `←` goes up, and
+typing filters the listing — the same keys as the file picker everywhere else.
+
+`Enter` on a folder walks into it. `Enter` on a file **copies it to the directory the
+other pane is showing**, so the pane with the focus is always the source and there is no
+upload key and no download key to get the wrong way round. A name that is already there is
+asked about first. `Esc` closes the browser — `q` is a letter here, because both panes
+take typed text.
+
+Behind the right-hand pane is a single `sftp` session, opened with the same port, user,
+key, password and options as a login to that host — so there is nothing to keep in
+`~/.ssh/config` and no `scp` command line to get right. It is brought up through the same
+chain as a session: a host that needs a VPN and a tunnel gets both first. The host can say
+where the remote pane opens (**Transfers start in**); left empty it opens wherever the
+login lands.
+
+A download shows its progress; an upload shows its size and how long it has been going,
+because `sftp` does not report the far end's progress. Everything a transfer does goes into
+the host's log (`l`) and into its report (`s`).
 
 ### Connections that are not ours
 
@@ -149,6 +174,10 @@ Tunnels run ssh with `BatchMode=yes` (no interactive prompts), so use key- or ag
 authentication for the hosts you tunnel through; SSH-tab sessions are interactive and may
 prompt normally. A tunnel that runs through an SSH-tab host with a stored password is the
 exception — it drops batch mode and answers that one prompt, the same way a session does.
+
+File transfers (`f`) use `sftp`, which comes with the same OpenSSH package as `ssh`, and
+follow the same rule: a stored password is answered, and a host without one runs in batch
+mode, because a full-screen program has no terminal to put a prompt on.
 
 Optional, each detected on startup and only greying out its own feature when missing:
 

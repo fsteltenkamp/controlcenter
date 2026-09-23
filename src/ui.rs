@@ -1,12 +1,14 @@
 use crate::app::{
-    App, FormField, FormMode, LogPane, RdpField, RdpMode, RowItem, SshField, SshMode, Step, Tab,
-    VpnMode, VpnPane, FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
+    App, FormField, FormMode, Link, LogPane, Pane, PendingCopy, RdpField, RdpMode, RowItem,
+    SshField, SshMode, Step, Tab, TransferView, VpnMode, VpnPane, FORM_FIELDS, RDP_FIELDS,
+    SSH_FIELDS,
 };
 use crate::browser::FileBrowser;
 use crate::chooser::{Chooser, Row as ChooserRow};
 use crate::logs;
 use crate::platform::Advice;
 use crate::rdp::RdpStatus;
+use crate::sftp::RemoteKind;
 use crate::ssh;
 use crate::theme::{self, Theme};
 use crate::tunnel::Status;
@@ -122,6 +124,12 @@ pub fn render(f: &mut Frame, app: &App) {
     // One log pane for the whole program, over whichever tab opened it.
     if let Some(pane) = &app.log_pane {
         render_log_overlay(f, app, pane, area);
+    }
+
+    // The transfer browser covers the tab that opened it, and the file picker
+    // can still open over the top of a form on another tab.
+    if let Some(view) = &app.transfer {
+        render_transfer_overlay(f, view, area);
     }
 
     // The pickers cover the form that opened them.
@@ -2086,6 +2094,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("a/e/d", "host"),
                 ("ctrl↑↓", "move"),
                 ("r", "new session"),
+                ("f", "files"),
                 ("p", "password"),
                 ("l", "log"),
                 ("s", "report"),
@@ -2691,6 +2700,7 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(TEXT()),
             ),
             SshField::ExtraArgs => (form.extra_args.clone(), Style::default().fg(TEXT())),
+            SshField::RemoteDir => (form.remote_dir.clone(), Style::default().fg(TEXT())),
         };
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
         let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
@@ -2709,6 +2719,11 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
     } else if form.field() == SshField::KeyPath {
         lines.push(Line::from(Span::styled(
             " Ctrl+O file picker · Enter save · Esc cancel",
+            Style::default().fg(DIM()),
+        )));
+    } else if form.field() == SshField::RemoteDir {
+        lines.push(Line::from(Span::styled(
+            " a path on the host — where f opens the remote pane · Enter save · Esc cancel",
             Style::default().fg(DIM()),
         )));
     } else if matches!(form.field(), SshField::RequiresVpn | SshField::DependsOn) {
@@ -3119,6 +3134,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         text("controlcenter is not holding — an orphan of an earlier run, or"),
         text("someone else's. Enter stops one; x takes them down with the rest"),
         Line::from(""),
+        section("transfers"),
+        text("f on an ssh host opens a two-pane browser: this machine on the"),
+        text("left, the host on the right, over one sftp session. Tab moves"),
+        text("between the panes and ↵ copies what is selected into the other"),
+        text("one — no ssh_config, no scp command line to get right"),
+        Line::from(""),
         section("logs and reports"),
         text("l opens the log of whatever is selected: what controlcenter did"),
         text("about it, merged with what the process it started printed."),
@@ -3180,6 +3201,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("d", "delete"),
         entry("r", "reconnect · reload"),
         entry("p", "remove the stored password"),
+        entry("f", "files — the two-pane transfer browser, on an ssh host"),
         entry("l", "log"),
         entry("s", "save a report to a file — everything, not just this log"),
         entry("c", "clear — the log, or entries that have finished"),
@@ -3210,6 +3232,8 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("← →", "switch pane · change the field under the cursor"),
         entry("esc", "cancel a form, close a popup"),
         entry("y", "confirm in a prompt"),
+        entry("tab", "in the transfer browser: the other pane — the one with"),
+        entry("", "the focus is where a copy comes from, and ↵ copies it"),
         entry("ctrl+o", "open a picker for the field under the cursor — files"),
         entry("", "on a path, the whole list on a VPN, tunnel or ssh-host"),
         entry("", "field, where groups are folders and typing searches"),
@@ -3222,6 +3246,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         row("a e d", "profile", "tunnel", "host", "connection"),
         row("r", "refresh", "restart", "new session", "reconnect"),
         row("p", "openvpn pw", "—", "stored pw", "never stored"),
+        row("f", "—", "—", "transfer files", "—"),
         row("l", "profile log", "ssh output", "what it did", "client log"),
         row("c", "errors", "failed", "last session", "finished"),
         row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move connection"),
@@ -3351,6 +3376,294 @@ fn render_browser_overlay(f: &mut Frame, browser: &FileBrowser, area: Rect) {
         ))),
         chunks[3],
     );
+}
+
+/// The transfer browser: this machine on the left, the host on the right, and
+/// the copy between them going whichever way the focus says.
+///
+/// Deliberately two of the file picker's layout side by side — the keys are
+/// the picker's keys, so the shape should be the picker's shape.
+fn render_transfer_overlay(f: &mut Frame, view: &TransferView, area: Rect) {
+    let rect = centered_rect(
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+        area,
+    );
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(
+                format!(" files · {} ", view.host),
+                Style::default().fg(ACCENT()).bold(),
+            )),
+        rect,
+    );
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+
+    render_local_pane(f, view, panes[0]);
+    render_remote_pane(f, view, panes[1]);
+    render_transfer_status(f, view, rows[1]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " tab pane · ↑↓ select · → open · ← up · ↵ copy or open · Esc close",
+            Style::default().fg(DIM()),
+        ))),
+        rows[2],
+    );
+
+    if let Some(copy) = &view.confirm {
+        render_overwrite_confirm(f, copy, area);
+    }
+}
+
+/// The two panes share a shape: where it is looking, how it went, what is
+/// there. Only the answers differ.
+fn pane_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(area)
+}
+
+fn pane_title(f: &mut Frame, area: Rect, label: &str, path: &str, focused: bool) {
+    let style = if focused {
+        Style::default().fg(ACCENT()).bold()
+    } else {
+        Style::default().fg(DIM())
+    };
+    let width = area.width.saturating_sub(label.len() as u16 + 3) as usize;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {label} "), style),
+            Span::styled(scrolled(path, width), Style::default().fg(TEXT())),
+            Span::styled(
+                if focused { "▏" } else { "" },
+                Style::default().fg(ACCENT()),
+            ),
+        ])),
+        area,
+    );
+}
+
+fn render_local_pane(f: &mut Frame, view: &TransferView, area: Rect) {
+    let focused = view.focus == Pane::Local;
+    let chunks = pane_chunks(area);
+    pane_title(f, chunks[0], "local", &view.local.input, focused);
+
+    let subtitle = match &view.local.error {
+        Some(e) => Span::styled(
+            format!(" {}", truncate(e, area.width as usize)),
+            Style::default().fg(DANGER()),
+        ),
+        None => Span::styled(
+            format!(" {} entries", view.local.entries.len()),
+            Style::default().fg(DIM()),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(subtitle)), chunks[1]);
+
+    let items: Vec<ListItem> = view
+        .local
+        .entries
+        .iter()
+        .map(|e| {
+            let (mark, name, style) = if e.is_dir {
+                ("▸ ", format!("{}/", e.name), Style::default().fg(ACCENT()))
+            } else {
+                ("  ", e.name.clone(), Style::default().fg(TEXT()))
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(DIM())),
+                Span::styled(truncate(&name, area.width as usize - 3), style),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if focused && !view.local.entries.is_empty() {
+        state.select(Some(view.local.selected));
+    }
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+        chunks[2],
+        &mut state,
+    );
+}
+
+fn render_remote_pane(f: &mut Frame, view: &TransferView, area: Rect) {
+    let focused = view.focus == Pane::Remote;
+    let chunks = pane_chunks(area);
+    pane_title(f, chunks[0], "remote", &view.remote.input, focused);
+
+    let width = area.width as usize;
+    let subtitle = match (&view.link, &view.remote.error) {
+        (Link::Connecting, _) => Span::styled(" connecting…", Style::default().fg(WARN())),
+        (Link::Down(why), _) => Span::styled(
+            format!(" {}", truncate(why, width)),
+            Style::default().fg(DANGER()),
+        ),
+        (Link::Up, Some(e)) => Span::styled(
+            format!(" {}", truncate(e, width)),
+            Style::default().fg(DANGER()),
+        ),
+        (Link::Up, None) if view.remote.pending.is_some() => {
+            Span::styled(" reading…", Style::default().fg(DIM()))
+        }
+        (Link::Up, None) => Span::styled(
+            format!(" {} entries", view.remote.entries.len()),
+            Style::default().fg(DIM()),
+        ),
+    };
+    f.render_widget(Paragraph::new(Line::from(subtitle)), chunks[1]);
+
+    let items: Vec<ListItem> = view
+        .remote
+        .entries
+        .iter()
+        .map(|e| {
+            let (mark, name, style) = match e.kind {
+                RemoteKind::Dir => ("▸ ", format!("{}/", e.name), Style::default().fg(ACCENT())),
+                RemoteKind::Link => ("→ ", e.name.clone(), Style::default().fg(ACCENT())),
+                RemoteKind::File => ("  ", e.name.clone(), Style::default().fg(TEXT())),
+            };
+            let size = if e.kind == RemoteKind::File {
+                human_bytes(e.size)
+            } else {
+                String::new()
+            };
+            // The size sits at the right-hand edge, as a file manager puts it.
+            let room = width.saturating_sub(size.len() + 4);
+            let name = truncate(&name, room);
+            let pad = room.saturating_sub(name.chars().count()) + 1;
+            ListItem::new(Line::from(vec![
+                Span::styled(mark, Style::default().fg(DIM())),
+                Span::styled(name, style),
+                Span::styled(" ".repeat(pad), Style::default()),
+                Span::styled(size, Style::default().fg(DIM())),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if focused && !view.remote.entries.is_empty() {
+        state.select(Some(view.remote.selected));
+    }
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().bg(SELECTION_BG())),
+        chunks[2],
+        &mut state,
+    );
+}
+
+/// What a copy is doing, or what Enter would do if there is none.
+fn render_transfer_status(f: &mut Frame, view: &TransferView, area: Rect) {
+    let line = match (&view.in_flight, &view.link) {
+        (Some(f), _) => {
+            let arrow = match f.to {
+                Pane::Local => "↓",
+                Pane::Remote => "↑",
+            };
+            let progress = match (f.watch.is_some(), f.size) {
+                // A download is the one we can measure: the file is ours and
+                // it is growing.
+                (true, size) if size > 0 => format!(
+                    "{} / {} · {}%",
+                    human_bytes(f.done),
+                    human_bytes(size),
+                    (f.done.saturating_mul(100) / size).min(100)
+                ),
+                // An upload's progress is the server's business, and sftp on a
+                // pipe does not report it, so say how long it has been rather
+                // than invent a number.
+                _ => format!("{} · {}", human_bytes(f.size), fmt_duration(f.started.elapsed())),
+            };
+            Line::from(vec![
+                Span::styled(format!(" {arrow} "), Style::default().fg(WARN()).bold()),
+                Span::styled(
+                    truncate(&f.what, area.width as usize / 2),
+                    Style::default().fg(TEXT()),
+                ),
+                Span::styled(format!("  {progress}"), Style::default().fg(ACCENT())),
+            ])
+        }
+        (None, Link::Up) => {
+            let arrow = match view.focus {
+                Pane::Local => "→",
+                Pane::Remote => "←",
+            };
+            Line::from(vec![
+                Span::styled(" ↵ ", Style::default().fg(ACCENT()).bold()),
+                Span::styled(
+                    format!("copies from {} ", view.focus.label()),
+                    Style::default().fg(DIM()),
+                ),
+                Span::styled(arrow, Style::default().fg(ACCENT())),
+                Span::styled(
+                    format!(" {}", truncate(&view.to_dir(), area.width as usize / 2)),
+                    Style::default().fg(TEXT()),
+                ),
+            ])
+        }
+        (None, _) => Line::from(Span::styled(
+            format!(" {}", truncate(&view.status(), area.width as usize)),
+            Style::default().fg(DIM()),
+        )),
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_overwrite_confirm(f: &mut Frame, copy: &PendingCopy, area: Rect) {
+    let rect = centered_rect(64, 6, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(" '{}' is already there:", copy.name),
+            Style::default().fg(TEXT()),
+        )),
+        Line::from(Span::styled(
+            format!(" {}", truncate(&copy.dst, 60)),
+            Style::default().fg(WARN()),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" y", Style::default().fg(WARN()).bold()),
+            Span::styled(" overwrite it · ", Style::default().fg(DIM())),
+            Span::styled("any other key", Style::default().fg(ACCENT())),
+            Span::styled(" leave it", Style::default().fg(DIM())),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(
+                " overwrite ",
+                Style::default().fg(WARN()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
 }
 
 /// The list picker: what is being typed, and the folder it is looking in.

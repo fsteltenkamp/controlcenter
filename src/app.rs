@@ -4,6 +4,7 @@ use crate::config::{self, AppConfig, Paths};
 use crate::logs::{Entry, Journal, LogTarget, Ring};
 use crate::rdp::{self, ActiveRdp, RdpStatus};
 use crate::report;
+use crate::sftp::{self, MsgKind, RemoteBrowser, SftpMsg};
 use crate::ssh::{self, SessionOutcome};
 use crate::theme::{self, Theme};
 use crate::tunnel::{self, ActiveTunnel, Status};
@@ -22,6 +23,7 @@ use crate::Tui;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +39,10 @@ const SCAN_SECS: u64 = 5;
 const TICKET_REFRESH: Duration = Duration::from_secs(120);
 /// How long a dependent connection waits for its tunnel to come up.
 const DEPENDENCY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an sftp session may take to answer for itself before it is taken
+/// to be stuck. It cannot be waiting on us — it has a key, a stored password
+/// or `BatchMode=yes` — so what is left is a network that is not there.
+const SFTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bringing a VPN up may sit through a browser login, so it gets much longer.
 const VPN_TIMEOUT: Duration = Duration::from_secs(120);
 /// And while a browser login is actually waiting, the clock is on the person at
@@ -814,6 +820,7 @@ pub enum SshField {
     RequiresVpn,
     DependsOn,
     ExtraArgs,
+    RemoteDir,
 }
 
 pub const SSH_FIELDS: &[SshField] = &[
@@ -828,6 +835,7 @@ pub const SSH_FIELDS: &[SshField] = &[
     SshField::RequiresVpn,
     SshField::DependsOn,
     SshField::ExtraArgs,
+    SshField::RemoteDir,
 ];
 
 impl SshField {
@@ -844,6 +852,7 @@ impl SshField {
             Self::RequiresVpn => "Requires VPN",
             Self::DependsOn => "Requires tunnel",
             Self::ExtraArgs => "Extra ssh args (optional)",
+            Self::RemoteDir => "Transfers start in (optional)",
         }
     }
 
@@ -867,6 +876,7 @@ pub struct SshForm {
     pub vpn: Picker,
     pub dep: Picker,
     pub extra_args: String,
+    pub remote_dir: String,
     pub error: Option<String>,
     /// Set once the user has acknowledged the cleartext-password warning for
     /// this edit, so saving again does not ask twice.
@@ -888,6 +898,7 @@ impl SshForm {
             vpn: Picker::vpn(ctx.vpn, ""),
             dep: Picker::tunnels(ctx.tunnels, "", None),
             extra_args: String::new(),
+            remote_dir: String::new(),
             error: None,
             password_ack: false,
         }
@@ -907,6 +918,7 @@ impl SshForm {
             vpn: Picker::vpn(ctx.vpn, &h.requires_vpn),
             dep: Picker::tunnels(ctx.tunnels, &h.depends_on, None),
             extra_args: h.extra_args.clone(),
+            remote_dir: h.remote_dir.clone(),
             error: None,
             // Already stored: the warning was accepted when it was first saved.
             password_ack: !h.password.is_empty(),
@@ -935,6 +947,7 @@ impl SshForm {
             SshField::KeyPath => Some(&mut self.key_path),
             SshField::Password => Some(&mut self.password),
             SshField::ExtraArgs => Some(&mut self.extra_args),
+            SshField::RemoteDir => Some(&mut self.remote_dir),
             SshField::SkipHostKey | SshField::RequiresVpn | SshField::DependsOn => None,
         }
     }
@@ -968,6 +981,7 @@ impl SshForm {
             extra_args: self.extra_args.trim().to_string(),
             depends_on: self.dep.value(),
             requires_vpn: self.vpn.value(),
+            remote_dir: self.remote_dir.trim().to_string(),
         })
     }
 }
@@ -980,6 +994,135 @@ pub enum SshMode {
     DeleteConfirm(usize),
     /// Cleartext-password warning shown before the form is saved.
     PasswordWarning,
+}
+
+// ---------------------------------------------------------------------------
+// Transfers
+// ---------------------------------------------------------------------------
+
+/// Which half of the transfer browser the keys act on.
+///
+/// The focused pane is where a copy comes *from* and the other one is where it
+/// lands, so there is no upload key and no download key that could disagree
+/// about which way round they are: the panes already say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Local,
+    Remote,
+}
+
+impl Pane {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Local => Self::Remote,
+            Self::Remote => Self::Local,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// Where the sftp session behind the remote pane has got to.
+pub enum Link {
+    Connecting,
+    Up,
+    /// Gone, with what it said on the way out. The browser stays up: the
+    /// reason is the last useful thing on the screen.
+    Down(String),
+}
+
+/// A copy the browser has started and is waiting on. One at a time, because
+/// the session serves one command at a time and a queue nobody can see the
+/// state of is worse than a wait.
+pub struct InFlight {
+    /// "/srv/app/dump.sql → /home/me/", for the status line and the log.
+    pub what: String,
+    /// The pane the copy lands in, and so the listing that goes stale.
+    pub to: Pane,
+    pub size: u64,
+    /// The file being written, when it is one we can watch. A download is: its
+    /// size on disk is the only progress an sftp on a pipe will ever give us,
+    /// and an upload's is the server's business, which it does not report.
+    pub watch: Option<PathBuf>,
+    pub done: u64,
+    pub started: Instant,
+}
+
+/// A copy, worked out and ready to run. Held rather than started while the
+/// overwrite question is on screen.
+#[derive(Debug, Clone)]
+pub struct PendingCopy {
+    pub to: Pane,
+    pub src: String,
+    pub dst: String,
+    pub name: String,
+    pub size: u64,
+}
+
+impl PendingCopy {
+    pub fn what(&self) -> String {
+        format!("{} → {}", self.src, self.dst)
+    }
+}
+
+/// What pressing Enter in the browser turns out to mean.
+enum CopyPlan {
+    Nothing,
+    /// A folder was walked into; the remote pane may now need a listing.
+    Descended,
+    Refused(String, bool),
+    /// Something is already called that at the far end.
+    Ask(PendingCopy),
+    Go(PendingCopy),
+}
+
+/// The two-pane browser: this machine on the left, the host on the right.
+pub struct TransferView {
+    pub host: String,
+    pub focus: Pane,
+    pub local: FileBrowser,
+    pub remote: RemoteBrowser,
+    pub link: Link,
+    pub session: Option<sftp::Session>,
+    pub in_flight: Option<InFlight>,
+    /// A copy that would land on a name that is already there, waiting for the
+    /// user to say whether that is what they meant.
+    pub confirm: Option<PendingCopy>,
+    pub opened: Instant,
+}
+
+impl TransferView {
+    /// The directory the focused pane is showing, and the one the other is —
+    /// which is where a copy would land.
+    pub fn source_dir(&self) -> String {
+        match self.focus {
+            Pane::Local => self.local.dir.to_string_lossy().into_owned(),
+            Pane::Remote => self.remote.dir.clone(),
+        }
+    }
+
+    pub fn to_dir(&self) -> String {
+        match self.focus {
+            Pane::Local => self.remote.dir.clone(),
+            Pane::Remote => self.local.dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    pub fn status(&self) -> String {
+        match &self.link {
+            Link::Connecting => "connecting…".into(),
+            Link::Down(why) => why.clone(),
+            Link::Up => match &self.in_flight {
+                Some(f) => f.what.clone(),
+                None => format!("{} → {}", self.source_dir(), self.to_dir()),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,6 +1188,9 @@ pub enum Step {
     Vpn(String),
     Tunnel(String),
     Ssh(String),
+    /// The transfer browser on an SSH host. A session of its own, brought up
+    /// through the same chain as a login to the same host.
+    Transfer(String),
     Rdp { name: String, password: String },
 }
 
@@ -1054,6 +1200,7 @@ impl Step {
             Self::Vpn(p) => format!("vpn {}", vpn_requirement_label(p)),
             Self::Tunnel(n) => format!("tunnel '{n}'"),
             Self::Ssh(n) => format!("ssh '{n}'"),
+            Self::Transfer(n) => format!("files on '{n}'"),
             Self::Rdp { name, .. } => format!("rdp '{name}'"),
         }
     }
@@ -1064,6 +1211,7 @@ impl Step {
             Self::Vpn(p) => format!("vpn {}", vpn_requirement_label(p)),
             Self::Tunnel(n) => format!("tun {n}"),
             Self::Ssh(n) => format!("ssh {n}"),
+            Self::Transfer(n) => format!("files {n}"),
             Self::Rdp { name, .. } => format!("rdp {name}"),
         }
     }
@@ -1079,14 +1227,16 @@ impl Step {
                 None => LogTarget::Program,
             },
             Self::Tunnel(n) => LogTarget::Tunnel(n.clone()),
-            Self::Ssh(n) => LogTarget::Ssh(n.clone()),
+            // A transfer is something done to a host, not a connection of its
+            // own: it belongs in that host's log and in that host's report.
+            Self::Ssh(n) | Self::Transfer(n) => LogTarget::Ssh(n.clone()),
             Self::Rdp { name, .. } => LogTarget::Rdp(name.clone()),
         }
     }
 
     /// Steps that only fire and forget; everything else is waited on.
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Ssh(_) | Self::Rdp { .. })
+        matches!(self, Self::Ssh(_) | Self::Transfer(_) | Self::Rdp { .. })
     }
 }
 
@@ -1164,7 +1314,9 @@ impl Catalog<'_> {
                 .find(|t| &t.name == n)
                 .map(Tunnel::requires)
                 .unwrap_or_default(),
-            Step::Ssh(n) => self
+            // A transfer rides the host, so it waits for exactly what a
+            // session to that host waits for.
+            Step::Ssh(n) | Step::Transfer(n) => self
                 .ssh_hosts
                 .iter()
                 .find(|h| &h.name == n)
@@ -2061,6 +2213,20 @@ pub struct App {
     pub journal: Journal,
     /// The file picker, open over whichever form asked for it.
     pub browser: Option<FileBrowser>,
+    /// The transfer browser, open over the SSH tab.
+    pub transfer: Option<TransferView>,
+    /// What each host's sftp sessions have printed, kept per host rather than
+    /// with the session so that closing the browser does not take the log of
+    /// what it did with it.
+    sftp_logs: HashMap<String, Arc<Ring>>,
+    sftp_tx: Sender<SftpMsg>,
+    sftp_rx: Receiver<SftpMsg>,
+    /// Bumped for every session opened, so an answer from one that has already
+    /// been closed is dropped rather than drawn over the one that replaced it.
+    sftp_gen: u64,
+    /// Where the local pane opens: the last directory it was left in, so a
+    /// second transfer does not start at the beginning again.
+    transfer_local: String,
     /// The list picker, open over whichever form field asked for it. The same
     /// `Ctrl+O` as the file browser, and never both at once.
     pub chooser: Option<(ChooserTarget, Chooser)>,
@@ -2099,6 +2265,7 @@ impl App {
         let app_config_terminal = app_config.ssh.terminal.clone();
         let rdp_client = rdp::resolve_client(&app_config.rdp.client);
         let (vpn_tx, vpn_rx) = channel();
+        let (sftp_tx, sftp_rx) = channel();
         let vpn_view = VpnView::new();
         let empty_ctx = FormContext {
             tunnels: &tunnels,
@@ -2156,6 +2323,12 @@ impl App {
             log_pane: None,
             journal: Journal::default(),
             browser: None,
+            transfer: None,
+            sftp_logs: HashMap::new(),
+            sftp_tx,
+            sftp_rx,
+            sftp_gen: 0,
+            transfer_local: String::new(),
             chooser: None,
             activation: None,
             conflict: None,
@@ -2182,9 +2355,15 @@ impl App {
         loop {
             terminal.draw(|f| ui::render(f, &self))?;
 
-            let timeout = tick_rate
+            let mut timeout = tick_rate
                 .checked_sub(self.last_tick.elapsed())
                 .unwrap_or(Duration::ZERO);
+            // A listing comes back on a thread, and a browser that sat on it
+            // until the next tick would answer a keystroke a second late. The
+            // shorter wait costs a redraw of a popup that is already open.
+            if self.transfer.is_some() {
+                timeout = timeout.min(Duration::from_millis(100));
+            }
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
@@ -2192,6 +2371,8 @@ impl App {
                     }
                 }
             }
+            self.drain_sftp();
+            self.poll_transfer();
             if self.last_tick.elapsed() >= tick_rate {
                 self.on_tick();
                 self.last_tick = Instant::now();
@@ -2207,6 +2388,9 @@ impl App {
                 break;
             }
         }
+        // A transfer session is a child of ours like any other: it goes when
+        // the program does, rather than being left holding a connection.
+        self.close_transfer();
         for (_, mut t) in self.active.drain() {
             t.stop();
         }
@@ -2323,9 +2507,10 @@ impl App {
         self.flash(msg, is_error);
     }
 
-    /// The line buffers a pane on `target` shows. An SSH host has none: its
-    /// session runs in a terminal window of its own, and its output stays
-    /// there — what controlcenter knows about it is in the journal instead.
+    /// The line buffers a pane on `target` shows. An SSH host has one only
+    /// once files have been moved to or from it: an interactive session runs
+    /// in a terminal window of its own and its output stays there, while an
+    /// sftp session is a child process of ours like any other.
     fn rings_for(&self, target: &LogTarget) -> Vec<&Ring> {
         let mut rings: Vec<&Ring> = Vec::new();
         for (name, a) in &self.active {
@@ -2341,6 +2526,11 @@ impl App {
         for (name, a) in &self.ovpn_active {
             if target.covers(&LogTarget::Vpn(ProviderId::Openvpn, name.clone())) {
                 rings.push(&a.log);
+            }
+        }
+        for (name, ring) in &self.sftp_logs {
+            if target.covers(&LogTarget::Ssh(name.clone())) {
+                rings.push(ring);
             }
         }
         // What a client printed itself, as opposed to what one of its sessions
@@ -2561,6 +2751,12 @@ impl App {
         }
         if self.chooser.is_some() {
             self.on_chooser_key(key);
+            return;
+        }
+        // The transfer browser is modal over the tab that opened it: its two
+        // panes take text, so every letter belongs to them.
+        if self.transfer.is_some() {
+            self.on_transfer_key(key);
             return;
         }
         // The log pane is one popup for the whole program, so it is handled
@@ -2796,6 +2992,10 @@ impl App {
             }
             // The dashboard watches everything, so its log is everything.
             KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('f') => self.flash(
+                "files move over SSH — pick the host on the SSH tab",
+                false,
+            ),
             KeyCode::Enter
             | KeyCode::Char(' ')
             | KeyCode::Char('a')
@@ -2907,6 +3107,10 @@ impl App {
                 false,
             ),
             KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('f') => self.flash(
+                "a tunnel carries the connection, not the files — transfer on the SSH tab",
+                false,
+            ),
             KeyCode::Char('c') => self.clear_finished_tunnels(),
             _ => {}
         }
@@ -3061,6 +3265,10 @@ impl App {
             }
             KeyCode::Char('p') => self.clear_vpn_password(),
             KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('f') => self.flash(
+                "a VPN carries the connection, not the files — transfer on the SSH tab",
+                false,
+            ),
             KeyCode::Char('c') => self.clear_vpn_finished(),
             _ => {}
         }
@@ -4415,6 +4623,10 @@ impl App {
                 false,
             ),
             KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('f') => self.flash(
+                "an RDP session carries its own drives — transfer on the SSH tab",
+                false,
+            ),
             KeyCode::Char('c') => {
                 // Clear a finished session entry (keeps running ones).
                 if let Some(i) = self.selected_rdp_conn() {
@@ -4768,6 +4980,7 @@ impl App {
             // another one — the same thing Enter does.
             KeyCode::Char('r') => self.open_selected_ssh(),
             KeyCode::Char('p') => self.clear_stored_password(),
+            KeyCode::Char('f') => self.open_selected_transfer(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_ssh(),
             _ => {}
@@ -5125,6 +5338,477 @@ impl App {
                 ),
             );
             self.ssh_last.insert(name, outcome);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transfers
+    //
+    // One popup, two panes, one sftp session behind the right-hand one. The
+    // pane with the focus is the source and the other is the destination, so
+    // Enter is the only key a copy needs.
+    // -----------------------------------------------------------------------
+
+    /// `f` on the SSH tab. A transfer goes through the same plan a session
+    /// does — the host is only reachable once whatever it needs is up.
+    fn open_selected_transfer(&mut self) {
+        match self.ssh_rows.get(self.ssh_selected) {
+            Some(RowItem::Item(i)) => {
+                let name = self.ssh_hosts[*i].name.clone();
+                self.activate(vec![Step::Transfer(name)]);
+            }
+            Some(RowItem::Group(_)) => self.flash(
+                "a transfer is one host at a time — pick a host",
+                false,
+            ),
+            None => self.flash("no ssh host is configured yet", true),
+        }
+    }
+
+    /// Start the session and put the browser on screen. Both panes are drawn
+    /// straight away: the local one is already usable, and the remote one says
+    /// it is connecting until sftp answers for itself.
+    fn open_transfer(&mut self, name: &str) {
+        let Some(host) = self.ssh_hosts.iter().find(|h| h.name == name).cloned() else {
+            return;
+        };
+        let target = LogTarget::Ssh(host.name.clone());
+        self.sftp_gen += 1;
+        let gen = self.sftp_gen;
+        let log = Arc::clone(
+            self.sftp_logs
+                .entry(host.name.clone())
+                .or_insert_with(|| Arc::new(Ring::new("sftp"))),
+        );
+        let session = match sftp::Session::open(
+            &host,
+            &self.ssh_password_helper,
+            gen,
+            log,
+            self.sftp_tx.clone(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.report(target, format!("'{}': {e:#}", host.name), true);
+                return;
+            }
+        };
+        self.note(
+            target,
+            format!("ran: {}", report::command_line(&session.argv)),
+        );
+        let local = FileBrowser::open(&self.transfer_local.clone());
+        self.transfer = Some(TransferView {
+            host: host.name.clone(),
+            focus: Pane::Local,
+            local,
+            // Empty until the session says where the login landed, unless the
+            // host has an answer of its own.
+            remote: RemoteBrowser::new(host.remote_dir.trim()),
+            link: Link::Connecting,
+            session: Some(session),
+            in_flight: None,
+            confirm: None,
+            opened: Instant::now(),
+        });
+    }
+
+    /// Esc: put the browser away and end the session with it. A copy still
+    /// running is cut off — that is what closing it during one means — and
+    /// what was cut is written down.
+    fn close_transfer(&mut self) {
+        let Some(view) = self.transfer.take() else {
+            return;
+        };
+        if let Some(session) = &view.session {
+            session.close();
+        }
+        // Where it was left, not what was typed into it: a half-typed name
+        // would come back as a filter on the next transfer.
+        self.transfer_local = format!(
+            "{}{}",
+            view.local.dir.display(),
+            std::path::MAIN_SEPARATOR
+        );
+        let target = LogTarget::Ssh(view.host.clone());
+        match view.in_flight {
+            Some(f) => self.report(
+                target,
+                format!("transfer browser closed — '{}' was cut off", f.what),
+                true,
+            ),
+            None => self.note(target, "transfer browser closed"),
+        }
+    }
+
+    /// Take whatever the session has said since the last look. Called from the
+    /// main loop rather than from the tick, so a listing appears as soon as it
+    /// arrives.
+    fn drain_sftp(&mut self) {
+        while let Ok(msg) = self.sftp_rx.try_recv() {
+            // Anything from a session that has been closed, or from one whose
+            // browser has been replaced, is not news any more.
+            let live = self
+                .transfer
+                .as_ref()
+                .and_then(|v| v.session.as_ref())
+                .map(|s| s.gen)
+                == Some(msg.gen);
+            if !live {
+                continue;
+            }
+            let host = self
+                .transfer
+                .as_ref()
+                .map(|v| v.host.clone())
+                .unwrap_or_default();
+            let target = LogTarget::Ssh(host);
+            match msg.kind {
+                MsgKind::Ready { cwd } => {
+                    if let Some(view) = &mut self.transfer {
+                        view.link = Link::Up;
+                        view.remote.start_at(&cwd);
+                    }
+                    self.note(target, format!("sftp session up, in {cwd}"));
+                    self.pump_remote();
+                }
+                MsgKind::Listed {
+                    dir,
+                    listing,
+                    error,
+                } => {
+                    // `ls` on a file lists the file: what was walked into was
+                    // never a directory, so back out and say so rather than
+                    // showing a folder with one thing in it.
+                    if listing.single_file(&dir) {
+                        if let Some(view) = &mut self.transfer {
+                            view.remote.cancel(&dir);
+                        }
+                        self.flash(
+                            format!("'{}' is a file — Enter on it copies it", sftp::base_name(&dir)),
+                            false,
+                        );
+                        continue;
+                    }
+                    if let Some(why) = &error {
+                        self.note(target, format!("listing {dir}: {why}"));
+                    }
+                    if let Some(view) = &mut self.transfer {
+                        view.remote.apply(&dir, listing, error);
+                    }
+                    self.pump_remote();
+                }
+                MsgKind::Transferred { error, took } => {
+                    let done = self.transfer.as_mut().and_then(|v| v.in_flight.take());
+                    let Some(f) = done else { continue };
+                    match error {
+                        Some(why) => self.report(target, format!("{}: {why}", f.what), true),
+                        None => {
+                            self.report(
+                                target,
+                                format!(
+                                    "copied {} ({}) in {}",
+                                    f.what,
+                                    ui::human_bytes(f.size),
+                                    ui::fmt_duration(took)
+                                ),
+                                false,
+                            );
+                            // What landed is not in the listing that was drawn
+                            // before it existed.
+                            self.relist(f.to);
+                        }
+                    }
+                }
+                MsgKind::Closed { error } => {
+                    if let Some(view) = &mut self.transfer {
+                        view.link = Link::Down(error.clone());
+                        view.session = None;
+                        view.in_flight = None;
+                    }
+                    self.report(target, error, true);
+                }
+            }
+        }
+    }
+
+    /// Once per pass of the main loop while the browser is open: how far a
+    /// download has got, and whether a session that never answered is worth
+    /// waiting for any longer.
+    fn poll_transfer(&mut self) {
+        if let Some(view) = &mut self.transfer {
+            if let Some(f) = &mut view.in_flight {
+                if let Some(path) = &f.watch {
+                    if let Ok(md) = std::fs::metadata(path) {
+                        f.done = md.len();
+                    }
+                }
+            }
+        }
+        let stuck = match &self.transfer {
+            Some(view) => {
+                matches!(view.link, Link::Connecting)
+                    && view.opened.elapsed() > SFTP_CONNECT_TIMEOUT
+            }
+            None => false,
+        };
+        if !stuck {
+            return;
+        }
+        let host = self.transfer.as_ref().map(|v| v.host.clone()).unwrap_or_default();
+        let why = "sftp did not answer — the host is not reachable from here".to_string();
+        if let Some(view) = &mut self.transfer {
+            if let Some(session) = view.session.take() {
+                session.close();
+            }
+            view.link = Link::Down(why.clone());
+        }
+        self.report(LogTarget::Ssh(host), why, true);
+    }
+
+    /// Ask for whatever the remote pane is now pointing at. Called after
+    /// anything that can move it, so the listing follows the typed path just
+    /// as the local browser's does.
+    fn pump_remote(&mut self) {
+        let Some(view) = &mut self.transfer else {
+            return;
+        };
+        if !matches!(view.link, Link::Up) {
+            return;
+        }
+        let want = view.remote.needs();
+        if let (Some(dir), Some(session)) = (want, view.session.as_ref()) {
+            session.list(&dir);
+        }
+    }
+
+    /// Read a pane's directory again, after something was written into it.
+    fn relist(&mut self, pane: Pane) {
+        match pane {
+            Pane::Local => {
+                if let Some(view) = &mut self.transfer {
+                    view.local.refresh();
+                }
+            }
+            Pane::Remote => {
+                if let Some(view) = &mut self.transfer {
+                    view.remote.mark_stale();
+                }
+                self.pump_remote();
+            }
+        }
+    }
+
+    fn on_transfer_key(&mut self, key: KeyEvent) {
+        // The overwrite question is modal over the browser under it.
+        if self.transfer.as_ref().is_some_and(|v| v.confirm.is_some()) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let copy = self.transfer.as_mut().and_then(|v| v.confirm.take());
+                    if let Some(copy) = copy {
+                        self.begin_copy(copy);
+                    }
+                }
+                _ => {
+                    if let Some(view) = &mut self.transfer {
+                        view.confirm = None;
+                    }
+                }
+            }
+            return;
+        }
+        match key.code {
+            // Both panes take text, so `q` is a letter here and Esc is the
+            // only way out — the same rule every form in the program follows.
+            KeyCode::Esc => {
+                self.close_transfer();
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(view) = &mut self.transfer {
+                    view.focus = view.focus.other();
+                }
+            }
+            KeyCode::Enter => self.transfer_enter(),
+            KeyCode::Up => self.move_transfer(-1),
+            KeyCode::Down => self.move_transfer(1),
+            KeyCode::PageUp => self.move_transfer(-10),
+            KeyCode::PageDown => self.move_transfer(10),
+            KeyCode::Left => {
+                if let Some(view) = &mut self.transfer {
+                    match view.focus {
+                        Pane::Local => view.local.ascend(),
+                        Pane::Remote => view.remote.ascend(),
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(view) = &mut self.transfer {
+                    match view.focus {
+                        Pane::Local => view.local.descend(),
+                        Pane::Remote => view.remote.descend(),
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(view) = &mut self.transfer {
+                    match view.focus {
+                        Pane::Local => view.local.backspace(),
+                        Pane::Remote => view.remote.backspace(),
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(view) = &mut self.transfer {
+                    match view.focus {
+                        Pane::Local => view.local.push(c),
+                        Pane::Remote => view.remote.push(c),
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.pump_remote();
+    }
+
+    fn move_transfer(&mut self, by: isize) {
+        let Some(view) = &mut self.transfer else {
+            return;
+        };
+        for _ in 0..by.unsigned_abs() {
+            match (view.focus, by > 0) {
+                (Pane::Local, true) => view.local.down(),
+                (Pane::Local, false) => view.local.up(),
+                (Pane::Remote, true) => view.remote.down(),
+                (Pane::Remote, false) => view.remote.up(),
+            }
+        }
+    }
+
+    /// Enter in the browser: walk into a folder, or copy what is selected to
+    /// the directory the other pane is showing.
+    ///
+    /// Worked out first and acted on afterwards, because deciding needs the
+    /// view and saying so needs the rest of the application.
+    fn transfer_enter(&mut self) {
+        let outcome = self.plan_copy();
+        match outcome {
+            CopyPlan::Nothing => {}
+            CopyPlan::Descended => self.pump_remote(),
+            CopyPlan::Refused(why, bad) => self.flash(why, bad),
+            CopyPlan::Ask(copy) => {
+                if let Some(view) = &mut self.transfer {
+                    view.confirm = Some(copy);
+                }
+            }
+            CopyPlan::Go(copy) => self.begin_copy(copy),
+        }
+    }
+
+    /// What Enter in the browser amounts to, decided with the view in hand.
+    fn plan_copy(&mut self) -> CopyPlan {
+        let Some(view) = &mut self.transfer else {
+            return CopyPlan::Nothing;
+        };
+        let to = view.focus.other();
+        let connected = matches!(view.link, Link::Up);
+        if view.in_flight.is_some() {
+            return CopyPlan::Refused("one copy at a time — this one is still running".into(), false);
+        }
+        let copy = match view.focus {
+            Pane::Local => {
+                if !connected {
+                    return CopyPlan::Refused("the remote side is not connected".into(), true);
+                }
+                // A folder is walked into; anything else — and a path typed
+                // into a listing that matched nothing — is what to send.
+                let Some(path) = view.local.accept() else {
+                    return CopyPlan::Nothing;
+                };
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                PendingCopy {
+                    to,
+                    dst: sftp::join_remote(&view.remote.dir, &name),
+                    src: path,
+                    name,
+                    size,
+                }
+            }
+            Pane::Remote => {
+                if !connected {
+                    return CopyPlan::Refused("the remote side is not connected".into(), true);
+                }
+                let Some(entry) = view.remote.selected_entry().cloned() else {
+                    return CopyPlan::Refused("nothing to copy".into(), false);
+                };
+                if entry.is_dir() {
+                    view.remote.descend();
+                    return CopyPlan::Descended;
+                }
+                // A symlink is copied rather than walked into: `→` is the key
+                // that tries to walk into one, and what it points at decides
+                // whether that works.
+                let src = sftp::join_remote(&view.remote.dir, &entry.name);
+                PendingCopy {
+                    to,
+                    dst: view
+                        .local
+                        .dir
+                        .join(&entry.name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    src,
+                    name: entry.name,
+                    size: entry.size,
+                }
+            }
+        };
+        // What is already there is what the listings say is there: neither
+        // side is asked again for something it has only just told us.
+        let clash = match to {
+            Pane::Local => std::path::Path::new(&copy.dst).exists(),
+            Pane::Remote => view.remote.all.iter().any(|e| e.name == copy.name),
+        };
+        if clash {
+            CopyPlan::Ask(copy)
+        } else {
+            CopyPlan::Go(copy)
+        }
+    }
+
+    /// Send the copy and start watching it.
+    fn begin_copy(&mut self, copy: PendingCopy) {
+        let what = copy.what();
+        let sent = match &mut self.transfer {
+            Some(view) => match view.session.as_ref() {
+                Some(session) => {
+                    match copy.to {
+                        Pane::Remote => session.put(&copy.src, &copy.dst),
+                        Pane::Local => session.get(&copy.src, &copy.dst),
+                    }
+                    view.in_flight = Some(InFlight {
+                        what: what.clone(),
+                        to: copy.to,
+                        size: copy.size,
+                        // Only a download is a file of ours to watch grow.
+                        watch: matches!(copy.to, Pane::Local)
+                            .then(|| PathBuf::from(&copy.dst)),
+                        done: 0,
+                        started: Instant::now(),
+                    });
+                    Some(view.host.clone())
+                }
+                None => None,
+            },
+            None => None,
+        };
+        match sent {
+            Some(host) => self.note(LogTarget::Ssh(host), format!("copying {what}")),
+            None => self.flash("the remote side is not connected", true),
         }
     }
 
@@ -5505,7 +6189,7 @@ impl App {
                 None => StepState::Waiting,
             },
             // Terminal steps are never waited on.
-            Step::Ssh(_) | Step::Rdp { .. } => StepState::Ready,
+            Step::Ssh(_) | Step::Transfer(_) | Step::Rdp { .. } => StepState::Ready,
         }
     }
 
@@ -5637,6 +6321,14 @@ impl App {
                     StartOutcome::Failed(format!("ssh host '{name}' is gone"))
                 }
             }
+            Step::Transfer(name) => {
+                if self.ssh_hosts.iter().any(|h| &h.name == name) {
+                    self.open_transfer(&name.clone());
+                    StartOutcome::Started
+                } else {
+                    StartOutcome::Failed(format!("ssh host '{name}' is gone"))
+                }
+            }
             Step::Rdp { name, password } => {
                 self.spawn_rdp(&name.clone(), &password.clone());
                 StartOutcome::Started
@@ -5718,7 +6410,7 @@ impl App {
                     note: None,
                 })
             }
-            Step::Ssh(_) => None,
+            Step::Ssh(_) | Step::Transfer(_) => None,
         }
     }
 
@@ -6588,6 +7280,7 @@ mod tests {
             extra_args: String::new(),
             depends_on: dep.into(),
             requires_vpn: vpn.into(),
+            remote_dir: String::new(),
         }
     }
 

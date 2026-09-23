@@ -136,10 +136,15 @@ skip_host_key_check = true         # StrictHostKeyChecking=no + no known_hosts
 extra_args = "-A"                  # optional, passed to ssh verbatim
 requires_vpn = "wireguard:home"    # optional, see connections.md
 depends_on = "prod-db"             # optional, tunnel to bring up first
+remote_dir = "/srv/app"            # optional, where f opens the remote pane
 ```
 
 `skip_host_key_check` is there for tunnelled localhost targets, where the key changes with
 whatever is on the far end of the tunnel.
+
+`remote_dir` is only a starting point for the transfer browser (`f`); left empty it opens
+wherever the login lands, and you can walk anywhere from there. See
+[connections.md](connections.md#transferring-files).
 
 An entry here is not only an interactive login: a tunnel can name it as its `ssh_host`,
 and then runs with everything set here — see

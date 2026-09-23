@@ -524,6 +524,7 @@ mod tests {
             extra_args: "-A".into(),
             depends_on: String::new(),
             requires_vpn: String::new(),
+            remote_dir: String::new(),
         }
     }
 

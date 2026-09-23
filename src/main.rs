@@ -6,6 +6,7 @@ mod logs;
 mod platform;
 mod rdp;
 mod report;
+mod sftp;
 mod ssh;
 mod theme;
 mod tunnel;

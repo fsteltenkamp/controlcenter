@@ -472,6 +472,21 @@ fn ssh_block(out: &mut String, app: &App, h: &SshHost) {
         "command",
         redact(&ssh::command_preview(h, &app.ssh_password_helper)),
     );
+    // What a transfer would run, from the same function that runs it.
+    field(
+        out,
+        "transfers",
+        command_line(&crate::sftp::command_line(h, &app.ssh_password_helper)),
+    );
+    field(
+        out,
+        "transfers start in",
+        if h.remote_dir.is_empty() {
+            "wherever the login lands".to_string()
+        } else {
+            h.remote_dir.clone()
+        },
+    );
     field(out, "windows open", app.ssh_windows_open(&h.name).to_string());
     match app.ssh_last.get(&h.name) {
         Some(o) => field(

@@ -236,6 +236,10 @@ pub struct SshHost {
     /// VPN profile that must be active first. Empty = none, `*` = any profile.
     #[serde(default)]
     pub requires_vpn: String,
+    /// Where the transfer browser's remote pane opens. Empty = wherever the
+    /// login lands, which is the host's own answer to the question.
+    #[serde(default)]
+    pub remote_dir: String,
 }
 
 pub fn default_ssh_port() -> u16 {

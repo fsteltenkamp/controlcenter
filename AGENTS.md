@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 211 tests, all pure unit tests — no network, no root
+cargo test             # 227 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -48,6 +48,7 @@ so those still need the CI job or a real machine.
 | `src/report.rs` | the report `s` exports, and the redaction every line goes through |
 | `src/tunnel.rs` | spawning ssh, the counting relay, per-tunnel status |
 | `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline |
+| `src/sftp.rs` | the one `sftp` process a transfer browser talks to, the listing it parses, and the remote pane's state |
 | `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
 | `src/browser.rs` | the file picker |
 | `src/chooser.rs` | the list picker — groups as folders, entries as files |
@@ -130,12 +131,44 @@ justify a decision that would otherwise look arbitrary — why WireGuard is poll
 rather than `wg show`, why openvpn is stopped through a pid file. Do not add comments that
 restate the code.
 
+**A transfer is a session, not a command per file.** `sftp.rs` holds one `sftp` process
+per open transfer browser and talks to it on its stdin, because listing a directory and
+copying out of it are the same conversation: one authentication, no handshake between
+keystrokes, and a password asked for once or never. `ControlMaster` would have done the
+same on Unix and nothing at all on Windows. Three things about sftp's own interface carry
+the whole protocol, and none of them is incidental:
+
+- reading commands from a pipe it echoes each one back prefixed with `sftp> `, so what
+  comes home is recognisable as ours
+- a command prefixed with `-` does not end the session when it fails, which is what keeps
+  a typo'd path from costing the connection — every command we send has it
+- `pwd`'s reply cannot be produced by a listing, so every command is followed by one and
+  its reply is where that command's output ends
+
+Two things were established against a real server rather than reasoned about, and a change
+here should be too: the progress meter is *on* by default on a pipe, so it is turned off
+with the `progress` command, which toggles — what it prints is checked rather than
+assumed; and `ls` echoes each entry the way it was asked for, so listing by absolute path
+gives absolute paths back and the pane reads the last segment. Errors arrive on stderr,
+out of step with the stdout being parsed, so a thread collects them and they are read once
+the marker says the command is done — and `Connected to` and `Warning:` are not errors, or
+every empty directory would report one.
+
+**A transfer belongs to the host, not to itself.** It gets no `LogTarget` of its own: it
+writes to `LogTarget::Ssh(name)`, so `l` on the host shows it and a report on the host
+covers it without a new section. Its ring lives in `App::sftp_logs`, keyed by host rather
+than held by the session, so closing the browser does not take the record of what it did
+with it. `Step::Transfer` requires exactly what `Step::Ssh` requires, which is why a host
+behind a VPN and a tunnel can be browsed at all.
+
 **A configured SSH host becomes a command line in one place.** A tunnel's `ssh_host` is
 either a destination ssh resolves or `ssh:<name>`, an entry from `ssh.toml`
 (`types::parse_ssh_target`). Where it is an entry, everything that entry says about
 reaching the host comes from `ssh::connection_args` — the same function an interactive
 session uses — so a field added to `SshHost` reaches tunnels and sessions together or
-neither. What the entry needs for itself is folded into the tunnel's plan by
+neither. `ssh::transfer_args` is that function again for `sftp` — the same options with the port
+flag swapped, by position and never by search, because `extra_args` is free text and may
+hold a `-p` of its own. What the entry needs for itself is folded into the tunnel's plan by
 `Catalog::requires_of`, which returns one `Requires` per source rather than merging them:
 a tunnel and the host it rides can each name a tunnel, and both have to be up.
 

@@ -187,6 +187,53 @@ waits before closing so the error stays readable. Its output belongs to that win
 `l` on the SSH tab shows what controlcenter knows instead: the command line it ran, where
 the session opened, and how it ended — see [logs.md](logs.md).
 
+## Transferring files
+
+`f` on an SSH host opens a two-pane browser — this machine on the left, the host on the
+right — over a single `sftp` session to that host. It is opened through the same plan a
+session is: whatever the host requires is brought up first, and a transfer to a host
+behind a VPN and a tunnel works for the same reason a login to it does.
+
+The keys are the file picker's keys:
+
+| | |
+| --- | --- |
+| `Tab` | the other pane |
+| `↑` `↓` `PgUp` `PgDn` | select |
+| typing | filter the listing, or type a path outright |
+| `→` | open the folder under the cursor |
+| `←` | up one level |
+| `Enter` | a folder: walk into it. Anything else: **copy it to the other pane's directory** |
+| `Esc` | close the browser — `q` is a letter here, because the panes take text |
+
+The pane with the focus is where a copy comes *from*, and the other pane's directory is
+where it lands, so the direction is always visible and there is no separate upload and
+download to confuse. A file that is already there at the far end is asked about before it
+is overwritten. One copy runs at a time; closing the browser during one cuts it off, and
+says so in the log.
+
+The session is `sftp` run with exactly what the host entry says — port, user, key,
+password, `skip_host_key_check`, extra args — which is what a login to the same host runs
+with. Nothing needs to be in `~/.ssh/config`, and there is no `scp` command line to get
+right.
+
+Two things follow from there being no terminal to ask at:
+
+- a host with **no stored password** runs with `BatchMode=yes`, so a key, an agent or a
+  stored password is what makes a transfer work. Anything that would have been a prompt —
+  a password, an unknown host key — becomes an error in the log rather than a session
+  that hangs
+- a session that never answers is given up on after twenty seconds
+
+A download shows how far it has got, because the file is on this machine and growing. An
+upload shows its size and how long it has been running: `sftp` on a pipe does not report
+the far end's progress, and a number that was made up here would be worth less than the
+clock. Every command and every outcome goes into the host's log (`l`) and its report
+(`s`) — see [logs.md](logs.md).
+
+A symlink is listed with `→`. `Enter` copies what it points at; `→` tries to walk into it,
+and says so if it is not a directory.
+
 ## Passwords
 
 Storing an SSH password is optional and asks for confirmation first, because it is written
