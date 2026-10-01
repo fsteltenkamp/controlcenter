@@ -248,6 +248,22 @@ sudo ticket described under [Root](#root). Without a ticket that `sudo` has no t
 ask on and the CLI reports it as `failed to start subprocess`, so the panel adds what it
 actually needed.
 
+Every connect asks `pangolin auth status` before the `up`, after the account is selected —
+the check only ever speaks for the selected account. A session the server has turned
+down, expired or revoked, stops the connect there and raises a **login required** popup.
+`Enter` on it hands this terminal to `pangolin login <server>` against that account's own
+server, the same way an inline SSH session takes it, and connects again once the login has
+succeeded. When the server cannot be reached the check says so in the log and the connect
+goes ahead: the tunnel runs on credentials of its own, and an `up` that fails will say why.
+Everything the CLI prints along the way goes into the client's log, so `l` and `s` show
+pangolin's own words and not only the line that ended the attempt.
+
+At start controlcenter asks `pangolin version`. Pangolin is reached past its CLI, through
+its control socket and its account store, so each build is checked against one release and
+names it in reports as `supported`. An older client raises an **update available** popup
+once per start; `Enter` hands the terminal to `pangolin update`, and `q` or `Esc` leaves it
+for this session. A newer client is not mentioned.
+
 ## Connections controlcenter is not holding
 
 A session can outlive the program that started it — a crash, a `kill -9`, an exit while

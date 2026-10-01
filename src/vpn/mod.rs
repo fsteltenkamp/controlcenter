@@ -232,6 +232,13 @@ pub enum VpnMsg {
         waiting: Option<Verification>,
         error: Option<String>,
     },
+    /// The installed client is older than the release this build was checked
+    /// against. Sent once, at most, per check.
+    Outdated {
+        provider: ProviderId,
+        installed: String,
+        supported: &'static str,
+    },
     /// What is on the machine, whoever started it. Belongs to no one client.
     Scanned(scan::Scan),
 }
@@ -290,7 +297,7 @@ pub fn connect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::connect(tx, profile, Arc::clone(env.log))),
-        ProviderId::Pangolin => pangolin::connect(tx, profile),
+        ProviderId::Pangolin => pangolin::connect(tx, profile, Arc::clone(env.log)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::connect(
@@ -318,6 +325,23 @@ pub fn connect(
     }
 }
 
+/// Ask the installed client whether it is older than the release this build was
+/// checked against; the answer, if it is, arrives as [`VpnMsg::Outdated`].
+///
+/// Only pangolin pins one. It is the client reached past its CLI — through its
+/// control socket and its account store, neither of which is a published
+/// interface with a promise behind it — so it is the one whose older releases
+/// this build cannot vouch for.
+pub fn check_version(p: ProviderId, tx: Sender<VpnMsg>) {
+    match p {
+        ProviderId::Pangolin => pangolin::check_version(tx),
+        ProviderId::Netbird
+        | ProviderId::Wireguard
+        | ProviderId::Openvpn
+        | ProviderId::Tailscale => {}
+    }
+}
+
 /// Take the provider down. `profile` matters only where more than one can be up.
 pub fn disconnect(
     p: ProviderId,
@@ -327,7 +351,7 @@ pub fn disconnect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::disconnect(tx, Arc::clone(env.log))),
-        ProviderId::Pangolin => Ok(pangolin::disconnect(tx)),
+        ProviderId::Pangolin => Ok(pangolin::disconnect(tx, Arc::clone(env.log))),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::disconnect(

@@ -36,43 +36,154 @@
 //!   poll stays unprivileged by construction, like every other client's.
 
 use super::{ProviderId, VpnMsg, VpnProfile, VpnStatus};
+use crate::logs::Ring;
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::mpsc::Sender;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const ME: ProviderId = ProviderId::Pangolin;
 
+/// The pangolin release this build was last checked against: the status reply,
+/// the account store and the wording [`parse_login`] reads were all confirmed on
+/// it. The client is expected to be kept current, so an older one is offered an
+/// update rather than accommodated — raise this when the integration has been
+/// checked against a newer release, never to silence the prompt.
+pub const SUPPORTED: &str = "0.18.0";
+
 /// The sudo `pangolin up` runs for itself cannot prompt from inside the TUI.
 const SUDO_HINT: &str = "pangolin escalates itself; controlcenter's sudo ticket is what lets it \
                          (set vpn.sudo = \"ask\" in config.toml, or run `sudo -v` first)";
 
-fn run(args: &[&str]) -> Result<String, String> {
+fn exec(args: &[&str]) -> Result<Output, String> {
     let mut cmd = Command::new(crate::platform::program("pangolin"));
     #[cfg(windows)]
     {
         crate::platform::hidden(&mut cmd);
     }
-    let out = cmd
-        .args(args)
+    cmd.args(args)
         .output()
-        .map_err(|e| format!("running pangolin: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    if out.status.success() {
-        Ok(stdout)
+        .map_err(|e| format!("running pangolin: {e}"))
+}
+
+/// Stdout on success; on failure, whatever the CLI said about it.
+fn judge(args: &[&str], status: ExitStatus, stdout: &str, stderr: &str) -> Result<String, String> {
+    if status.success() {
+        Ok(stdout.to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&out.stderr);
         let msg = stderr.trim();
         let msg = if msg.is_empty() { stdout.trim() } else { msg };
         Err(if msg.is_empty() {
-            format!("pangolin {} failed ({})", args.join(" "), out.status)
+            format!("pangolin {} failed ({status})", args.join(" "))
         } else {
             msg.to_string()
         })
     }
+}
+
+fn run(args: &[&str]) -> Result<String, String> {
+    let out = exec(args)?;
+    judge(
+        args,
+        out.status,
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// Put what a command printed into the client's log ring, both streams, so a
+/// report on an action has the CLI's own words and not only the line that ended
+/// it.
+fn record(log: &Ring, out: &Output) {
+    for stream in [&out.stdout, &out.stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            let line = line.trim_end();
+            if !line.trim().is_empty() {
+                log.push(line.to_string());
+            }
+        }
+    }
+}
+
+/// How long a command's output is still read once the command itself has
+/// exited. Long enough for the last lines to arrive, short enough not to be
+/// felt — see [`run_logged`].
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Run a command that changes something, with its output going into `log` as
+/// it is printed.
+///
+/// Waits for the *command*, not for its output to end. `pangolin up` starts the
+/// client as `sudo sh -c "nohup pangolin up client … &"`, and that root `sh`
+/// keeps the stdout and stderr it was handed for as long as the client runs —
+/// so `Command::output`, which reads until every holder of the pipes has let
+/// go, would not come back until the VPN went down, leaving the tab on
+/// "bringing up" over a client that had been connected for minutes. So the
+/// exit is what ends it, and the output is read for [`DRAIN_GRACE`] after.
+/// A reader still blocked then is left behind on its pipe and ends when the
+/// client does; it holds nothing but the pipe.
+fn run_logged(args: &[&str], log: &Arc<Ring>) -> Result<String, String> {
+    let mut cmd = Command::new(crate::platform::program("pangolin"));
+    #[cfg(windows)]
+    {
+        crate::platform::hidden(&mut cmd);
+    }
+    cmd.args(args);
+    wait_logged(cmd, args, log)
+}
+
+/// [`run_logged`]'s waiting, apart from which program it waits on, so the
+/// tests can hand it a command that leaves its pipes behind the way `up` does.
+fn wait_logged(mut cmd: Command, args: &[&str], log: &Arc<Ring>) -> Result<String, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running pangolin: {e}"))?;
+
+    let (done_tx, done_rx) = channel();
+    let collect = |pipe: Option<Box<dyn Read + Send>>| {
+        let said = Arc::new(Mutex::new(String::new()));
+        if let Some(pipe) = pipe {
+            let (log, said, done) = (Arc::clone(log), Arc::clone(&said), done_tx.clone());
+            thread::spawn(move || {
+                for line in BufReader::new(pipe).split(b'\n').map_while(Result::ok) {
+                    let line = String::from_utf8_lossy(&line);
+                    let line = line.trim_end();
+                    if !line.trim().is_empty() {
+                        log.push(line.to_string());
+                    }
+                    let mut said = said.lock().unwrap();
+                    said.push_str(line);
+                    said.push('\n');
+                }
+                let _ = done.send(());
+            });
+        }
+        said
+    };
+    let out = collect(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = collect(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    drop(done_tx);
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("waiting for pangolin: {e}"))?;
+    let deadline = Instant::now() + DRAIN_GRACE;
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if done_rx.recv_timeout(left).is_err() {
+            break;
+        }
+    }
+    let stdout = out.lock().unwrap().clone();
+    let stderr = err.lock().unwrap().clone();
+    judge(args, status, &stdout, &stderr)
 }
 
 /// Say what a failed `up` actually needs, because the CLI reports its own sudo
@@ -87,6 +198,17 @@ fn with_sudo_hint(e: String) -> String {
     } else {
         e
     }
+}
+
+/// The last non-empty line of what a command printed.
+///
+/// Any command can be preceded on stdout by a one-time notice or an "a new
+/// version is available" banner, and the answer is what it prints last.
+fn last_line(out: &str) -> Option<&str> {
+    out.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +316,19 @@ fn running() -> Result<bool, String> {
 /// switch that did not wait would take the old account down and then fail to
 /// bring the new one up, leaving the tab showing an account that is selected
 /// over a tunnel that is not there.
-fn stop() -> Result<(), String> {
+///
+/// Pangolin's own CLI refuses to stop a client its desktop app started. This
+/// stops it anyway — a stop has to stop — but asks first whose it is, so the log
+/// says which program's connection was taken down.
+fn stop(log: &Ring) -> Result<(), String> {
+    if let Ok(Some(body)) = control("GET", "/status") {
+        let agent = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| str_at(&v, "agent").map(str::to_string));
+        if let Some(agent) = agent {
+            log.push(format!("stopping the client {agent} started"));
+        }
+    }
     if control("POST", "/exit")?.is_none() {
         // Nothing was running. Being asked to stop it again is not a failure.
         return Ok(());
@@ -229,26 +363,21 @@ pub struct Account {
 /// Where the CLI keeps its accounts. Asked of the CLI rather than assumed: the
 /// directory is not the same on every system and `config path` is the only
 /// statement of it that cannot drift.
+///
+/// Asked once and kept, because [`connect`] needs it on the UI thread and a
+/// subprocess there is a stall. The first background poll is what fills it, so
+/// in practice the UI thread only ever reads it.
 fn store_path() -> Result<PathBuf, String> {
+    static STORE: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = STORE.get() {
+        return Ok(path.clone());
+    }
     let out = run(&["config", "path"])?;
-    let cfg = PathBuf::from(config_path_line(&out)?);
+    let cfg = PathBuf::from(last_line(&out).ok_or("pangolin config path printed nothing")?);
     let dir = cfg
         .parent()
         .ok_or("pangolin config path named no directory")?;
-    Ok(dir.join("accounts.json"))
-}
-
-/// The path out of what `pangolin config path` printed.
-///
-/// The last line rather than the whole of it: any command can be preceded on
-/// stdout by a one-time notice or an "a new version is available" banner, and
-/// the answer is what it prints last.
-fn config_path_line(out: &str) -> Result<&str, String> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
-        .ok_or_else(|| "pangolin config path printed nothing".to_string())
+    Ok(STORE.get_or_init(|| dir.join("accounts.json")).clone())
 }
 
 /// The accounts and which one is selected. Order is the store's map order, which
@@ -564,6 +693,50 @@ pub fn refresh(tx: Sender<VpnMsg>) {
     });
 }
 
+/// What `pangolin auth status` says about the selected account's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Login {
+    Valid,
+    /// The server turned the session down. The CLI still says "logged in"
+    /// beside it and still exits 0, because it falls back to the account data it
+    /// has on disk.
+    Expired,
+    /// There is no account to be logged in as.
+    Missing,
+    /// The server could not be asked. Not a reason to refuse: the tunnel runs
+    /// on credentials of its own, and an `up` that fails will say why.
+    Unknown,
+}
+
+/// Read the session out of `auth status`. Its exit code only tells *logged out*
+/// apart from the rest, so the wording has to be read; every case here was
+/// produced against a real server rather than reasoned about.
+fn parse_login(exited_ok: bool, out: &str) -> Login {
+    let low = out.to_ascii_lowercase();
+    if low.contains("not logged in") {
+        Login::Missing
+    } else if low.contains("unauthorized") || low.contains("try logging in again") {
+        Login::Expired
+    } else if !exited_ok
+        || low.contains("cached account data")
+        || low.contains("server appears to be down")
+    {
+        Login::Unknown
+    } else if low.contains("logged in") {
+        Login::Valid
+    } else {
+        Login::Unknown
+    }
+}
+
+/// Why an action stopped. A missing login is its own case because it is the
+/// one failure with a remedy controlcenter can hand the person — see
+/// [`login_args`].
+enum Failure {
+    Failed(String),
+    Login(String),
+}
+
 /// One thing an action takes. Not all of them are commands: making room for a
 /// new client means waiting until the old one is *gone*, and only the control
 /// socket can say when that is true.
@@ -573,6 +746,9 @@ pub enum Step {
     Run(Vec<String>),
     /// Stop whatever client is running, and wait for it to finish going away.
     Stop,
+    /// `pangolin auth status`, and refuse to go on if the server has turned the
+    /// selected account's session down.
+    CheckLogin,
 }
 
 impl Step {
@@ -583,76 +759,148 @@ impl Step {
         match self {
             Self::Run(args) => format!("pangolin {}", args.join(" ")),
             Self::Stop => format!("POST /exit → {CONTROL}"),
+            Self::CheckLogin => "pangolin auth status".to_string(),
         }
     }
 
-    fn perform(&self) -> Result<(), String> {
+    fn perform(&self, log: &Arc<Ring>) -> Result<(), Failure> {
         match self {
             Self::Run(args) => {
                 let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-                run(&argv).map(|_| ())
+                run_logged(&argv, log)
+                    .map(|_| ())
+                    .map_err(|e| Failure::Failed(with_sudo_hint(e)))
             }
-            Self::Stop => stop(),
+            Self::Stop => stop(log).map_err(Failure::Failed),
+            Self::CheckLogin => {
+                let out = exec(&["auth", "status"]).map_err(Failure::Failed)?;
+                record(log, &out);
+                let said = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                match parse_login(out.status.success(), &said) {
+                    Login::Valid => Ok(()),
+                    Login::Unknown => {
+                        log.push("could not confirm the login with the server — trying anyway");
+                        Ok(())
+                    }
+                    Login::Expired => Err(Failure::Login(
+                        "the server rejected the session — it has expired or was revoked".into(),
+                    )),
+                    Login::Missing => Err(Failure::Login("pangolin is not logged in".into())),
+                }
+            }
         }
     }
 }
 
+/// The selected account's row name, for a login failure on a plain connect that
+/// was not told which account it was for.
+fn selected_name() -> Option<String> {
+    let (accounts, active) = accounts_now().ok()?;
+    let active = active?;
+    accounts
+        .iter()
+        .find(|a| a.user_id == active)
+        .map(|a| display_name(a, &accounts))
+}
+
 /// Run a sequence of steps, stopping at the first failure, then refresh.
-pub fn action(tx: Sender<VpnMsg>, desc: String, steps: Vec<Step>) {
+///
+/// Everything the CLI prints goes into `log` as it is run. A login the server
+/// will not accept is reported twice over, as netbird's is: as the action's
+/// failure, and as [`VpnMsg::LoginNeeded`], which is what raises the popup that
+/// offers to log in again.
+pub fn action(
+    tx: Sender<VpnMsg>,
+    desc: String,
+    steps: Vec<Step>,
+    profile: Option<String>,
+    log: Arc<Ring>,
+) {
     thread::spawn(move || {
-        let mut error = None;
+        let mut failure = None;
         for step in &steps {
-            if let Err(e) = step.perform() {
-                error = Some(with_sudo_hint(e));
+            if let Err(f) = step.perform(&log) {
+                failure = Some(f);
                 break;
             }
         }
+        let error = match &failure {
+            Some(Failure::Failed(e) | Failure::Login(e)) => Some(e.clone()),
+            None => None,
+        };
         let _ = tx.send(VpnMsg::ActionDone {
             provider: ME,
             desc,
             error,
         });
+        if let Some(Failure::Login(e)) = failure {
+            let _ = tx.send(VpnMsg::LoginNeeded {
+                provider: ME,
+                profile: profile.or_else(selected_name).unwrap_or_default(),
+                waiting: None,
+                error: Some(e),
+            });
+        }
         refresh(tx);
     });
 }
 
-/// What bringing an account up takes, given whether a client is already running.
+/// What bringing an account up takes.
 ///
 /// The stop comes first and is not optional. `pangolin up` refuses outright
 /// while a client is running, and `pangolin select account` shuts one down
 /// itself the moment the selection changes — without waiting for it to be gone.
 /// Left to those two, switching accounts reliably ends with the old account
-/// down, the `up` refused, and nothing connected at all. Doing the stop here is
-/// also what puts it in the log beside the rest of the switch.
+/// down, the `up` refused, and nothing connected at all. It is in every plan
+/// rather than only when a client was seen running, because asking first would
+/// be a socket round trip on the UI thread, and a stop with nothing to stop
+/// costs one refused connection.
+///
+/// The login check comes after the selection, because `auth status` only ever
+/// speaks for the selected account, and before the `up`, because an `up` on a
+/// dead session fails in words that do not say so.
 ///
 /// `--silent` on the `up` is not optional either: without it a detached `up`
 /// draws a progress view of its own into the terminal controlcenter is holding.
-pub fn connect_plan(account: Option<&Account>, client_running: bool) -> Vec<Step> {
-    let mut steps = Vec::new();
-    if client_running {
-        steps.push(Step::Stop);
-    }
+pub fn connect_plan(account: Option<&Account>) -> Vec<Step> {
+    let mut steps = vec![Step::Stop];
     if let Some(a) = account {
-        let mut select = vec![
-            "select".to_string(),
-            "account".to_string(),
-            "-a".to_string(),
-            a.email.clone(),
-        ];
-        // Two logins can share an email on different hosts; the host is what
-        // makes the selection exact.
-        if !a.host.is_empty() {
-            select.push("--host".into());
-            select.push(a.host.clone());
-        }
-        steps.push(Step::Run(select));
+        steps.push(Step::Run(select_args(a)));
     }
+    steps.push(Step::CheckLogin);
     steps.push(Step::Run(vec!["up".into(), "--silent".into()]));
     steps
 }
 
+/// `select account` for exactly this account. Never without `-a`: with nothing
+/// to match, the CLI opens a menu on `/dev/tty`, which from here is
+/// controlcenter's own terminal.
+fn select_args(a: &Account) -> Vec<String> {
+    let mut select = vec![
+        "select".to_string(),
+        "account".to_string(),
+        "-a".to_string(),
+        a.email.clone(),
+    ];
+    // Two logins can share an email on different hosts, and a search that
+    // matches both opens the same menu; the host is what makes it exact.
+    if !a.host.is_empty() {
+        select.push("--host".into());
+        select.push(a.host.clone());
+    }
+    select
+}
+
 /// Bring an account up. Returns what it launched, for the log.
-pub fn connect(tx: Sender<VpnMsg>, profile: Option<&str>) -> Result<Vec<String>, String> {
+pub fn connect(
+    tx: Sender<VpnMsg>,
+    profile: Option<&str>,
+    log: Arc<Ring>,
+) -> Result<Vec<String>, String> {
     let account = match profile {
         Some(name) => {
             let (accounts, _) = accounts_now()?;
@@ -666,19 +914,79 @@ pub fn connect(tx: Sender<VpnMsg>, profile: Option<&str>) -> Result<Vec<String>,
         Some(a) => format!("switching to account '{}'", a.email),
         None => "connecting".to_string(),
     };
-    // A socket that cannot be reached at all is no reason to refuse to try: the
-    // worst it costs is the `up` below saying a client is already running.
-    let steps = connect_plan(account.as_ref(), running().unwrap_or(false));
+    let steps = connect_plan(account.as_ref());
     let ran = steps.iter().map(Step::describe).collect();
-    action(tx, desc, steps);
+    action(tx, desc, steps, profile.map(str::to_string), log);
     Ok(ran)
 }
 
-pub fn disconnect(tx: Sender<VpnMsg>) -> Vec<String> {
+pub fn disconnect(tx: Sender<VpnMsg>, log: Arc<Ring>) -> Vec<String> {
     let steps = vec![Step::Stop];
     let ran = steps.iter().map(Step::describe).collect();
-    action(tx, "disconnecting".into(), steps);
+    action(tx, "disconnecting".into(), steps, None, log);
     ran
+}
+
+/// What logs an account in again: `pangolin login` against the account's own
+/// host, so the person is not asked which server they meant. It is interactive
+/// — it asks and it opens a browser — so it is run on the terminal, with the TUI
+/// out of the way, never from a thread.
+pub fn login_args(profile: &str) -> Vec<String> {
+    let account = accounts_now()
+        .ok()
+        .and_then(|(accounts, _)| find_account(&accounts, profile));
+    login_args_for(account.as_ref())
+}
+
+fn login_args_for(account: Option<&Account>) -> Vec<String> {
+    let mut args = vec!["login".to_string()];
+    args.extend(account.map(|a| a.host.clone()).filter(|h| !h.is_empty()));
+    args
+}
+
+/// What updates the client. Its own updater, because the CLI is installed by a
+/// script rather than a package manager, and run on the terminal for the same
+/// reason as [`login_args`]: it may ask for a password to replace the binary.
+pub fn update_args() -> Vec<String> {
+    vec!["update".to_string()]
+}
+
+/// A version as numbers, for comparing. A leading `v` and a pre-release suffix
+/// are dropped; anything else that is not a number makes it unreadable.
+fn version_parts(v: &str) -> Option<Vec<u64>> {
+    let v = v.trim().trim_start_matches('v');
+    let v = v.split(['-', '+']).next()?;
+    v.split('.').map(|p| p.parse().ok()).collect()
+}
+
+/// Whether `installed` is behind `supported`. A version that cannot be read is
+/// not called old: a prompt to update on a guess would be wrong half the time.
+fn older(installed: &str, supported: &str) -> bool {
+    match (version_parts(installed), version_parts(supported)) {
+        (Some(i), Some(s)) => i < s,
+        _ => false,
+    }
+}
+
+/// Ask the installed CLI its version, on a thread, and say so only if it is
+/// older than [`SUPPORTED`]. `pangolin version` reads nothing off the network,
+/// so this costs no more than any other command.
+pub fn check_version(tx: Sender<VpnMsg>) {
+    thread::spawn(move || {
+        let Ok(out) = run(&["version"]) else {
+            return;
+        };
+        let Some(installed) = last_line(&out).map(str::to_string) else {
+            return;
+        };
+        if older(&installed, SUPPORTED) {
+            let _ = tx.send(VpnMsg::Outdated {
+                provider: ME,
+                installed,
+                supported: SUPPORTED,
+            });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -838,17 +1146,21 @@ mod tests {
     }
 
     #[test]
-    fn connecting_with_nothing_running_stops_nothing() {
+    fn a_plain_connect_still_clears_the_way_and_checks_the_login() {
         assert_eq!(
-            connect_plan(None, false),
-            vec![Step::Run(vec!["up".into(), "--silent".into()])]
+            connect_plan(None),
+            vec![
+                Step::Stop,
+                Step::CheckLogin,
+                Step::Run(vec!["up".into(), "--silent".into()]),
+            ]
         );
     }
 
     #[test]
-    fn switching_stops_the_running_client_before_it_selects() {
+    fn switching_stops_selects_then_checks_the_login_before_up() {
         let (accounts, _) = parse_accounts(STORE).unwrap();
-        let steps = connect_plan(Some(&accounts[0]), true);
+        let steps = connect_plan(Some(&accounts[0]));
         // The stop has to come first: `up` refuses while a client is running,
         // and `select account` would take it down without waiting.
         assert_eq!(steps[0], Step::Stop);
@@ -863,13 +1175,16 @@ mod tests {
                 "https://pangolin.example.de".into(),
             ])
         );
-        assert_eq!(steps[2], Step::Run(vec!["up".into(), "--silent".into()]));
+        // `auth status` speaks for the selected account, so it comes after the
+        // selection and before the `up` it is guarding.
+        assert_eq!(steps[2], Step::CheckLogin);
+        assert_eq!(steps[3], Step::Run(vec!["up".into(), "--silent".into()]));
     }
 
     #[test]
     fn every_step_says_what_it_did_for_the_log() {
         let (accounts, _) = parse_accounts(STORE).unwrap();
-        let lines: Vec<String> = connect_plan(Some(&accounts[1]), true)
+        let lines: Vec<String> = connect_plan(Some(&accounts[1]))
             .iter()
             .map(Step::describe)
             .collect();
@@ -878,7 +1193,78 @@ mod tests {
             lines[1],
             "pangolin select account -a zed@example.net --host https://other.example.com"
         );
-        assert_eq!(lines[2], "pangolin up --silent");
+        assert_eq!(lines[2], "pangolin auth status");
+        assert_eq!(lines[3], "pangolin up --silent");
+    }
+
+    /// `auth status` as 0.18.0 prints it, in each state it was seen in.
+    #[test]
+    fn reads_the_session_out_of_auth_status() {
+        let valid = "Status: logged in\n@ https://p.example.de\n\nUser: a@b.c\n";
+        assert_eq!(parse_login(true, valid), Login::Valid);
+        // Exits 0 and still says "logged in": only the first line tells.
+        let expired = "Failed to fetch user data: Unauthorized. Try logging in again.\n\n\
+                       Status: logged in (using cached account data)\n@ https://p.example.de\n";
+        assert_eq!(parse_login(true, expired), Login::Expired);
+        let offline = "The server appears to be down.\n\n\
+                       Status: logged in (using cached account data)\n";
+        assert_eq!(parse_login(true, offline), Login::Unknown);
+        let missing = "Status: not logged in\nRun 'pangolin login' to authenticate\n";
+        assert_eq!(parse_login(false, missing), Login::Missing);
+        assert_eq!(parse_login(false, "Error: something else"), Login::Unknown);
+    }
+
+    #[test]
+    fn only_an_older_client_is_outdated() {
+        assert!(older("0.17.3", "0.18.0"));
+        assert!(older("v0.9.0", "0.18.0"));
+        assert!(!older("0.18.0", "0.18.0"));
+        assert!(!older("0.19.0-rc1", "0.18.0"));
+        assert!(!older("1.0", "0.18.0"));
+        // Not readable is not old.
+        assert!(!older("dev", "0.18.0"));
+    }
+
+    #[test]
+    fn logging_in_again_never_asks_which_server() {
+        assert_eq!(update_args(), ["update"]);
+        let (accounts, _) = parse_accounts(STORE).unwrap();
+        // Through the account's own host, found by the name the row carries.
+        let a = find_account(&accounts, "zed@example.net");
+        assert_eq!(
+            login_args_for(a.as_ref()),
+            ["login", "https://other.example.com"]
+        );
+        // An account that is gone leaves the CLI to ask.
+        assert_eq!(login_args_for(None), ["login"]);
+    }
+
+    /// What `up` does to its pipes: exits at once, leaving behind a process
+    /// that holds them. The wait has to end with the command, not with the
+    /// background process — the hang this guards against outlived the command
+    /// by as long as the VPN stayed up.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_leaves_its_pipes_behind_is_not_waited_out() {
+        let log = Arc::new(Ring::new("pangolin"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo up and running; sleep 30 &"]);
+        let started = Instant::now();
+        let out = wait_logged(cmd, &["up"], &log).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // And what it said before it went still reaches both the caller and
+        // the log.
+        assert_eq!(out.trim(), "up and running");
+        assert_eq!(log.last_text().as_deref(), Some("up and running"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_fails_says_why_from_its_stderr() {
+        let log = Arc::new(Ring::new("pangolin"));
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo nope >&2; exit 3"]);
+        assert_eq!(wait_logged(cmd, &["up"], &log).unwrap_err(), "nope");
     }
 
     #[test]
@@ -904,15 +1290,12 @@ mod tests {
     }
 
     #[test]
-    fn a_banner_before_the_answer_does_not_hide_the_config_path() {
+    fn a_banner_before_the_answer_does_not_hide_it() {
         // Any command can be preceded on stdout by an update banner.
         let out = "A new version is available: 0.18.0 (current: 0.17.0)\n\
                    Run 'pangolin update' to update to the latest version\n\n\
                    /home/u/.config/pangolin/config.json\n";
-        assert_eq!(
-            config_path_line(out).unwrap(),
-            "/home/u/.config/pangolin/config.json"
-        );
-        assert!(config_path_line("  \n ").is_err());
+        assert_eq!(last_line(out), Some("/home/u/.config/pangolin/config.json"));
+        assert_eq!(last_line("  \n "), None);
     }
 }

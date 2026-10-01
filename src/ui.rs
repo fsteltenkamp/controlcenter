@@ -146,6 +146,11 @@ pub fn render(f: &mut Frame, app: &App) {
         render_port_prompt(f, app, area);
     }
 
+    // An outdated client holds nothing up either.
+    if app.update_prompt.is_some() {
+        render_update_prompt(f, app, area);
+    }
+
     // A conflict prompt holds a tunnel start hostage; it wins over everything.
     if app.conflict.is_some() {
         render_conflict_prompt(f, app, area);
@@ -1334,7 +1339,7 @@ fn vpn_hints(id: ProviderId) -> Vec<&'static str> {
             " Enter selects the account and brings the client up; a switch stops",
             " whatever is up first, because pangolin's own `up` refuses otherwise.",
             " Anything that requires the account being left is disconnected.",
-            " Accounts are pangolin's own; add one with `pangolin login`.",
+            " Accounts are pangolin's own; `pangolin login` adds or renews one.",
             " pangolin runs its own sudo, so it needs controlcenter's sudo ticket.",
         ],
         ProviderId::Netbird => vec![
@@ -2949,6 +2954,60 @@ fn render_port_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, rect);
 }
 
+fn render_update_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(prompt) = &app.update_prompt else {
+        return;
+    };
+    let slug = prompt.provider.slug();
+    let field = |k: &str, v: Span<'static>| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<10}"), Style::default().fg(DIM())),
+            v,
+        ])
+    };
+    let prose = |t: String| Line::from(Span::styled(format!(" {t}"), Style::default().fg(TEXT())));
+    let lines = vec![
+        field(
+            "installed",
+            Span::styled(prompt.installed.clone(), Style::default().fg(WARN()).bold()),
+        ),
+        field(
+            "supported",
+            Span::styled(prompt.supported.to_string(), Style::default().fg(ACCENT()).bold()),
+        ),
+        Line::from(""),
+        prose(format!(
+            "This build of controlcenter was checked against {slug} {}. An older",
+            prompt.supported
+        )),
+        prose("client may answer differently than it expects, and it is meant to".into()),
+        prose("be kept current.".into()),
+        Line::from(""),
+        prose(format!("Enter hands this terminal to `{slug} update`.")),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Enter", Style::default().fg(WARN()).bold()),
+            Span::styled(" update · ", Style::default().fg(DIM())),
+            Span::styled("q/Esc", Style::default().fg(ACCENT())),
+            Span::styled(" not now — asked again next start", Style::default().fg(DIM())),
+        ]),
+    ];
+    const WIDTH: u16 = 74;
+    let wrapped: usize = lines.iter().map(|l| wrapped_height(l, WIDTH - 2)).sum();
+    let rect = centered_rect(WIDTH, (wrapped + 2) as u16, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WARN()))
+            .title(Span::styled(
+                format!(" {slug}: update available "),
+                Style::default().fg(WARN()).bold(),
+            )),
+    );
+    f.render_widget(para, rect);
+}
+
 fn render_sso_prompt(f: &mut Frame, app: &App, area: Rect) {
     let Some(prompt) = &app.sso_prompt else {
         return;
@@ -3017,22 +3076,43 @@ fn render_sso_prompt(f: &mut Frame, app: &App, area: Rect) {
                 ));
             }
             lines.push(Line::from(""));
-            lines.push(prose(format!(
-                "{name} has no SSO session. A user device is logged in through"
-            )));
-            lines.push(prose(
-                "a browser and that session expires; a peer registered with a".into(),
-            ));
-            lines.push(prose("setup key never asks for one.".into()));
-            lines.push(Line::from(""));
-            lines.push(prose(
-                "Enter tries again: the browser opens and the code, if there is".into(),
-            ));
-            lines.push(prose("one to type, appears here. Or do it outside:".into()));
-            lines.push(Line::from(""));
-            let cmd = match prompt.profile.is_empty() {
-                true => format!("   {slug} login"),
-                false => format!("   {slug} login --profile {}", prompt.profile),
+            // Pangolin's login is a program of its own rather than something a
+            // connect can carry, so the remedy is different and so is the key.
+            let cmd = if prompt.provider == ProviderId::Pangolin {
+                lines.push(prose(format!(
+                    "{name} has no session the server will accept. Pangolin logs"
+                )));
+                lines.push(prose(
+                    "in through a browser, and that session expires or can be revoked.".into(),
+                ));
+                lines.push(Line::from(""));
+                lines.push(prose(
+                    "Enter hands this terminal to pangolin's own login, against the".into(),
+                ));
+                lines.push(prose(
+                    "account's own server, and connects again once it is done.".into(),
+                ));
+                lines.push(prose("Or do it outside:".into()));
+                lines.push(Line::from(""));
+                format!("   {slug} login <server>")
+            } else {
+                lines.push(prose(format!(
+                    "{name} has no SSO session. A user device is logged in through"
+                )));
+                lines.push(prose(
+                    "a browser and that session expires; a peer registered with a".into(),
+                ));
+                lines.push(prose("setup key never asks for one.".into()));
+                lines.push(Line::from(""));
+                lines.push(prose(
+                    "Enter tries again: the browser opens and the code, if there is".into(),
+                ));
+                lines.push(prose("one to type, appears here. Or do it outside:".into()));
+                lines.push(Line::from(""));
+                match prompt.profile.is_empty() {
+                    true => format!("   {slug} login"),
+                    false => format!("   {slug} login --profile {}", prompt.profile),
+                }
             };
             lines.push(Line::from(Span::styled(
                 cmd,

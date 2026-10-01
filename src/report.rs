@@ -649,14 +649,14 @@ fn vpn_profile_block(out: &mut String, app: &App, provider: ProviderId, profile:
         }
         ProviderId::Pangolin => {
             field(out, "accounts", "pangolin's own — controlcenter only reads them");
-            // Both of these come from the same place the action does, so what
-            // is reported is what ran. The `up` is the last step of every plan;
-            // the stop is the first whenever a client was already running,
-            // which is every switch.
-            for step in pangolin::connect_plan(None, false) {
+            // These come from the same place the action does, so what is
+            // reported is what ran. A switch puts its `select account` second;
+            // the rest is every plan.
+            for step in pangolin::connect_plan(None) {
                 field(out, "command", step.describe());
             }
             field(out, "stop", pangolin::Step::Stop.describe());
+            field(out, "supported", pangolin::SUPPORTED);
             field(out, "status", pangolin::status_probe());
             // The escalation is the CLI's, not ours, and a report that did not
             // say so would send the reader to privileged.rs for a sudo that

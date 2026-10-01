@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 227 tests, all pure unit tests — no network, no root
+cargo test             # 232 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -38,7 +38,7 @@ so those still need the CI job or a real machine.
 
 | file | holds |
 | --- | --- |
-| `src/main.rs` | CLI, terminal setup/teardown, handing the terminal to an inline ssh session, and the `SSH_ASKPASS` mode |
+| `src/main.rs` | CLI, terminal setup/teardown, handing the terminal to an inline ssh session or a client's own login or update (`App::run_handoff`), and the `SSH_ASKPASS` mode |
 | `src/platform.rs` | what differs between the systems and belongs to no one client: finding a binary, the null device, locking a file to its owner, looking up and stopping a process, whether we are elevated, and the Windows command-line and CSV parsers |
 | `src/app.rs` | all state and all key handling; the only place that decides what a key does |
 | `src/ui.rs` | all drawing; reads `App`, never mutates it |
@@ -180,6 +180,13 @@ non-zero on a no-op, and `status --json` shares its stdout with the CLI's update
 banner. Reaching past a CLI needs that kind of reason written down beside it, and
 it stays inside the same two rules as everything else: the client's own published
 interface, and no escalation for anything that only looks.
+
+Reaching past a CLI is also why `pangolin::SUPPORTED` exists: it names the release the
+socket replies, the account store and the `auth status` wording were last checked against,
+and an older client is offered `pangolin update` at start. Raise it after checking a newer
+release against a real client, never to quiet the prompt. A client command that asks
+questions — `pangolin login`, `pangolin update`, anything that opens `/dev/tty` — is never
+run from a thread: it goes on `App::handoffs` and gets the terminal from the main loop.
 
 **The UI thread never blocks.** Every connect, disconnect and status poll runs on a thread
 and reports back through `vpn_tx`/`vpn_rx`. A new long-running operation follows the same

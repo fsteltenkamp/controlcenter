@@ -1525,6 +1525,36 @@ pub struct PortPrompt {
     pub advice: Vec<crate::platform::Advice>,
 }
 
+/// A VPN client older than the release this build was checked against, and the
+/// offer to update it. Raised once per check and dismissed for the session:
+/// asking again on every poll would make it a nag rather than a notice.
+pub struct UpdatePrompt {
+    pub provider: ProviderId,
+    pub installed: String,
+    pub supported: &'static str,
+}
+
+/// A client command that needs the terminal to itself. A login asks questions
+/// and an update may ask for a password, and run from a thread either would draw
+/// over the TUI and read its keys — so the main loop hands the terminal over the
+/// way it does for an inline ssh session, and takes it back when it is done.
+pub struct Handoff {
+    pub provider: ProviderId,
+    pub target: LogTarget,
+    pub args: Vec<String>,
+    /// What to do once it has succeeded. Nothing follows a failure: the person
+    /// has just watched it fail, and the log says so.
+    pub then: AfterHandoff,
+}
+
+pub enum AfterHandoff {
+    /// Bring the profile up that the login was for.
+    Connect(Option<String>),
+    /// Look at the version again, and at everything else, since the binary has
+    /// changed under the poll.
+    Recheck,
+}
+
 // ---------------------------------------------------------------------------
 // VPN state
 // ---------------------------------------------------------------------------
@@ -2240,6 +2270,9 @@ pub struct App {
     /// it is in front of the user. Dismissing it leaves the login itself alone;
     /// what the client is still waiting on lives on the client.
     pub sso_prompt: Option<SsoPrompt>,
+    pub update_prompt: Option<UpdatePrompt>,
+    /// Client commands waiting for the main loop to hand them the terminal.
+    handoffs: VecDeque<Handoff>,
     /// Name of the host cleared to run; the main loop owns the terminal and
     /// hands it to ssh.
     /// Sessions waiting for the main loop to open them. A queue, because a
@@ -2334,6 +2367,8 @@ impl App {
             conflict: None,
             port_prompt: None,
             sso_prompt: None,
+            update_prompt: None,
+            handoffs: VecDeque::new(),
             ssh_launch: VecDeque::new(),
             vpn_tx,
             vpn_rx,
@@ -2346,6 +2381,9 @@ impl App {
         app.rebuild_rdp_rows();
         for id in ProviderId::ALL {
             app.refresh_provider(id);
+            if app.vpn.get(id).installed {
+                vpn::check_version(id, app.vpn_tx.clone());
+            }
         }
         app
     }
@@ -2382,6 +2420,10 @@ impl App {
             // after the other, windowed ones all open at once.
             while let Some(name) = self.ssh_launch.pop_front() {
                 self.run_ssh_session(terminal, &name)?;
+                self.last_tick = Instant::now();
+            }
+            while let Some(handoff) = self.handoffs.pop_front() {
+                self.run_handoff(terminal, handoff)?;
                 self.last_tick = Instant::now();
             }
             if self.should_quit {
@@ -2730,6 +2772,11 @@ impl App {
         // the browser, and nothing else on screen can answer for it.
         if self.sso_prompt.is_some() {
             self.on_sso_key(key);
+            return;
+        }
+        // Holds nothing up, so it comes after the prompts that do.
+        if self.update_prompt.is_some() {
+            self.on_update_key(key);
             return;
         }
         // A refused port resumes nothing when it is dismissed — it explains a
@@ -3680,7 +3727,11 @@ impl App {
                 // The attempt is over and there is no URL left to open, so all
                 // there is to do is say what is missing and offer another go.
                 self.vpn.get_mut(provider).sso = None;
-                self.report(target, format!("{label} has no SSO session"), true);
+                let missing = match provider {
+                    ProviderId::Pangolin => "has no valid login",
+                    _ => "has no SSO session",
+                };
+                self.report(target, format!("{label} {missing}"), true);
                 self.sso_prompt = Some(SsoPrompt {
                     provider,
                     profile,
@@ -3779,6 +3830,18 @@ impl App {
             KeyCode::Enter if waiting.is_some() => {
                 self.flash("the login is still waiting on the browser — o opens it again", false)
             }
+            // Pangolin's login cannot be driven from a thread the way netbird's
+            // `up` can: it is a program of its own that asks questions, so the
+            // terminal goes to it and the connect is asked for again after.
+            KeyCode::Enter if id == ProviderId::Pangolin => {
+                self.sso_prompt = None;
+                self.handoffs.push_back(Handoff {
+                    provider: id,
+                    target: LogTarget::Vpn(id, profile.clone()),
+                    args: vpn::pangolin::login_args(&profile),
+                    then: AfterHandoff::Connect((!profile.is_empty()).then_some(profile)),
+                });
+            }
             KeyCode::Enter => {
                 self.sso_prompt = None;
                 self.vpn_connect(id, (!profile.is_empty()).then_some(profile));
@@ -3798,6 +3861,67 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.sso_prompt = None,
             _ => {}
         }
+    }
+
+    fn on_update_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = &self.update_prompt else {
+            return;
+        };
+        let id = prompt.provider;
+        match key.code {
+            KeyCode::Enter => {
+                self.update_prompt = None;
+                self.handoffs.push_back(Handoff {
+                    provider: id,
+                    target: LogTarget::vpn(id),
+                    args: vpn::pangolin::update_args(),
+                    then: AfterHandoff::Recheck,
+                });
+            }
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.update_prompt = None;
+                self.note(LogTarget::vpn(id), "left the client as it is, for this session");
+            }
+            _ => {}
+        }
+    }
+
+    /// Give the terminal to a client command and take it back afterwards.
+    ///
+    /// It waits for Enter before the TUI comes back, which an ssh session does
+    /// not: what a login or an update prints at the end is its answer, and the
+    /// alternate screen would cover it the instant the command exited.
+    fn run_handoff(&mut self, terminal: &mut Tui, h: Handoff) -> Result<()> {
+        let program = h.provider.binaries()[0];
+        let mut argv = vec![program.to_string()];
+        argv.extend(h.args.iter().cloned());
+        let line = report::command_line(&argv);
+        self.note(h.target.clone(), format!("handed the terminal to: {line}"));
+
+        crate::suspend_terminal(terminal)?;
+        println!("── controlcenter: {line} ──");
+        let status = std::process::Command::new(crate::platform::program(program))
+            .args(&h.args)
+            .status();
+        println!("── press Enter to return to controlcenter ──");
+        let _ = std::io::stdin().read_line(&mut String::new());
+        crate::resume_terminal(terminal)?;
+
+        match status {
+            Ok(st) if st.success() => {
+                self.note(h.target, format!("{line}: done"));
+                match h.then {
+                    AfterHandoff::Connect(profile) => self.vpn_connect(h.provider, profile),
+                    AfterHandoff::Recheck => {
+                        vpn::check_version(h.provider, self.vpn_tx.clone());
+                        self.refresh_provider(h.provider);
+                    }
+                }
+            }
+            Ok(st) => self.report(h.target, format!("{line} failed ({st})"), true),
+            Err(e) => self.report(h.target, format!("{line}: {e}"), true),
+        }
+        Ok(())
     }
 
     // ----- OpenVPN sessions, owned here like RDP sessions -------------------
@@ -7151,6 +7275,24 @@ impl App {
                     waiting,
                     error,
                 } => self.on_login_needed(provider, profile, waiting, error),
+                VpnMsg::Outdated {
+                    provider,
+                    installed,
+                    supported,
+                } => {
+                    self.note(
+                        LogTarget::vpn(provider),
+                        format!(
+                            "{} {installed} is older than {supported}, the release this build supports",
+                            provider.slug()
+                        ),
+                    );
+                    self.update_prompt = Some(UpdatePrompt {
+                        provider,
+                        installed,
+                        supported,
+                    });
+                }
                 VpnMsg::ActionDone {
                     provider: id,
                     desc,
