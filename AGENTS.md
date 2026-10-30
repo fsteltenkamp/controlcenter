@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 232 tests, all pure unit tests — no network, no root
+cargo test             # 233 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 

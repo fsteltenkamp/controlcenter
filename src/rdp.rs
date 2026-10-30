@@ -151,6 +151,24 @@ fn freerdp_args(conn: &RdpConnection) -> Vec<String> {
     args
 }
 
+/// What xfreerdp is told on stdin, one line per prompt it will put.
+///
+/// `/from-stdin` asks for whatever the command line left out, in a fixed order —
+/// user, domain, password — and the user is always given. Without a domain it
+/// asks for one first, so a password written alone is read as the domain and
+/// the password prompt meets a closed pipe: the connection is cancelled before
+/// it is attempted. An empty line is the answer for no domain.
+fn stdin_answers(conn: &RdpConnection, password: &str) -> String {
+    let domain_given = !conn.domain.is_empty()
+        || conn.username.contains('\\')
+        || conn.extra_args.split_whitespace().any(|a| a.starts_with("/d:"));
+    if domain_given {
+        format!("{password}\n")
+    } else {
+        format!("\n{password}\n")
+    }
+}
+
 /// mstsc takes the connection itself in the file and almost nothing else, so
 /// the only arguments are the file and whichever switches the user added.
 fn mstsc_args(conn: &RdpConnection, file: Option<&Path>) -> Vec<String> {
@@ -419,7 +437,7 @@ fn spawn_freerdp(conn: &RdpConnection, password: &str) -> Result<ActiveRdp> {
         .context("spawning xfreerdp3 (is freerdp3 installed?)")?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "{password}");
+        let _ = stdin.write_all(stdin_answers(conn, password).as_bytes());
         // Dropping stdin closes it so xfreerdp cannot wait on further prompts.
     }
 
@@ -577,6 +595,16 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("/d:")));
         // Extra args are appended in the order they were typed.
         assert_eq!(&args[args.len() - 2..], &["/f".to_string(), "/sound".to_string()]);
+    }
+
+    #[test]
+    fn without_a_domain_the_domain_prompt_is_answered_before_the_password() {
+        assert_eq!(stdin_answers(&conn("", ""), "pw"), "\npw\n");
+        assert_eq!(stdin_answers(&conn("acme", ""), "pw"), "pw\n");
+        assert_eq!(stdin_answers(&conn("", "/f /d:acme"), "pw"), "pw\n");
+        let mut c = conn("", "");
+        c.username = "acme\\flo".into();
+        assert_eq!(stdin_answers(&c, "pw"), "pw\n");
     }
 
     #[test]
