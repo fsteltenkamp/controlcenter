@@ -39,8 +39,9 @@ in.
 ## Dependencies
 
 Tunnels, SSH hosts and RDP connections each take two optional requirements, picked with
-`←` `→` in their form — or with `Ctrl+O`, which opens the whole list as a popup where
-groups are folders and typing searches every one of them at once:
+`←` `→` in their form — or with `Ctrl+O`, which opens the whole list as a popup laid out
+like a file tree: groups, VPN clients and Pangolin accounts are folders, what you can
+depend on is a file, and typing searches everything below where you are:
 
 - **`requires_vpn`** — a VPN that must be up first, written as `provider:profile`
 - **`depends_on`** — a tunnel that must be up. Tunnels can name another tunnel here, which
@@ -121,7 +122,8 @@ it has just left pointing at nothing. Renaming one follows through to them.
 | `"*"` | any VPN, as long as one is connected |
 | `"netbird:*"` | any NetBird profile |
 | `"wireguard:home"` | that profile of that client |
-| `"pangolin:you@example.net"` | that pangolin account |
+| `"pangolin:you@example.net"` | that pangolin account, on whichever organisation it has selected |
+| `"pangolin:you@example.net#acme"` | that pangolin account, on organisation `acme` |
 | `"work"` | NetBird's `work` — how it was written before there was more than one client |
 
 Unqualified names still mean NetBird, so config files written before the other clients
@@ -131,8 +133,10 @@ next save the entry.
 A plan holds **one requirement per client**, so a chain may legitimately need WireGuard
 *and* Tailscale and both get a step, run in a fixed order (netbird, wireguard, openvpn,
 tailscale, pangolin). Within one client a named profile beats `*`, and two different profiles of the
-*same* client is a contradiction, refused before anything starts. Renaming a profile
-follows it through everything that requires it.
+*same* client is a contradiction, refused before anything starts. A Pangolin organisation
+is more specific than its account, so a chain asking for both gets the organisation, and
+two organisations are a contradiction like two profiles. Renaming a profile follows it
+through everything that requires it.
 
 ## Conflicts
 
@@ -144,7 +148,7 @@ pulling a VPN up behind it, or a profile switched by hand on the VPN tab:
 | Step | Conflicts with | Accepting |
 | --- | --- | --- |
 | tunnel | another tunnel on the same binding — the same local port for `-L`/`-D`, the same port on the same ssh host for `-R` | disconnects it |
-| VPN profile | a different profile of the *same* client being active | switches, disconnecting whatever required the old one |
+| VPN profile | a different profile of the *same* client being active, or another organisation of the same Pangolin account | switches, disconnecting whatever required the old one — a connection that only named the account stays up across a change of organisation |
 | RDP | another running session to the same host:port | disconnects it |
 
 Only NetBird, Tailscale and Pangolin can hold one profile at a time, so only they

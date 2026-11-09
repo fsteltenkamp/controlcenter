@@ -199,11 +199,19 @@ riding on the profile going down.
 
 ## Pangolin
 
-Profiles here are pangolin **accounts** — one per login, an email against a host. They are
+Profiles here are pangolin **accounts** — one per login, an email against a host — and
+each organisation of an account is a row of its own, named `account#org`. They are
 pangolin's own, so like NetBird's they are listed and switched but never edited here;
 `a`, `e` and `d` say so, and `pangolin login` is what adds one. `Enter` selects the account
-and brings the client up; only one can be up at a time, so switching prompts as a conflict
-when something is riding on the account going down.
+and the organisation and brings the client up; only one can be up at a time, so switching
+prompts as a conflict when something is riding on what is going down.
+
+Pangolin can only list the organisations of the **selected** account, so controlcenter
+asks when an account becomes selected, again every ten minutes, and whenever you press
+`r`, and remembers each account's list. An account that has never been selected here shows
+only the organisation pangolin has saved for it; select it once and the rest appear. The
+list comes from the completion behind `pangolin select org --org`, the same one a shell
+uses, so the CLI does the talking and controlcenter never handles the session token.
 
 The account list is read from the store pangolin itself writes, beside the file
 `pangolin config path` names, because `pangolin select account` is a menu and has no
@@ -211,7 +219,8 @@ non-interactive listing. Only the email, host and organisation are taken from it
 logins with the same email on different hosts are listed as `email @ host`; a single one
 is listed as just the email.
 
-A row is green when that account is the selected one **and** a client is actually up. The
+A row is green when that account is the selected one **and** a client is actually up, on
+that organisation, which is the running client's to report. The
 selection outlives every client started from it, so the two are not the same question:
 going by the selection alone would leave a row green over a tunnel that is not there, and
 `Enter` on it would try to disconnect something that had already gone.
@@ -235,7 +244,10 @@ naming only the sites that are down or are being reached over a relay, since a s
 up and direct needs no telling.
 
 Switching stops the running client and waits for it to be gone before it selects the new
-account. That order is forced by the client: `pangolin up` refuses outright while any
+account and organisation, even when only the organisation changes: with a client running,
+`pangolin select org` opens the terminal to watch the switch happen. The choice is saved in
+pangolin, so `pangolin ssh` and the rest of its CLI follow it. That order is forced by the
+client: `pangolin up` refuses outright while any
 client is running, and `pangolin select account` tears one down itself without waiting for
 it to finish. Left to those two, a switch reliably ended with the old account down, the
 `up` refused, and nothing connected — while the tab, reading the selection, showed the new

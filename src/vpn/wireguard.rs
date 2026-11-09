@@ -448,6 +448,7 @@ pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<WireguardProfile>) {
                 name: p.name.clone(),
                 detail: p.summary(),
                 foreign: None,
+                within: None,
             })
             .collect();
 

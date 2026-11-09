@@ -114,6 +114,14 @@ impl ProviderId {
         matches!(self, Self::Netbird | Self::Tailscale | Self::Pangolin)
     }
 
+    /// Whether a profile of this client holds places of its own that a
+    /// requirement can name, as `profile#place`. A pangolin account is on one of
+    /// its organisations at a time. Only here so a name that happens to hold a
+    /// `#` means nothing special on any other client.
+    pub fn has_scopes(self) -> bool {
+        matches!(self, Self::Pangolin)
+    }
+
     /// Whether connecting needs root — administrator, on Windows. Warns up
     /// front, and decides whether an action goes through [`privileged`] at all;
     /// which escalation that then is stays [`privileged`]'s to choose.
@@ -148,6 +156,18 @@ pub struct VpnProfile {
     /// on the machine that controlcenter is not holding: an orphan of an
     /// earlier run, or something else's. It can be stopped and nothing else.
     pub foreign: Option<scan::Foreign>,
+    /// Set when the row is one place inside a bigger profile, so a picker can
+    /// file it there.
+    pub within: Option<Within>,
+}
+
+/// Where a [`VpnProfile`] sits inside the profile it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Within {
+    /// The containing profile's name, which is a requirement in its own right.
+    pub parent: String,
+    /// What this place is called inside it.
+    pub label: String,
 }
 
 impl VpnProfile {
@@ -262,10 +282,16 @@ pub fn installed(p: ProviderId) -> bool {
 pub struct VpnEnv<'a> {
     pub cfg: &'a VpnConfig,
     pub wireguard_dir: &'a Path,
+    /// Where a client may keep what it can only learn some of the time.
+    pub config_dir: &'a Path,
     /// The log ring of the provider being acted on, for a client that is driven
     /// by a command worth reading as it runs rather than after it: netbird's
     /// `up` prints a login URL that is worth nothing once it has finished.
     pub log: &'a Arc<Ring>,
+}
+
+fn orgs_file(env: VpnEnv<'_>) -> std::path::PathBuf {
+    env.config_dir.join(pangolin::ORGS_FILE)
 }
 
 /// Fetch profiles and status on a background thread; the result arrives as
@@ -279,7 +305,7 @@ pub fn refresh(p: ProviderId, tx: Sender<VpnMsg>, env: VpnEnv<'_>) {
         ProviderId::Netbird => netbird::refresh(tx),
         ProviderId::Wireguard => wireguard::refresh(tx, env.cfg.wireguard.clone()),
         ProviderId::Tailscale => tailscale::refresh(tx, env.cfg.tailscale.clone()),
-        ProviderId::Pangolin => pangolin::refresh(tx),
+        ProviderId::Pangolin => pangolin::refresh(tx, orgs_file(env)),
         ProviderId::Openvpn => {}
     }
 }
@@ -297,7 +323,7 @@ pub fn connect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::connect(tx, profile, Arc::clone(env.log))),
-        ProviderId::Pangolin => pangolin::connect(tx, profile, Arc::clone(env.log)),
+        ProviderId::Pangolin => pangolin::connect(tx, profile, Arc::clone(env.log), orgs_file(env)),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::connect(
@@ -351,7 +377,7 @@ pub fn disconnect(
 ) -> Result<Vec<String>, String> {
     match p {
         ProviderId::Netbird => Ok(netbird::disconnect(tx, Arc::clone(env.log))),
-        ProviderId::Pangolin => Ok(pangolin::disconnect(tx, Arc::clone(env.log))),
+        ProviderId::Pangolin => Ok(pangolin::disconnect(tx, Arc::clone(env.log), orgs_file(env))),
         ProviderId::Wireguard => {
             let prof = find_wireguard(env.cfg, profile)?;
             Ok(wireguard::disconnect(

@@ -10,7 +10,7 @@ use crate::theme::{self, Theme};
 use crate::tunnel::{self, ActiveTunnel, Status};
 use crate::types::{
     canonical_vpn_requirement, parse_vpn_requirement, ssh_entry_of, ssh_entry_ref, tunnel_conflict,
-    vpn_requirement_label, ForwardType, OpenvpnProfile, RdpConnection, Requires, SshHost,
+    profile_covers, vpn_requirement_label, ForwardType, OpenvpnProfile, RdpConnection, Requires, SshHost,
     TailscaleProfile, Tunnel, VpnConfig, WireguardProfile, VPN_ANY,
 };
 use crate::ui;
@@ -535,9 +535,24 @@ impl Picker {
                 "(any profile)",
                 slug,
             ));
-            options.extend(state.profiles.iter().map(|p| {
-                Choice::in_folder(format!("{slug}:{}", p.name), &p.name, slug)
-            }));
+            let mut parents: Vec<&str> = Vec::new();
+            for p in &state.profiles {
+                let value = format!("{slug}:{}", p.name);
+                let Some(within) = &p.within else {
+                    options.push(Choice::in_folder(value, &p.name, slug));
+                    continue;
+                };
+                let path = vec![slug.to_string(), within.parent.clone()];
+                if !parents.contains(&within.parent.as_str()) {
+                    parents.push(&within.parent);
+                    options.push(Choice::in_path(
+                        format!("{slug}:{}", within.parent),
+                        "(any organisation)",
+                        path.clone(),
+                    ));
+                }
+                options.push(Choice::in_path(value, &within.label, path));
+            }
         }
         Self::build(PickerKind::Vpn, options, &canonical_vpn_requirement(current))
     }
@@ -1270,14 +1285,25 @@ impl Catalog<'_> {
     /// requirement — what taking it down would cut. `tunnel_up` and `rdp_up`
     /// answer for the two lists separately, because a tunnel and an RDP
     /// connection may share a name.
-    fn riders_of(
+    /// `coming` is what replaces it, for a switch, and `""` when nothing does:
+    /// moving an account to another organisation takes a tunnel on the old
+    /// organisation with it, and leaves one that only asked for the account.
+    fn riders_cut_by(
         &self,
-        req: &str,
+        going: &str,
+        coming: &str,
         tunnel_up: &dyn Fn(&str) -> bool,
         rdp_up: &dyn Fn(&str) -> bool,
     ) -> (Vec<String>, Vec<String>) {
-        let want = canonical_vpn_requirement(req);
-        let matches = |r: &str| canonical_vpn_requirement(r) == want;
+        let going = parse_vpn_requirement(going);
+        let coming = parse_vpn_requirement(coming);
+        let matches = |r: &str| {
+            let Some(rider) = parse_vpn_requirement(r) else {
+                return false;
+            };
+            going.as_ref().is_some_and(|g| rider.rides_on(g))
+                && !coming.as_ref().is_some_and(|c| rider.rides_on(c))
+        };
         let tunnels = self
             .tunnels
             .iter()
@@ -1374,7 +1400,10 @@ impl Catalog<'_> {
             // "any profile of this provider" adds nothing to a named one.
             (_, None) => {}
             (None, Some(_)) => *slot = req.canonical(),
-            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) if profile_covers(provider, b, a) => {}
+            // The account was asked for and now a place on it is: the same
+            // client session, just more specific.
+            (Some(a), Some(b)) if profile_covers(provider, a, b) => *slot = req.canonical(),
             (Some(a), Some(b)) => {
                 return Err(format!(
                     "needs {} profile '{a}' and '{b}' at the same time",
@@ -1648,6 +1677,18 @@ impl ProviderState {
                 .find(|p| p.active && p.is_stored())
                 .map(|p| p.name.as_str())
         })
+    }
+
+    /// The one profile this client has, when it has exactly one — and an account
+    /// on several organisations is still one profile, named as the account, so
+    /// the client stays on whichever it has selected.
+    pub fn sole_profile(&self) -> Option<String> {
+        let mut names = self
+            .profiles
+            .iter()
+            .map(|p| p.within.as_ref().map_or(&p.name, |w| &w.parent));
+        let first = names.next()?;
+        names.all(|n| n == first).then(|| first.clone())
     }
 
     /// The rows that are stored profiles, i.e. the ones `a`, `e`, `d` and `p`
@@ -3235,6 +3276,7 @@ impl App {
         VpnEnv {
             cfg: &self.vpn_cfg,
             wireguard_dir: &self.paths.wireguard_dir,
+            config_dir: &self.paths.config_dir,
             log: &self.vpn.get(id).log,
         }
     }
@@ -3306,6 +3348,10 @@ impl App {
             KeyCode::Char('r') => {
                 let id = self.vpn.current_id();
                 self.vpn.get_mut(id).error = None;
+                // A poll only lists organisations now and then; this is asking.
+                if id == ProviderId::Pangolin {
+                    vpn::pangolin::ask_orgs_again();
+                }
                 self.refresh_provider(id);
                 self.refresh_scan();
                 self.flash(format!("refreshing {}", id.slug()), false);
@@ -3472,6 +3518,7 @@ impl App {
                     active: false,
                     detail: w.summary(),
                     foreign: None,
+                    within: None,
                 })
                 .collect(),
             ProviderId::Openvpn => {
@@ -3487,6 +3534,7 @@ impl App {
                     active: false,
                     detail: String::new(),
                     foreign: None,
+                    within: None,
                 })
                 .collect(),
             // Read from the client, not from vpn.toml; the background refresh
@@ -4058,6 +4106,7 @@ impl App {
                     .map(|s| s.status.label())
                     .unwrap_or_else(|| o.summary(&self.paths.openvpn_dir)),
                 foreign: None,
+                within: None,
             })
             .collect();
 
@@ -4297,6 +4346,7 @@ impl App {
                 active: true,
                 detail: f.detail(&run_dir),
                 foreign: Some(f),
+                within: None,
             })
             .collect();
         let state = self.vpn.get_mut(id);
@@ -6253,8 +6303,10 @@ impl App {
                 // list is the truth there, not a single "active" field.
                 state
                     .stored()
-                    .any(|p| p.active && &p.name == name)
-                    || state.active_profile() == Some(name.as_str())
+                    .any(|p| p.active && profile_covers(provider, name, &p.name))
+                    || state
+                        .active_profile()
+                        .is_some_and(|up| profile_covers(provider, name, up))
             }
         }
     }
@@ -6270,10 +6322,10 @@ impl App {
             .vpn
             .providers
             .iter()
-            .filter(|p| p.installed && p.profiles.len() == 1)
+            .filter(|p| p.installed && p.sole_profile().is_some())
             .collect();
         match candidates.as_slice() {
-            [only] => Ok((only.id, Some(only.profiles[0].name.clone()))),
+            [only] => Ok((only.id, only.sole_profile())),
             [] => Err("no VPN client is installed".into()),
             _ => Err("several VPNs could satisfy '*' — name one, e.g. wireguard:home".into()),
         }
@@ -6382,9 +6434,9 @@ impl App {
                 let profile = match (profile, id) {
                     (Some(p), _) => Some(p),
                     (None, ProviderId::Netbird) => None,
-                    (None, _) => match self.vpn.get(id).profiles.as_slice() {
-                        [only] => Some(only.name.clone()),
-                        _ => {
+                    (None, _) => match self.vpn.get(id).sole_profile() {
+                        Some(only) => Some(only),
+                        None => {
                             return StartOutcome::Failed(format!(
                                 "{} needs a named profile, e.g. {}:<name>",
                                 id.slug(),
@@ -6470,13 +6522,14 @@ impl App {
                 let id = parsed.provider.filter(|p| p.exclusive())?;
                 let wanted = parsed.profile?;
                 let current = self.active_vpn_profile(id)?;
-                if current == wanted {
+                if profile_covers(id, &wanted, &current) {
                     return None;
                 }
                 // Switching profiles cuts anything that asked for the old one.
                 let old = format!("{}:{current}", id.slug());
-                let (stop_tunnels, stop_rdp) = self.catalog().riders_of(
+                let (stop_tunnels, stop_rdp) = self.catalog().riders_cut_by(
                     &old,
+                    req,
                     &|name| self.active.contains_key(name),
                     &|name| self.rdp_running(name),
                 );
@@ -7502,6 +7555,7 @@ mod tests {
                     active: false,
                     detail: String::new(),
                     foreign: None,
+                    within: None,
                 })
                 .collect();
         }
@@ -7517,6 +7571,7 @@ mod tests {
             // It is up — that is why it is listed at all.
             active: true,
             detail: "pid 4242 · root · not started here".into(),
+            within: None,
             foreign: Some(scan::Foreign::Process(scan::Process {
                 pid: 4242,
                 provider: ProviderId::Openvpn,
@@ -7945,7 +8000,7 @@ mod tests {
             rdp_conns: &conns,
         };
         let (tunnels, rdp) =
-            cat.riders_of("netbird:home", &|n| n == "up-on-home", &|n| n == "desk");
+            cat.riders_cut_by("netbird:home", "", &|n| n == "up-on-home", &|n| n == "desk");
         assert_eq!(tunnels, ["up-on-home"]);
         assert_eq!(rdp, ["desk"]);
     }
@@ -7956,8 +8011,83 @@ mod tests {
         // one client, so it must count against netbird:home.
         let ts = vec![tunnel("legacy", "home", "")];
         let cat = catalog(&ts, &[]);
-        let (tunnels, _) = cat.riders_of("netbird:home", &|_| true, &|_| true);
+        let (tunnels, _) = cat.riders_cut_by("netbird:home", "", &|_| true, &|_| true);
         assert_eq!(tunnels, ["legacy"]);
+    }
+
+    fn pangolin_view() -> VpnView {
+        let mut view = view_with(&[(ProviderId::Pangolin, &["me#acme", "me#beta"])]);
+        for p in &mut view.providers[ProviderId::Pangolin.index()].profiles {
+            let label = p.name.split('#').nth(1).unwrap().to_string();
+            p.within = Some(crate::vpn::Within {
+                parent: "me".into(),
+                label,
+            });
+        }
+        view
+    }
+
+    #[test]
+    fn an_organisation_is_filed_inside_its_account_beside_any_organisation() {
+        let picker = Picker::vpn(&pangolin_view(), "");
+        let account = ["pangolin".to_string(), "me".to_string()];
+        let inside: Vec<&str> = picker
+            .options
+            .iter()
+            .filter(|o| o.folder == account)
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(inside, ["pangolin:me", "pangolin:me#acme", "pangolin:me#beta"]);
+    }
+
+    #[test]
+    fn a_requirement_from_before_organisations_still_names_an_option() {
+        let picker = Picker::vpn(&pangolin_view(), "pangolin:me");
+        assert_eq!(picker.value(), "pangolin:me");
+        assert!(picker.options.iter().all(|o| !o.name.contains("(missing)")));
+    }
+
+    #[test]
+    fn an_account_on_several_organisations_is_still_one_profile() {
+        let view = pangolin_view();
+        let state = &view.providers[ProviderId::Pangolin.index()];
+        assert_eq!(state.sole_profile().as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn an_organisation_is_more_specific_than_its_account_and_excludes_another() {
+        let mut vpn = vec!["pangolin:me".to_string()];
+        Catalog::merge_vpn(&mut vpn, "pangolin:me#acme").unwrap();
+        assert_eq!(vpn, ["pangolin:me#acme"]);
+        // Asking for the account afterwards adds nothing.
+        Catalog::merge_vpn(&mut vpn, "pangolin:me").unwrap();
+        assert_eq!(vpn, ["pangolin:me#acme"]);
+        // One client is on one organisation.
+        assert!(Catalog::merge_vpn(&mut vpn, "pangolin:me#beta").is_err());
+    }
+
+    #[test]
+    fn moving_an_account_between_organisations_only_cuts_what_asked_for_the_old_one() {
+        let ts = vec![
+            tunnel("on-acme", "pangolin:me#acme", ""),
+            tunnel("on-beta", "pangolin:me#beta", ""),
+            tunnel("on-account", "pangolin:me", ""),
+        ];
+        let cat = catalog(&ts, &[]);
+        let up = |_: &str| true;
+        let (tunnels, _) = cat.riders_cut_by("pangolin:me#acme", "pangolin:me#beta", &up, &up);
+        assert_eq!(tunnels, ["on-acme"]);
+        // Going to another account takes the account's riders too.
+        let (tunnels, _) = cat.riders_cut_by("pangolin:me#acme", "pangolin:you", &up, &up);
+        assert_eq!(tunnels, ["on-acme", "on-account"]);
+    }
+
+    #[test]
+    fn a_hash_means_nothing_on_a_client_without_scopes() {
+        assert!(!profile_covers(ProviderId::Wireguard, "home", "home#2"));
+        assert!(profile_covers(ProviderId::Pangolin, "me", "me#acme"));
+        assert!(!profile_covers(ProviderId::Pangolin, "me#acme", "me"));
+        assert!(!profile_covers(ProviderId::Pangolin, "me", "mexico#acme"));
     }
 
     #[test]
@@ -7965,7 +8095,7 @@ mod tests {
         // The switch then goes through without a prompt.
         let ts = vec![tunnel("a", "netbird:work", "")];
         let cat = catalog(&ts, &[]);
-        let (tunnels, rdp) = cat.riders_of("netbird:home", &|_| true, &|_| true);
+        let (tunnels, rdp) = cat.riders_cut_by("netbird:home", "", &|_| true, &|_| true);
         assert!(tunnels.is_empty() && rdp.is_empty());
     }
 
@@ -8045,7 +8175,7 @@ mod tests {
         t.ssh_host = ssh_entry_ref("jump");
         let hosts = vec![ssh_host("jump", "netbird:work", "")];
         let ts = vec![t];
-        let (tunnels, _) = catalog(&ts, &hosts).riders_of("netbird:work", &|_| true, &|_| false);
+        let (tunnels, _) = catalog(&ts, &hosts).riders_cut_by("netbird:work", "", &|_| true, &|_| false);
         assert_eq!(tunnels, vec!["app".to_string()]);
     }
 

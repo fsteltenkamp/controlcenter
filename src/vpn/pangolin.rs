@@ -13,6 +13,12 @@
 //!   itself writes, whose directory `pangolin config path` names. Only the email,
 //!   host and org are taken from it; the file also holds a session token, which
 //!   is why nothing here ever echoes it back.
+//!
+//!   Organisations have no listing either, and the store only has the selected
+//!   one. `pangolin select org` is a menu as well, but its `--org` flag has a
+//!   shell completion that asks the server, so that is what is asked — see
+//!   [`list_orgs`]. It leaves the session token where it is, which going to the
+//!   server's API from here would not.
 //! * `pangolin up` escalates itself — it re-executes under `sudo` to create the
 //!   tunnel device — so it is run unprivileged and *not* through
 //!   [`super::privileged`], which would leave two escalations racing for the same
@@ -35,11 +41,14 @@
 //!   world-writable on purpose, so nothing here escalates to reach it: a status
 //!   poll stays unprivileged by construction, like every other client's.
 
-use super::{ProviderId, VpnMsg, VpnProfile, VpnStatus};
+use super::{ProviderId, VpnMsg, VpnProfile, VpnStatus, Within};
 use crate::logs::Ring;
+use crate::types::VPN_SCOPE;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -433,43 +442,223 @@ fn display_name(a: &Account, all: &[Account]) -> String {
 }
 
 /// The host without its scheme — the whole URL is what `--host` wants, but not
-/// what a narrow list wants to spend its width on.
-fn summarise(a: &Account) -> String {
+/// what a narrow list wants to spend its width on. `org` is the name of the
+/// organisation the row is about.
+fn summarise(a: &Account, org: &str) -> String {
     let host = a
         .host
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    match (host.is_empty(), a.org.is_empty()) {
+    match (host.is_empty(), org.is_empty()) {
         (true, true) => String::new(),
-        (true, false) => a.org.clone(),
+        (true, false) => org.to_string(),
         (false, true) => host.to_string(),
-        (false, false) => format!("{host} · {}", a.org),
+        (false, false) => format!("{host} · {org}"),
     }
 }
 
-/// The rows the tab lists.
+/// One organisation an account belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Org {
+    pub id: String,
+    pub name: String,
+}
+
+impl Org {
+    /// How the client's own menu writes it, short when the two say the same.
+    fn label(&self) -> String {
+        if self.name == self.id {
+            self.id.clone()
+        } else {
+            format!("{} ({})", self.name, self.id)
+        }
+    }
+}
+
+/// Every account's organisations, by user id.
+type KnownOrgs = BTreeMap<String, Vec<Org>>;
+
+/// Where what was learned about organisations is kept. A cache and not config:
+/// nothing in it was chosen, and deleting it costs only the listings.
+pub const ORGS_FILE: &str = "pangolin-orgs.json";
+
+/// How long a listing is good for before a poll asks again. Polls come every few
+/// seconds and this one goes to the server; organisations rarely change, and `r`
+/// asks on the spot.
+const ORG_LISTING_AGE: Duration = Duration::from_secs(600);
+
+/// What the completion for `select org --org` printed. Each candidate is
+/// `id<TAB>name`, which is also what tells them from an update banner and from
+/// cobra's closing `:4`. A failure — a dead session, no server — prints no
+/// candidates and exits 0, so nothing found has to mean "ask again later" rather
+/// than "this account has no organisations".
+fn parse_orgs(out: &str) -> Vec<Org> {
+    let mut orgs: Vec<Org> = out
+        .lines()
+        .filter_map(|l| {
+            let (id, name) = l.trim().split_once('\t')?;
+            (!id.is_empty()).then(|| Org {
+                id: id.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect();
+    // The server's order is not promised, and a row that moves between polls
+    // loses the cursor.
+    orgs.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+    orgs
+}
+
+/// The selected account's organisations.
+///
+/// Only ever the selected account's: the completion, like everything else in the
+/// CLI, speaks for that one, and selecting another to ask about it would stop a
+/// running client. So what is learned is kept by account in [`ORGS_FILE`], and an
+/// account that has never been selected here shows only the organisation the
+/// store has for it until it has been.
+fn list_orgs() -> Vec<Org> {
+    run(&["__complete", "select", "org", "--org", ""])
+        .map(|out| parse_orgs(&out))
+        .unwrap_or_default()
+}
+
+/// What this process knows about organisations. `asked` is when each account was
+/// last listed, kept apart from the listings because it means nothing to the
+/// next run.
+#[derive(Default)]
+struct OrgMemory {
+    known: Option<KnownOrgs>,
+    asked: HashMap<String, Instant>,
+}
+
+fn org_memory() -> &'static Mutex<OrgMemory> {
+    static MEMORY: OnceLock<Mutex<OrgMemory>> = OnceLock::new();
+    MEMORY.get_or_init(Default::default)
+}
+
+fn read_orgs(file: &Path) -> KnownOrgs {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn known_orgs(file: &Path) -> KnownOrgs {
+    org_memory()
+        .lock()
+        .unwrap()
+        .known
+        .get_or_insert_with(|| read_orgs(file))
+        .clone()
+}
+
+/// Whether this poll should be the one that lists the account. Claimed before
+/// the asking rather than after it, because polls overlap and the answer can take
+/// as long as the server does.
+fn claim_org_listing(user_id: &str) -> bool {
+    let mut memory = org_memory().lock().unwrap();
+    let fresh = memory
+        .asked
+        .get(user_id)
+        .is_some_and(|at| at.elapsed() < ORG_LISTING_AGE);
+    if !fresh {
+        memory.asked.insert(user_id.to_string(), Instant::now());
+    }
+    !fresh
+}
+
+/// Have the next poll list the selected account's organisations, however
+/// recently that was done.
+pub fn ask_orgs_again() {
+    org_memory().lock().unwrap().asked.clear();
+}
+
+/// Keep a listing. Whether it changed anything comes back, since only then is
+/// there something new for the tab to show.
+fn remember_orgs(file: &Path, user_id: &str, orgs: Vec<Org>) -> bool {
+    let mut memory = org_memory().lock().unwrap();
+    let known = memory.known.get_or_insert_with(|| read_orgs(file));
+    if orgs.is_empty() || known.get(user_id) == Some(&orgs) {
+        return false;
+    }
+    known.insert(user_id.to_string(), orgs);
+    if let Ok(raw) = serde_json::to_string_pretty(known) {
+        // Losing this only means listing again, so a full disk is no one's news.
+        if std::fs::write(file, raw).is_ok() {
+            let _ = crate::platform::restrict_file(file);
+        }
+    }
+    true
+}
+
+/// The organisations to list for an account: what has been learned, plus the
+/// ones the account store and the running client name, which are facts even
+/// about an account that has never been listed.
+fn orgs_of(a: &Account, known: &KnownOrgs, running: Option<&str>) -> Vec<Org> {
+    let mut orgs = known.get(&a.user_id).cloned().unwrap_or_default();
+    for id in std::iter::once(a.org.as_str()).chain(running) {
+        if !id.is_empty() && !orgs.iter().any(|o| o.id == id) {
+            orgs.push(Org {
+                id: id.to_string(),
+                name: id.to_string(),
+            });
+        }
+    }
+    orgs
+}
+
+/// The rows the tab lists: one per organisation of each account, or one for the
+/// account alone where no organisation is known.
 ///
 /// A row is marked active when this account is the selected one *and* a client
-/// is actually up. That mark is what `Enter` reads to choose between connecting
-/// and disconnecting, and what the conflict rules read as "the profile that is
-/// currently up", so the account store cannot answer it alone: a selection
-/// outlives every client started from it, and going by the store would leave
-/// the row green over a tunnel that is not there — with `Enter` on it trying to
-/// disconnect something that is already gone.
+/// is actually up, on this organisation. That mark is what `Enter` reads to
+/// choose between connecting and disconnecting, and what the conflict rules read
+/// as "the profile that is currently up", so the account store cannot answer it
+/// alone: a selection outlives every client started from it, and going by the
+/// store would leave the row green over a tunnel that is not there — with `Enter`
+/// on it trying to disconnect something that is already gone.
 ///
 /// Naming the running client's account from the store is exact rather than a
 /// guess: a client is started from the selected account's credentials, and
 /// `pangolin select account` stops any client that is running before it changes
-/// the selection, so the two cannot drift apart.
-fn profiles_of(accounts: &[Account], active: Option<&str>, connected: bool) -> Vec<VpnProfile> {
+/// the selection, so the two cannot drift apart. The organisation is the client's
+/// own to say, and `running` is what it said — `Some("")` for a client that is up
+/// and did not.
+fn profiles_of(
+    accounts: &[Account],
+    active: Option<&str>,
+    running: Option<&str>,
+    known: &KnownOrgs,
+) -> Vec<VpnProfile> {
     accounts
         .iter()
-        .map(|a| VpnProfile {
-            name: display_name(a, accounts),
-            active: connected && active == Some(a.user_id.as_str()),
-            detail: summarise(a),
-            foreign: None,
+        .flat_map(|a| {
+            let running = running.filter(|_| active == Some(a.user_id.as_str()));
+            let parent = display_name(a, accounts);
+            let orgs = orgs_of(a, known, running);
+            if orgs.is_empty() {
+                return vec![VpnProfile {
+                    name: parent,
+                    active: running.is_some(),
+                    detail: summarise(a, ""),
+                    foreign: None,
+                    within: None,
+                }];
+            }
+            let up = running.map(|r| if r.is_empty() { a.org.as_str() } else { r });
+            orgs.iter()
+                .map(|o| VpnProfile {
+                    name: format!("{parent}{VPN_SCOPE}{}", o.id),
+                    active: up == Some(o.id.as_str()),
+                    detail: summarise(a, &o.name),
+                    foreign: None,
+                    within: Some(Within {
+                        parent: parent.clone(),
+                        label: o.label(),
+                    }),
+                })
+                .collect()
         })
         .collect()
 }
@@ -492,6 +681,17 @@ fn find_account(accounts: &[Account], name: &str) -> Option<Account> {
         // still means the account it named.
         .or_else(|| accounts.iter().find(|a| a.email == name))
         .cloned()
+}
+
+/// The account a row or a requirement names, and the organisation if it names
+/// one. The whole name is tried first, because an email is allowed a `#` of its
+/// own and an organisation id is not.
+fn find_target(accounts: &[Account], name: &str) -> Option<(Account, Option<String>)> {
+    if let Some(a) = find_account(accounts, name) {
+        return Some((a, None));
+    }
+    let (account, org) = name.rsplit_once(VPN_SCOPE)?;
+    Some((find_account(accounts, account)?, Some(org.to_string())))
 }
 
 // ---------------------------------------------------------------------------
@@ -663,33 +863,54 @@ fn status_now() -> VpnStatus {
 // ---------------------------------------------------------------------------
 
 /// Fetch accounts and status on a background thread.
-pub fn refresh(tx: Sender<VpnMsg>) {
+///
+/// The organisations are asked after the answer has gone out and not before it,
+/// because that is the one part of a poll that goes to the server, and an
+/// unreachable one should not hold up the tab. If they turn out to have changed,
+/// a second answer follows.
+pub fn refresh(tx: Sender<VpnMsg>, orgs_file: PathBuf) {
     thread::spawn(move || {
         let store = accounts_now();
         let mut status = status_now();
-        let profiles = match &store {
-            Ok((accounts, active)) => {
-                Ok(profiles_of(accounts, active.as_deref(), status.connected))
-            }
-            Err(e) => Err(e.clone()),
-        };
+        let known = known_orgs(&orgs_file);
         // The client names an org and an agent, never an account, so the
-        // selected account is the only answer to "which profile is this" — and
+        // selected account is the only answer to "which account is this" — and
         // only while something is actually up, or a plan that asked for this
         // account would be told it already had it.
-        if status.connected {
-            if let Ok((accounts, Some(active))) = &store {
-                status.active_profile = accounts
-                    .iter()
-                    .find(|a| &a.user_id == active)
-                    .map(|a| display_name(a, accounts));
-            }
+        let running = status
+            .connected
+            .then(|| status.field("Organisation").unwrap_or("").to_string());
+        let profiles = match &store {
+            Ok((accounts, active)) => Ok(profiles_of(
+                accounts,
+                active.as_deref(),
+                running.as_deref(),
+                &known,
+            )),
+            Err(e) => Err(e.clone()),
+        };
+        if let Ok(rows) = &profiles {
+            status.active_profile = rows.iter().find(|p| p.active).map(|p| p.name.clone());
         }
         let _ = tx.send(VpnMsg::Refreshed {
             provider: ME,
             profiles,
             status,
         });
+
+        let Ok((_, Some(selected))) = store else {
+            return;
+        };
+        if !claim_org_listing(&selected) {
+            return;
+        }
+        let orgs = list_orgs();
+        // The listing took a round trip, and it answered for whoever was
+        // selected by then.
+        let still = accounts_now().is_ok_and(|(_, active)| active.as_ref() == Some(&selected));
+        if still && remember_orgs(&orgs_file, &selected, orgs) {
+            refresh(tx, orgs_file);
+        }
     });
 }
 
@@ -819,6 +1040,7 @@ pub fn action(
     steps: Vec<Step>,
     profile: Option<String>,
     log: Arc<Ring>,
+    orgs_file: PathBuf,
 ) {
     thread::spawn(move || {
         let mut failure = None;
@@ -845,7 +1067,7 @@ pub fn action(
                 error: Some(e),
             });
         }
-        refresh(tx);
+        refresh(tx, orgs_file);
     });
 }
 
@@ -861,17 +1083,31 @@ pub fn action(
 /// costs one refused connection.
 ///
 /// The login check comes after the selection, because `auth status` only ever
-/// speaks for the selected account, and before the `up`, because an `up` on a
-/// dead session fails in words that do not say so.
+/// speaks for the selected account, and before everything that goes on to need
+/// the session, because those fail in words that do not say so.
+///
+/// `select org` has its place for a reason too: with a client running it would
+/// switch that client in place and open `/dev/tty` to watch it happen. Once the
+/// stop has run there is nothing for it to switch, and all it does is save the
+/// choice for the `up` — and for `pangolin ssh` and the rest of the CLI, which is
+/// why the choice is saved rather than passed to `up --org` alone.
 ///
 /// `--silent` on the `up` is not optional either: without it a detached `up`
 /// draws a progress view of its own into the terminal controlcenter is holding.
-pub fn connect_plan(account: Option<&Account>) -> Vec<Step> {
+pub fn connect_plan(account: Option<&Account>, org: Option<&str>) -> Vec<Step> {
     let mut steps = vec![Step::Stop];
     if let Some(a) = account {
         steps.push(Step::Run(select_args(a)));
     }
     steps.push(Step::CheckLogin);
+    if let Some(org) = org {
+        steps.push(Step::Run(vec![
+            "select".into(),
+            "org".into(),
+            "--org".into(),
+            org.into(),
+        ]));
+    }
     steps.push(Step::Run(vec!["up".into(), "--silent".into()]));
     steps
 }
@@ -900,30 +1136,33 @@ pub fn connect(
     tx: Sender<VpnMsg>,
     profile: Option<&str>,
     log: Arc<Ring>,
+    orgs_file: PathBuf,
 ) -> Result<Vec<String>, String> {
-    let account = match profile {
+    let (account, org) = match profile {
         Some(name) => {
             let (accounts, _) = accounts_now()?;
-            Some(find_account(&accounts, name).ok_or_else(|| {
+            let (account, org) = find_target(&accounts, name).ok_or_else(|| {
                 format!("pangolin account '{name}' is not logged in — run `pangolin login`")
-            })?)
+            })?;
+            (Some(account), org)
         }
-        None => None,
+        None => (None, None),
     };
-    let desc = match &account {
-        Some(a) => format!("switching to account '{}'", a.email),
-        None => "connecting".to_string(),
+    let desc = match (&account, &org) {
+        (Some(a), Some(org)) => format!("switching to '{}' on '{org}'", a.email),
+        (Some(a), None) => format!("switching to account '{}'", a.email),
+        _ => "connecting".to_string(),
     };
-    let steps = connect_plan(account.as_ref());
+    let steps = connect_plan(account.as_ref(), org.as_deref());
     let ran = steps.iter().map(Step::describe).collect();
-    action(tx, desc, steps, profile.map(str::to_string), log);
+    action(tx, desc, steps, profile.map(str::to_string), log, orgs_file);
     Ok(ran)
 }
 
-pub fn disconnect(tx: Sender<VpnMsg>, log: Arc<Ring>) -> Vec<String> {
+pub fn disconnect(tx: Sender<VpnMsg>, log: Arc<Ring>, orgs_file: PathBuf) -> Vec<String> {
     let steps = vec![Step::Stop];
     let ran = steps.iter().map(Step::describe).collect();
-    action(tx, "disconnecting".into(), steps, None, log);
+    action(tx, "disconnecting".into(), steps, None, log, orgs_file);
     ran
 }
 
@@ -934,7 +1173,8 @@ pub fn disconnect(tx: Sender<VpnMsg>, log: Arc<Ring>) -> Vec<String> {
 pub fn login_args(profile: &str) -> Vec<String> {
     let account = accounts_now()
         .ok()
-        .and_then(|(accounts, _)| find_account(&accounts, profile));
+        .and_then(|(accounts, _)| find_target(&accounts, profile))
+        .map(|(account, _)| account);
     login_args_for(account.as_ref())
 }
 
@@ -1049,11 +1289,123 @@ mod tests {
     #[test]
     fn lists_accounts_as_profiles_with_the_running_one_active() {
         let (accounts, active) = parse_accounts(STORE).unwrap();
-        let profiles = profiles_of(&accounts, active.as_deref(), true);
-        assert_eq!(profiles[0].name, "someone@example.net");
+        let profiles = profiles_of(&accounts, active.as_deref(), Some("acme"), &KnownOrgs::new());
+        assert_eq!(profiles[0].name, "someone@example.net#acme");
         assert!(profiles[0].active);
         assert_eq!(profiles[0].detail, "pangolin.example.de · acme");
         assert!(!profiles[1].active);
+    }
+
+    fn two_orgs() -> KnownOrgs {
+        let org = |id: &str, name: &str| Org {
+            id: id.into(),
+            name: name.into(),
+        };
+        KnownOrgs::from([(
+            "9v4awzt468de0fn".to_string(),
+            vec![org("acme", "Acme Inc"), org("beta", "beta")],
+        )])
+    }
+
+    #[test]
+    fn each_known_organisation_is_a_row_and_only_the_running_one_is_active() {
+        let (accounts, active) = parse_accounts(STORE).unwrap();
+        // The client is on beta, whatever the store last had selected.
+        let rows = profiles_of(&accounts, active.as_deref(), Some("beta"), &two_orgs());
+        let names: Vec<&str> = rows.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "someone@example.net#acme",
+                "someone@example.net#beta",
+                "zed@example.net#other",
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|p| p.active).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        let within = rows[0].within.as_ref().unwrap();
+        assert_eq!(within.parent, "someone@example.net");
+        assert_eq!(within.label, "Acme Inc (acme)");
+        assert_eq!(rows[1].within.as_ref().unwrap().label, "beta");
+        assert_eq!(rows[0].detail, "pangolin.example.de · Acme Inc");
+    }
+
+    #[test]
+    fn a_client_on_an_organisation_not_yet_listed_still_gets_its_row() {
+        let (accounts, active) = parse_accounts(STORE).unwrap();
+        let rows = profiles_of(&accounts, active.as_deref(), Some("new"), &two_orgs());
+        assert!(rows.iter().any(|p| p.name == "someone@example.net#new" && p.active));
+    }
+
+    #[test]
+    fn a_client_that_names_no_organisation_is_on_the_selected_one() {
+        let (accounts, active) = parse_accounts(STORE).unwrap();
+        let rows = profiles_of(&accounts, active.as_deref(), Some(""), &KnownOrgs::new());
+        assert!(rows[0].active);
+    }
+
+    #[test]
+    fn an_account_with_no_organisation_at_all_keeps_a_plain_row() {
+        let raw = STORE.replace(r#""orgId": "acme""#, r#""orgId": """#);
+        let (accounts, active) = parse_accounts(&raw).unwrap();
+        let rows = profiles_of(&accounts, active.as_deref(), Some(""), &KnownOrgs::new());
+        assert_eq!(rows[0].name, "someone@example.net");
+        assert!(rows[0].within.is_none());
+        assert!(rows[0].active);
+    }
+
+    /// Shaped as 0.21.0 prints it, with a banner of the kind any command can
+    /// lead with.
+    #[test]
+    fn reads_organisations_out_of_the_completion() {
+        let out = "A new version is available: 9.9.9\n\
+                   zeta\tZeta GmbH\nacme\tAcme Inc\n:4\n";
+        let orgs = parse_orgs(out);
+        assert_eq!(
+            orgs.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["acme", "zeta"]
+        );
+        assert_eq!(orgs[1].name, "Zeta GmbH");
+        // What a dead session prints: no candidates, and no error.
+        assert!(parse_orgs(":4\n").is_empty());
+    }
+
+    #[test]
+    fn a_name_finds_its_account_and_organisation() {
+        let (accounts, _) = parse_accounts(STORE).unwrap();
+        let (a, org) = find_target(&accounts, "zed@example.net#beta").unwrap();
+        assert_eq!(a.email, "zed@example.net");
+        assert_eq!(org.as_deref(), Some("beta"));
+        // From before there were organisations.
+        let (a, org) = find_target(&accounts, "zed@example.net").unwrap();
+        assert_eq!(a.email, "zed@example.net");
+        assert_eq!(org, None);
+        assert!(find_target(&accounts, "nobody@example.net#beta").is_none());
+    }
+
+    #[test]
+    fn an_email_is_allowed_a_hash_of_its_own() {
+        let raw = STORE.replace("zed@example.net", "z#d@example.net");
+        let (accounts, _) = parse_accounts(&raw).unwrap();
+        let (a, org) = find_target(&accounts, "z#d@example.net").unwrap();
+        assert_eq!(a.email, "z#d@example.net");
+        assert_eq!(org, None);
+    }
+
+    #[test]
+    fn choosing_an_organisation_comes_after_the_login_check_and_before_up() {
+        let (accounts, _) = parse_accounts(STORE).unwrap();
+        let lines: Vec<String> = connect_plan(Some(&accounts[0]), Some("beta"))
+            .iter()
+            .map(Step::describe)
+            .collect();
+        assert!(lines[0].contains("/exit"), "{}", lines[0]);
+        assert!(lines[1].starts_with("pangolin select account"), "{}", lines[1]);
+        assert_eq!(lines[2], "pangolin auth status");
+        assert_eq!(lines[3], "pangolin select org --org beta");
+        assert_eq!(lines[4], "pangolin up --silent");
     }
 
     #[test]
@@ -1062,7 +1414,7 @@ mod tests {
         // row green over a tunnel that is not there — and Enter on it would try
         // to disconnect rather than connect.
         let (accounts, active) = parse_accounts(STORE).unwrap();
-        let profiles = profiles_of(&accounts, active.as_deref(), false);
+        let profiles = profiles_of(&accounts, active.as_deref(), None, &KnownOrgs::new());
         assert!(profiles.iter().all(|p| !p.active));
     }
 
@@ -1148,7 +1500,7 @@ mod tests {
     #[test]
     fn a_plain_connect_still_clears_the_way_and_checks_the_login() {
         assert_eq!(
-            connect_plan(None),
+            connect_plan(None, None),
             vec![
                 Step::Stop,
                 Step::CheckLogin,
@@ -1160,7 +1512,7 @@ mod tests {
     #[test]
     fn switching_stops_selects_then_checks_the_login_before_up() {
         let (accounts, _) = parse_accounts(STORE).unwrap();
-        let steps = connect_plan(Some(&accounts[0]));
+        let steps = connect_plan(Some(&accounts[0]), None);
         // The stop has to come first: `up` refuses while a client is running,
         // and `select account` would take it down without waiting.
         assert_eq!(steps[0], Step::Stop);
@@ -1184,7 +1536,7 @@ mod tests {
     #[test]
     fn every_step_says_what_it_did_for_the_log() {
         let (accounts, _) = parse_accounts(STORE).unwrap();
-        let lines: Vec<String> = connect_plan(Some(&accounts[1]))
+        let lines: Vec<String> = connect_plan(Some(&accounts[1]), None)
             .iter()
             .map(Step::describe)
             .collect();

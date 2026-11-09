@@ -652,7 +652,7 @@ fn vpn_profile_block(out: &mut String, app: &App, provider: ProviderId, profile:
             // These come from the same place the action does, so what is
             // reported is what ran. A switch puts its `select account` second;
             // the rest is every plan.
-            for step in pangolin::connect_plan(None) {
+            for step in pangolin::connect_plan(None, None) {
                 field(out, "command", step.describe());
             }
             field(out, "stop", pangolin::Step::Stop.describe());

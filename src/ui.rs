@@ -3784,7 +3784,7 @@ fn render_chooser_overlay(f: &mut Frame, chooser: &Chooser, area: Rect) {
     let where_ = if chooser.folder.is_empty() {
         "all".to_string()
     } else {
-        format!("{}/", chooser.folder)
+        format!("{}/", chooser.folder.join(" / "))
     };
     let filter_width = inner.width as usize;
     f.render_widget(
@@ -3845,7 +3845,7 @@ fn render_chooser_overlay(f: &mut Frame, chooser: &Chooser, area: Rect) {
     let hint = if chooser.folder.is_empty() {
         " ↑↓ select · type to search every group · Enter pick · Esc cancel"
     } else {
-        " ↑↓ select · type to filter · Enter pick · ← out of the group · Esc cancel"
+        " ↑↓ select · type to filter · Enter pick · ← up a level · Esc cancel"
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(DIM())))),

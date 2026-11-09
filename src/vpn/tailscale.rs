@@ -242,6 +242,7 @@ pub fn refresh(tx: Sender<VpnMsg>, stored: Vec<TailscaleProfile>) {
                 name: p.name.clone(),
                 detail: summarise(p),
                 foreign: None,
+                within: None,
             })
             .collect();
         let _ = tx.send(VpnMsg::Refreshed {

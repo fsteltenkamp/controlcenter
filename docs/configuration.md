@@ -27,7 +27,10 @@ directory granted — including the machine's administrators — and leaves your
 the only entry. A file that would be 0600 on Linux is yours alone on Windows too.
 
 NetBird and Pangolin are absent from `vpn.toml` on purpose: netbird's profiles live in
-netbird and pangolin's accounts live in pangolin, and both are only read. `reports/` is written to rather than read, and appears the first time you export
+netbird and pangolin's accounts live in pangolin, and both are only read. The one thing
+kept about them is `pangolin-orgs.json`, the organisations each account was last seen to
+have, because pangolin can only list the selected account's. It is a cache: deleting it
+costs nothing but the listings. `reports/` is written to rather than read, and appears the first time you export
 one — see [logs.md](logs.md).
 
 ## config.toml

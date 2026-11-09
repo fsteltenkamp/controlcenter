@@ -309,6 +309,8 @@ pub const VPN_ANY: &str = "*";
 /// | `"*"` | any provider, connected |
 /// | `"netbird:*"` | any netbird profile |
 /// | `"wireguard:home"` | that profile |
+/// | `"pangolin:me@x.net"` | that account, on whichever organisation it has selected |
+/// | `"pangolin:me@x.net#acme"` | that account, on that organisation |
 /// | `"work"` | netbird's, from before there was more than one provider |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpnRequirement {
@@ -318,7 +320,37 @@ pub struct VpnRequirement {
     pub profile: Option<String>,
 }
 
+/// Separates a profile from a place inside it, for a client whose profiles have
+/// any — see [`ProviderId::has_scopes`]. Not `/` or `:`, both of which are in a
+/// pangolin account name once it has to carry its server's URL.
+pub const VPN_SCOPE: char = '#';
+
+/// Whether `have` being up answers for a requirement on `want`: the same profile,
+/// or a place inside it. Being on one organisation of an account is being on that
+/// account, and the reverse is not true.
+pub fn profile_covers(provider: ProviderId, want: &str, have: &str) -> bool {
+    want == have
+        || (provider.has_scopes()
+            && have
+                .strip_prefix(want)
+                .is_some_and(|rest| rest.starts_with(VPN_SCOPE)))
+}
+
 impl VpnRequirement {
+    /// Whether something that needs this is cut off when `up` goes away. Exact
+    /// apart from scopes: a connection that takes any profile outlives any one
+    /// of them.
+    pub fn rides_on(&self, up: &VpnRequirement) -> bool {
+        if self.provider != up.provider {
+            return false;
+        }
+        match (&self.profile, &up.profile, self.provider) {
+            (Some(want), Some(have), Some(p)) => profile_covers(p, want, have),
+            (None, None, _) => true,
+            _ => false,
+        }
+    }
+
     /// How it is written in config files and carried in a plan step.
     pub fn canonical(&self) -> String {
         match (self.provider, &self.profile) {

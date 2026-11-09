@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 233 tests, all pure unit tests — no network, no root
+cargo test             # 251 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -51,7 +51,7 @@ so those still need the CI job or a real machine.
 | `src/sftp.rs` | the one `sftp` process a transfer browser talks to, the listing it parses, and the remote pane's state |
 | `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
 | `src/browser.rs` | the file picker |
-| `src/chooser.rs` | the list picker — groups as folders, entries as files |
+| `src/chooser.rs` | the list picker — a tree: groups, clients and accounts as folders, entries as files |
 | `src/theme.rs` | the four colour themes |
 | `src/vpn/` | one module per client behind a shared interface in `mod.rs`, plus `privileged.rs` for pkexec/sudo/elevation and `scan.rs` for what is on the machine |
 
@@ -180,6 +180,14 @@ non-zero on a no-op, and `status --json` shares its stdout with the CLI's update
 banner. Reaching past a CLI needs that kind of reason written down beside it, and
 it stays inside the same two rules as everything else: the client's own published
 interface, and no escalation for anything that only looks.
+
+An organisation is a place inside a profile, written `account#org`
+(`types::VPN_SCOPE`), and `ProviderId::has_scopes` says which clients have them. Never
+compare two such names with `==`: `types::profile_covers` is what knows that being on an
+organisation is being on its account. The CLI has no listing of them, so `pangolin::list_orgs`
+reads the completion for `select org --org`, which speaks only for the selected account —
+that is why they are remembered per account. Do not call the server's API instead: the CLI
+holds the session token and nothing here should.
 
 Reaching past a CLI is also why `pangolin::SUPPORTED` exists: it names the release the
 socket replies, the account store and the `auth status` wording were last checked against,

@@ -70,6 +70,7 @@ fn parse_profiles(raw: &str) -> Vec<VpnProfile> {
                 name,
                 detail: String::new(),
                 foreign: None,
+                within: None,
             })
         })
         .collect()

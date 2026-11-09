@@ -12,10 +12,14 @@
 //! of those lists and should look like it. It also puts "(none)" where the eye
 //! already expects it.
 //!
-//! One thing it does that a directory cannot: typing at the top level searches
-//! every folder at once. The reason to open this at all is usually that the
+//! One thing it does that a directory cannot: typing searches every folder below
+//! where you are at once. The reason to open this at all is usually that the
 //! group an entry is filed under is the part you have forgotten, so making the
 //! search go through the folders first would defeat it.
+//!
+//! A folder is a path of names rather than one string with separators in it,
+//! because the names are other people's: a tunnel group may hold a `/`, and a
+//! pangolin account's name holds its server's URL.
 
 /// One thing that can be picked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,8 +28,9 @@ pub struct Choice {
     pub value: String,
     /// How it is listed inside its folder.
     pub name: String,
-    /// The folder it is filed under. Empty = listed at the top level.
-    pub folder: String,
+    /// The folders it is filed under, outermost first. Empty = listed at the
+    /// top level.
+    pub folder: Vec<String>,
 }
 
 impl Choice {
@@ -34,7 +39,7 @@ impl Choice {
         Self {
             value: value.into(),
             name: name.into(),
-            folder: String::new(),
+            folder: Vec::new(),
         }
     }
 
@@ -43,10 +48,21 @@ impl Choice {
         name: impl Into<String>,
         folder: impl Into<String>,
     ) -> Self {
+        // A connection in no group is handed over with an empty group name.
+        let folder = Some(folder.into()).filter(|f| !f.is_empty());
+        Self::in_path(value, name, folder.into_iter().collect())
+    }
+
+    /// A choice some folders down.
+    pub fn in_path(
+        value: impl Into<String>,
+        name: impl Into<String>,
+        folder: Vec<String>,
+    ) -> Self {
         Self {
             value: value.into(),
             name: name.into(),
-            folder: folder.into(),
+            folder,
         }
     }
 }
@@ -54,6 +70,7 @@ impl Choice {
 /// A line in the listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
+    /// A folder directly inside the one being listed, by its own name.
     Folder(String),
     Choice {
         value: String,
@@ -68,8 +85,8 @@ pub struct Chooser {
     /// What the popup is picking — "requires tunnel", "ssh host".
     pub title: String,
     choices: Vec<Choice>,
-    /// The folder being listed. Empty = the top level.
-    pub folder: String,
+    /// The folder being listed, outermost first. Empty = the top level.
+    pub folder: Vec<String>,
     /// What has been typed, which filters the listing.
     pub filter: String,
     pub rows: Vec<Row>,
@@ -104,11 +121,16 @@ impl Chooser {
         self.choices.len()
     }
 
+    /// The folders directly inside the one being listed, in order of first
+    /// appearance.
     fn folders(&self) -> Vec<String> {
+        let depth = self.folder.len();
         let mut out: Vec<String> = Vec::new();
-        for c in &self.choices {
-            if !c.folder.is_empty() && !out.contains(&c.folder) {
-                out.push(c.folder.clone());
+        for c in self.choices.iter().filter(|c| c.folder.starts_with(&self.folder)) {
+            if let Some(name) = c.folder.get(depth) {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
         }
         out
@@ -118,43 +140,31 @@ impl Chooser {
         let filter = self.filter.to_lowercase();
         let matches = |s: &str| filter.is_empty() || s.to_lowercase().contains(&filter);
 
+        let depth = self.folder.len();
         let mut rows: Vec<Row> = Vec::new();
-        if self.folder.is_empty() {
-            for c in &self.choices {
-                // With nothing typed this is a tree and a grouped entry is
-                // inside its folder; typing turns it into a search of the lot.
-                let listed = if filter.is_empty() {
-                    c.folder.is_empty()
-                } else {
-                    matches(&c.name)
-                };
-                if listed {
-                    rows.push(Row::Choice {
-                        value: c.value.clone(),
-                        label: if c.folder.is_empty() {
-                            c.name.clone()
-                        } else {
-                            format!("{} / {}", c.folder, c.name)
-                        },
-                    });
-                }
-            }
-            rows.extend(
-                self.folders()
-                    .into_iter()
-                    .filter(|f| matches(f))
-                    .map(Row::Folder),
-            );
-        } else {
-            for c in self.choices.iter().filter(|c| c.folder == self.folder) {
-                if matches(&c.name) {
-                    rows.push(Row::Choice {
-                        value: c.value.clone(),
-                        label: c.name.clone(),
-                    });
-                }
+        for c in self.choices.iter().filter(|c| c.folder.starts_with(&self.folder)) {
+            // With nothing typed this is a tree and a deeper entry is inside
+            // its folder; typing turns it into a search of everything below.
+            let listed = if filter.is_empty() {
+                c.folder.len() == depth
+            } else {
+                matches(&c.name)
+            };
+            if listed {
+                let mut label = c.folder[depth..].to_vec();
+                label.push(c.name.clone());
+                rows.push(Row::Choice {
+                    value: c.value.clone(),
+                    label: label.join(" / "),
+                });
             }
         }
+        rows.extend(
+            self.folders()
+                .into_iter()
+                .filter(|f| matches(f))
+                .map(Row::Folder),
+        );
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -211,18 +221,17 @@ impl Chooser {
         let Some(Row::Folder(name)) = self.selected_row().cloned() else {
             return;
         };
-        self.folder = name;
+        self.folder.push(name);
         self.filter.clear();
         self.selected = 0;
         self.refresh();
     }
 
-    /// Back to the top level, with the folder we came out of selected.
+    /// One folder up, with the folder we came out of selected.
     pub fn ascend(&mut self) {
-        if self.folder.is_empty() {
+        let Some(leaf) = self.folder.pop() else {
             return;
-        }
-        let leaf = std::mem::take(&mut self.folder);
+        };
         self.filter.clear();
         self.selected = 0;
         self.refresh();
@@ -285,7 +294,7 @@ mod tests {
         let mut c = Chooser::open("dep", choices(), "");
         c.selected = 2; // prod/
         assert_eq!(c.accept(), None);
-        assert_eq!(c.folder, "prod");
+        assert_eq!(c.folder, ["prod"]);
         assert_eq!(labels(&c), vec!["db", "web"]);
         assert_eq!(c.accept(), Some("prod-db".to_string()));
     }
@@ -304,7 +313,7 @@ mod tests {
     #[test]
     fn typing_inside_a_folder_stays_inside_it() {
         let mut c = Chooser::open("dep", choices(), "prod-web");
-        assert_eq!(c.folder, "prod");
+        assert_eq!(c.folder, ["prod"]);
         for ch in "d".chars() {
             c.push(ch);
         }
@@ -314,7 +323,7 @@ mod tests {
     #[test]
     fn it_opens_on_the_value_the_field_already_holds() {
         let c = Chooser::open("dep", choices(), "test-db");
-        assert_eq!(c.folder, "test");
+        assert_eq!(c.folder, ["test"]);
         assert_eq!(
             c.selected_row(),
             Some(&Row::Choice {
@@ -332,9 +341,63 @@ mod tests {
         c.backspace();
         assert_eq!(labels(&c), vec!["db", "web"]);
         c.backspace();
-        assert_eq!(c.folder, "");
+        assert!(c.folder.is_empty());
         // And the folder it came out of is what the cursor is on.
         assert_eq!(c.selected_row(), Some(&Row::Folder("prod".into())));
+    }
+
+    fn nested() -> Vec<Choice> {
+        let account = || vec!["pangolin".to_string(), "me@x.net".to_string()];
+        vec![
+            Choice::plain("", "(none)"),
+            Choice::in_folder("pangolin:*", "(any profile)", "pangolin"),
+            Choice::in_path("pangolin:me@x.net", "(any organisation)", account()),
+            Choice::in_path("pangolin:me@x.net#acme", "Acme", account()),
+            Choice::in_path("pangolin:me@x.net#beta", "Beta", account()),
+            Choice::in_folder("netbird:work", "work", "netbird"),
+        ]
+    }
+
+    #[test]
+    fn folders_nest_and_each_level_lists_only_its_own() {
+        let mut c = Chooser::open("vpn", nested(), "");
+        assert_eq!(labels(&c), vec!["(none)", "pangolin/", "netbird/"]);
+        c.selected = 1;
+        assert_eq!(c.accept(), None);
+        assert_eq!(labels(&c), vec!["(any profile)", "me@x.net/"]);
+        c.selected = 1;
+        assert_eq!(c.accept(), None);
+        assert_eq!(labels(&c), vec!["(any organisation)", "Acme", "Beta"]);
+        c.selected = 2;
+        assert_eq!(c.accept(), Some("pangolin:me@x.net#beta".to_string()));
+    }
+
+    #[test]
+    fn it_opens_as_deep_as_the_value_it_holds_and_climbs_one_level_at_a_time() {
+        let mut c = Chooser::open("vpn", nested(), "pangolin:me@x.net#acme");
+        assert_eq!(c.folder, ["pangolin", "me@x.net"]);
+        assert_eq!(c.selected, 1);
+        c.ascend();
+        assert_eq!(c.folder, ["pangolin"]);
+        assert_eq!(c.selected_row(), Some(&Row::Folder("me@x.net".into())));
+        c.ascend();
+        assert_eq!(c.selected_row(), Some(&Row::Folder("pangolin".into())));
+    }
+
+    #[test]
+    fn a_search_reaches_every_level_below_and_says_where_it_found_it() {
+        let mut c = Chooser::open("vpn", nested(), "");
+        for ch in "acme".chars() {
+            c.push(ch);
+        }
+        assert_eq!(labels(&c), vec!["pangolin / me@x.net / Acme"]);
+        assert_eq!(c.accept(), Some("pangolin:me@x.net#acme".to_string()));
+    }
+
+    #[test]
+    fn a_slash_in_a_group_name_is_not_a_level() {
+        let c = Chooser::open("dep", vec![Choice::in_folder("a", "a", "site/east")], "");
+        assert_eq!(labels(&c), vec!["site/east/"]);
     }
 
     #[test]
