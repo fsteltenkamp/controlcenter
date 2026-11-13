@@ -5,6 +5,8 @@ use crate::app::{
 };
 use crate::browser::FileBrowser;
 use crate::chooser::{Chooser, Row as ChooserRow};
+use crate::docker::{self, Condition, DockerPane, Row as DockerRow};
+use crate::logs::LogTarget;
 use crate::logs;
 use crate::platform::Advice;
 use crate::rdp::RdpStatus;
@@ -85,6 +87,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Tab::Tunnels => render_tunnels(f, app, chunks[1]),
         Tab::Ssh => render_ssh(f, app, chunks[1]),
         Tab::Rdp => render_rdp(f, app, chunks[1]),
+        Tab::Docker => render_docker(f, app, chunks[1]),
     }
     render_status(f, app, chunks[2]);
 
@@ -119,6 +122,10 @@ pub fn render(f: &mut Frame, app: &App) {
             render_vpn_delete_confirm(f, app, area, *provider, *idx)
         }
         VpnMode::SecretWarning { .. } => render_vpn_secret_warning(f, app, area),
+    }
+
+    if let Some(c) = &app.docker_confirm {
+        render_docker_confirm(f, &c.question, area);
     }
 
     // One log pane for the whole program, over whichever tab opened it.
@@ -215,8 +222,24 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         names.sort_unstable();
         names.join("+")
     };
-    let title_right =
-        format!(" ssh {}/{} up · vpn {} · rdp {} ", up, app.active.len(), vpn, rdp_running);
+    let docker = {
+        let listed: Vec<_> = app.docker.engines.iter().filter(|e| e.listed).collect();
+        if listed.is_empty() {
+            "-".to_string()
+        } else {
+            let running: usize = listed.iter().map(|e| e.running()).sum();
+            let all: usize = listed.iter().map(|e| e.containers.len()).sum();
+            format!("{running}/{all}")
+        }
+    };
+    let title_right = format!(
+        " ssh {}/{} up · vpn {} · rdp {} · docker {} ",
+        up,
+        app.active.len(),
+        vpn,
+        rdp_running,
+        docker
+    );
 
     let tabs = Tabs::new(titles)
         .select(app.tab.index())
@@ -1955,6 +1978,9 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
             if !h.extra_args.is_empty() {
                 lines.push(field("extra args", h.extra_args.clone()));
             }
+            if h.docker {
+                lines.push(field("docker", "listed on the Docker tab".into()));
+            }
 
             if !h.password.is_empty() {
                 lines.push(Line::from(""));
@@ -2037,6 +2063,390 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Docker
+// ---------------------------------------------------------------------------
+
+/// The mark and colour for how much something needs looking at.
+fn condition_style(c: Condition) -> (&'static str, Color) {
+    match c {
+        Condition::Good => ("●", OK()),
+        Condition::Warn => ("◐", WARN()),
+        Condition::Bad => ("✖", DANGER()),
+        Condition::Idle => ("○", DIM()),
+    }
+}
+
+/// `● app healthy` — one container as the state strip and the lists show it.
+fn container_spans(c: &docker::Container) -> Vec<Span<'static>> {
+    let (cond, word) = c.condition();
+    let (mark, color) = condition_style(cond);
+    vec![
+        Span::styled(format!("{mark} "), Style::default().fg(color)),
+        Span::styled(c.label().to_string(), Style::default().fg(TEXT())),
+        Span::styled(format!(" {word}"), Style::default().fg(color)),
+    ]
+}
+
+/// Stacks by engine on the left, the stack's containers in the middle, and
+/// what is under the cursor on the right — the VPN tab's shape, one level
+/// deeper.
+fn render_docker(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(28),
+            Constraint::Percentage(34),
+            Constraint::Percentage(38),
+        ])
+        .split(area);
+    render_docker_stacks(f, app, chunks[0]);
+    render_docker_containers(f, app, chunks[1]);
+    render_docker_details(f, app, chunks[2]);
+}
+
+fn render_docker_stacks(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.docker.rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            DockerRow::Engine(e) => {
+                let st = app.docker.get(e);
+                let (mark, color) = match st {
+                    _ if app.docker_unreachable(e).is_some() => ("·", DIM()),
+                    Some(s) if s.error.is_some() => ("✖", DANGER()),
+                    Some(s) if s.pending && !s.listed => ("◌", WARN()),
+                    Some(s) if s.listed => condition_style(
+                        docker::worst(&s.containers).max(Condition::Good),
+                    ),
+                    _ => ("○", DIM()),
+                };
+                let count = st
+                    .filter(|s| s.listed)
+                    .map(|s| format!("  {}/{}", s.running(), s.containers.len()))
+                    .unwrap_or_default();
+                let fold = if app.docker.expanded.contains(e) { "▾ " } else { "▸ " };
+                ListItem::new(Line::from(vec![
+                    Span::styled(fold, Style::default().fg(DIM())),
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(e.label(), Style::default().fg(ACCENT()).bold()),
+                    Span::styled(count, Style::default().fg(DIM())),
+                ]))
+            }
+            DockerRow::Stack(e, name) => {
+                let containers = app
+                    .docker
+                    .get(e)
+                    .map(|st| docker::members(&st.containers, name))
+                    .unwrap_or_default();
+                let stack = docker::Stack {
+                    name,
+                    containers,
+                };
+                let (running, containers) = (stack.running(), stack.containers);
+                let busy = app
+                    .docker_busy
+                    .contains_key(&LogTarget::docker(e.key(), name, ""));
+                let (mark, color) = if busy {
+                    ("◌", WARN())
+                } else {
+                    condition_style(docker::worst(containers.iter().copied()))
+                };
+                let label = if name.is_empty() { docker::STANDALONE } else { name };
+                ListItem::new(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(label.to_string(), Style::default().fg(TEXT())),
+                    Span::styled(
+                        format!("  {running}/{}", containers.len()),
+                        Style::default().fg(DIM()),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(SELECTION_BG()))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border(app.docker.focus == DockerPane::Stacks))
+                .title(Span::styled(" stacks ", Style::default().fg(TEXT()))),
+        );
+    let mut state = ListState::default();
+    state.select(Some(app.docker.row_index()));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_docker_containers(f: &mut Frame, app: &App, area: Rect) {
+    let row = app.docker.current_row();
+    let containers = app.docker.stack_containers();
+    let title = match &row {
+        DockerRow::Stack(_, s) if s.is_empty() => format!(" {} ", docker::STANDALONE),
+        DockerRow::Stack(_, s) => format!(" {s} "),
+        DockerRow::Engine(_) => " containers ".to_string(),
+    };
+    let items: Vec<ListItem> = containers
+        .iter()
+        .map(|c| {
+            let mut spans = vec![Span::raw(" ")];
+            if app.docker_busy.contains_key(&c.target(row.engine())) {
+                spans.push(Span::styled("◌ ", Style::default().fg(WARN())));
+                spans.push(Span::styled(c.label().to_string(), Style::default().fg(TEXT())));
+            } else {
+                spans.extend(container_spans(c));
+            }
+            spans.push(Span::styled(
+                format!("  {}", truncate(&c.image, 28)),
+                Style::default().fg(DIM()),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let empty = items.is_empty();
+    let list = List::new(items)
+        .highlight_style(if app.docker.focus == DockerPane::Containers {
+            Style::default().bg(SELECTION_BG())
+        } else {
+            Style::default()
+        })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border(app.docker.focus == DockerPane::Containers))
+                .title(Span::styled(title, Style::default().fg(TEXT()))),
+        );
+    let mut state = ListState::default();
+    if !empty {
+        state.select(Some(app.docker.container_index()));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+    if empty {
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  pick a stack on the left",
+                Style::default().fg(DIM()),
+            )),
+            inner,
+        );
+    }
+}
+
+fn render_docker_details(f: &mut Frame, app: &App, area: Rect) {
+    let row = app.docker.current_row();
+    let engine = row.engine().clone();
+    let mut lines: Vec<Line> = Vec::new();
+    let kvl = |k: &str, v: String, color: Color| {
+        Line::from(vec![
+            Span::styled(format!(" {k:<12}"), Style::default().fg(DIM())),
+            Span::styled(v, Style::default().fg(color)),
+        ])
+    };
+    let hint = |t: &str| Line::from(Span::styled(format!(" {t}"), Style::default().fg(DIM())));
+
+    if let Some(c) = app.docker.selected_container() {
+        let (cond, word) = c.condition();
+        let (_, color) = condition_style(cond);
+        lines.push(kvl("container", c.name.clone(), TEXT()));
+        if !c.service.is_empty() {
+            lines.push(kvl("service", c.service.clone(), TEXT()));
+        }
+        lines.push(kvl("state", word, color));
+        lines.push(kvl("status", c.status.clone(), TEXT()));
+        lines.push(kvl("image", c.image.clone(), TEXT()));
+        if !c.ports.is_empty() {
+            lines.push(kvl("ports", c.ports.clone(), TEXT()));
+        }
+        lines.push(kvl("created", c.created.clone(), DIM()));
+        lines.push(kvl("id", c.id.clone(), DIM()));
+        if let Some(busy) = app.docker_busy.get(&c.target(&engine)) {
+            lines.push(kvl("action", format!("{busy}…"), WARN()));
+        }
+        let recent = app.log_lines(&c.target(&engine));
+        if !recent.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(hint("latest — l for the whole log:"));
+            for e in recent.iter().rev().take(8).rev() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate(&e.text, area.width.saturating_sub(5) as usize)),
+                    Style::default().fg(if e.error { DANGER() } else { TEXT() }),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(hint("↵ start/stop · r restart · d remove a stopped one"));
+        lines.push(hint("l this container's log · ← back to the stacks"));
+    } else {
+        match &row {
+            DockerRow::Engine(e) => {
+                lines.push(kvl("engine", e.label(), TEXT()));
+                if let docker::Engine::Ssh(n) = e {
+                    lines.push(kvl("over", format!("ssh host '{n}'"), TEXT()));
+                }
+                let st = app.docker.get(e);
+                if let Some(why) = app.docker_unreachable(e) {
+                    lines.push(kvl("state", why, WARN()));
+                } else if let Some(err) = st.and_then(|s| s.error.as_ref()) {
+                    lines.push(kvl("state", "not answering".into(), DANGER()));
+                    for l in err.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {l}"),
+                            Style::default().fg(DANGER()),
+                        )));
+                    }
+                } else if let Some(s) = st.filter(|s| s.listed) {
+                    lines.push(kvl(
+                        "containers",
+                        format!("{} running of {}", s.running(), s.containers.len()),
+                        TEXT(),
+                    ));
+                    lines.push(kvl(
+                        "stacks",
+                        docker::stacks(&s.containers)
+                            .iter()
+                            .filter(|s| !s.name.is_empty())
+                            .count()
+                            .to_string(),
+                        TEXT(),
+                    ));
+                } else {
+                    lines.push(kvl("state", "listing…".into(), WARN()));
+                }
+                lines.push(Line::from(""));
+                lines.push(hint(if app.docker.expanded.contains(e) {
+                    "← folds its stacks away"
+                } else {
+                    "→ lists its stacks"
+                }));
+                if matches!(e, docker::Engine::Ssh(_)) {
+                    lines.push(hint("↵ brings up what the host needs, then lists it"));
+                    lines.push(hint("its VPN, tunnel, key and password are the SSH tab's"));
+                } else {
+                    lines.push(hint("↵ / r list it again"));
+                    lines.push(hint("another engine: Docker = yes on an SSH host"));
+                }
+                lines.push(hint("listed every few seconds while this tab is open"));
+            }
+            DockerRow::Stack(_, name) => {
+                let containers = app.docker.stack_containers();
+                let stack = docker::Stack {
+                    name,
+                    containers: containers.clone(),
+                };
+                lines.push(kvl("stack", stack.label().to_string(), TEXT()));
+                lines.push(kvl("engine", engine.label(), TEXT()));
+                if !stack.working_dir().is_empty() {
+                    let room = area.width.saturating_sub(16) as usize;
+                    lines.push(kvl("directory", truncate_left(stack.working_dir(), room), TEXT()));
+                }
+                // Beside the directory they are usually in, so said relative to it.
+                let room = area.width.saturating_sub(16) as usize;
+                for (i, file) in stack.config_files().iter().enumerate() {
+                    let shown = file
+                        .strip_prefix(stack.working_dir())
+                        .and_then(|f| f.strip_prefix('/'))
+                        .unwrap_or(file);
+                    lines.push(kvl(
+                        if i == 0 { "compose" } else { "" },
+                        truncate_left(shown, room),
+                        DIM(),
+                    ));
+                }
+                if let Some(busy) = app.docker_busy.get(&LogTarget::docker(engine.key(), name, "")) {
+                    lines.push(kvl("action", format!("{busy}…"), WARN()));
+                }
+                lines.push(Line::from(""));
+                for c in &containers {
+                    let mut spans = vec![Span::raw(" ")];
+                    spans.extend(container_spans(c));
+                    spans.push(Span::styled(
+                        format!("  {}", c.status),
+                        Style::default().fg(DIM()),
+                    ));
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+                if name.is_empty() {
+                    lines.push(hint("these belong to no compose project"));
+                    lines.push(hint("→ picks one to start, stop or read"));
+                } else {
+                    lines.push(hint("↵ start/stop the stack · r restart · d compose down"));
+                    lines.push(hint("l every container's log, with their states"));
+                    lines.push(hint("→ one container: its own log, start, stop"));
+                }
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER()))
+                .title(Span::styled(" details ", Style::default().fg(TEXT()))),
+        ),
+        area,
+    );
+}
+
+/// The containers a docker log pane is about, packed into as many lines as
+/// they take — what is wrong with a stack is the first thing to read, before
+/// any of what it printed.
+fn docker_strip_lines(app: &App, target: &LogTarget, width: usize) -> Vec<Line<'static>> {
+    let containers = app.docker_strip(target);
+    if containers.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Line> = Vec::new();
+    let mut current: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1;
+    for c in &containers {
+        let spans = container_spans(c);
+        let len: usize = spans.iter().map(|s| s.content.chars().count()).sum::<usize>() + 3;
+        if used + len > width && used > 1 {
+            out.push(Line::from(std::mem::replace(&mut current, vec![Span::raw(" ")])));
+            used = 1;
+        }
+        current.extend(spans);
+        current.push(Span::raw("   "));
+        used += len;
+    }
+    out.push(Line::from(current));
+    out.push(Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(BORDER()),
+    )));
+    out
+}
+
+fn render_docker_confirm(f: &mut Frame, question: &str, area: Rect) {
+    let rect = centered_rect(64, 7, area);
+    f.render_widget(Clear, rect);
+    let para = Paragraph::new(vec![
+        Line::from(Span::styled(format!(" {question}"), Style::default().fg(TEXT()))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" y", Style::default().fg(DANGER()).bold()),
+            Span::styled(" go ahead · ", Style::default().fg(DIM())),
+            Span::styled("any other key", Style::default().fg(ACCENT())),
+            Span::styled(" cancel", Style::default().fg(DIM())),
+        ]),
+    ])
+    .wrap(Wrap { trim: false })
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(DANGER()))
+            .title(Span::styled(" confirm ", Style::default().fg(DANGER()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+// ---------------------------------------------------------------------------
 // Status bar / overlays
 // ---------------------------------------------------------------------------
 
@@ -2060,7 +2470,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         // on differs, so only the words after the key change.
         let hints: &[(&str, &str)] = match app.tab {
             Tab::Dashboard => &[
-                ("1-5/tab", "tab"),
+                ("1-6/tab", "tab"),
                 ("r", "reload"),
                 ("l", "log"),
                 ("s", "report"),
@@ -2106,6 +2516,18 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("c", "clear"),
                 ("x", "panic"),
                 ("?", "help"),
+            ],
+            Tab::Docker => &[
+                ("↵", "start/stop"),
+                ("←→", "fold/open"),
+                ("r", "restart"),
+                ("d", "down/remove"),
+                ("l", "log"),
+                ("s", "report"),
+                ("c", "clear"),
+                ("x", "panic"),
+                ("?", "help"),
+                ("k", "keys"),
             ],
             Tab::Rdp => &[
                 ("↵", "connect/disconnect"),
@@ -2398,27 +2820,18 @@ fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
         area,
     );
     f.render_widget(Clear, rect);
+    let tiles = app.log_tiles(&pane.target);
+    if !tiles.is_empty() {
+        render_log_tiles(f, app, pane, &tiles, rect);
+        return;
+    }
 
     let entries = app.log_lines(&pane.target);
     let inner = rect.width.saturating_sub(2) as usize;
-    // Two borders and the footer.
-    let rows = rect.height.saturating_sub(3) as usize;
-    let newest = entries.len().saturating_sub(pane.scroll);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in entries[..newest].iter().rev() {
-        let block = log_entry_lines(entry, inner);
-        if !lines.is_empty() && lines.len() + block.len() > rows {
-            break;
-        }
-        for line in block.into_iter().rev() {
-            lines.insert(0, line);
-        }
-        if lines.len() >= rows {
-            break;
-        }
-    }
-    lines.truncate(rows);
+    let strip = docker_strip_lines(app, &pane.target, inner);
+    // Two borders, the footer, and the state strip over a docker pane.
+    let rows = (rect.height.saturating_sub(3) as usize).saturating_sub(strip.len());
+    let mut lines = from_bottom(&entries, pane.scroll, rows, |e| log_entry_lines(e, inner));
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             " nothing logged yet — a quiet connection says nothing",
@@ -2428,8 +2841,13 @@ fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
     while lines.len() < rows {
         lines.push(Line::from(""));
     }
+    lines.splice(0..0, strip);
     lines.push(Line::from(Span::styled(
-        " s report · c clear · ↑↓ scroll · Esc/q/l close",
+        if pane.back.is_some() {
+            " s report · c clear · ↑↓ scroll · Esc/q back to the stack · l close"
+        } else {
+            " s report · c clear · ↑↓ scroll · Esc/q/l close"
+        },
         Style::default().fg(DIM()),
     )));
 
@@ -2444,6 +2862,165 @@ fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
             .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
     );
     f.render_widget(para, rect);
+}
+
+/// The newest entries that fit in `rows`, `scroll` entries back from the end,
+/// laid out oldest first as `draw` breaks each one into lines.
+fn from_bottom(
+    entries: &[logs::Entry],
+    scroll: usize,
+    rows: usize,
+    draw: impl Fn(&logs::Entry) -> Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    let newest = entries.len().saturating_sub(scroll);
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in entries[..newest].iter().rev() {
+        let block = draw(entry);
+        if !lines.is_empty() && lines.len() + block.len() > rows {
+            break;
+        }
+        for line in block.into_iter().rev() {
+            lines.insert(0, line);
+        }
+        if lines.len() >= rows {
+            break;
+        }
+    }
+    lines.truncate(rows);
+    lines
+}
+
+/// A stack's log: one tile per container, side by side and wrapping into a
+/// grid when they do not fit across, each following its own tail. What was
+/// done to the stack as a whole runs along the bottom.
+fn render_log_tiles(
+    f: &mut Frame,
+    app: &App,
+    pane: &LogPane,
+    tiles: &[docker::Container],
+    rect: Rect,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER()))
+        .title(Span::styled(
+            format!(" log · {} ", pane.target.title()),
+            Style::default().fg(ACCENT()).bold(),
+        ));
+    let inner = outer.inner(rect);
+    f.render_widget(outer, rect);
+    let LogTarget::Docker { engine, .. } = &pane.target else {
+        return;
+    };
+    let engine = docker::Engine::from_key(engine);
+
+    let own = app.stack_own_lines(&pane.target);
+    let own_rows: u16 = if own.is_empty() { 0 } else { 5 };
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(own_rows),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // As many across as leave each one a readable width, then as many rows
+    // as that takes.
+    let n = tiles.len();
+    let across = (parts[0].width as usize / 48).clamp(1, n);
+    let down = n.div_ceil(across);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Ratio(1, down as u32); down])
+        .split(parts[0]);
+    let focused = pane.tile.min(n - 1);
+    for (r, row) in rows.iter().enumerate() {
+        let here = &tiles[r * across..((r + 1) * across).min(n)];
+        let cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(vec![Constraint::Ratio(1, across as u32); across])
+            .split(*row);
+        for (i, c) in here.iter().enumerate() {
+            let at = r * across + i;
+            let scroll = pane.tile_scroll.get(&c.name).copied().unwrap_or(0);
+            let mut title = vec![Span::raw(" ")];
+            title.extend(container_spans(c));
+            if scroll > 0 {
+                title.push(Span::styled(
+                    format!(" · {scroll} back"),
+                    Style::default().fg(WARN()),
+                ));
+            }
+            title.push(Span::raw(" "));
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border(at == focused))
+                .title(Line::from(title));
+            let body = block.inner(cells[i]);
+            f.render_widget(block, cells[i]);
+            let width = body.width as usize;
+            let lines = from_bottom(
+                &app.tile_lines(&engine, c),
+                scroll,
+                body.height as usize,
+                |e| tile_entry_lines(e, width),
+            );
+            let lines = if lines.is_empty() {
+                vec![Line::from(Span::styled(
+                    " nothing printed yet",
+                    Style::default().fg(DIM()),
+                ))]
+            } else {
+                lines
+            };
+            f.render_widget(Paragraph::new(lines), body);
+        }
+    }
+
+    if own_rows > 0 {
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(BORDER()))
+            .title(Span::styled(" the stack ", Style::default().fg(DIM())));
+        let body = block.inner(parts[1]);
+        f.render_widget(block, parts[1]);
+        let width = body.width as usize;
+        let lines = from_bottom(&own, 0, body.height as usize, |e| log_entry_lines(e, width));
+        f.render_widget(Paragraph::new(lines), body);
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " ←→ container · ↑↓ scroll it · ↵ only this one · s report · c clear · Esc/q/l close",
+            Style::default().fg(DIM()),
+        )),
+        parts[2],
+    );
+}
+
+/// One entry in a tile, where there is no room for a source column: the
+/// tile's title already says whose log it is.
+fn tile_entry_lines(entry: &logs::Entry, width: usize) -> Vec<Line<'static>> {
+    let prefix = format!("{} ", logs::clock(entry.at));
+    let indent = prefix.chars().count();
+    let color = if entry.error {
+        DANGER()
+    } else if entry.source == logs::SELF {
+        ACCENT()
+    } else {
+        TEXT()
+    };
+    wrap_text(&entry.text, width.saturating_sub(indent).max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let head = if i == 0 { prefix.clone() } else { " ".repeat(indent) };
+            Line::from(vec![
+                Span::styled(head, Style::default().fg(DIM())),
+                Span::styled(chunk, Style::default().fg(color)),
+            ])
+        })
+        .collect()
 }
 
 /// One entry as it is drawn: a time, who said it, and the text under a hanging
@@ -2706,6 +3283,10 @@ fn render_ssh_form_overlay(f: &mut Frame, app: &App, area: Rect) {
             ),
             SshField::ExtraArgs => (form.extra_args.clone(), Style::default().fg(TEXT())),
             SshField::RemoteDir => (form.remote_dir.clone(), Style::default().fg(TEXT())),
+            SshField::Docker => (
+                format!("◂ {} ▸", if form.docker { "yes" } else { "no" }),
+                Style::default().fg(TEXT()),
+            ),
         };
         let cursor = if is_active && !fld.is_picker() { "▏" } else { "" };
         let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
@@ -3179,7 +3760,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     };
     let lines = vec![
         Line::from(Span::styled(
-            " SSH tunnels, SSH logins, VPN clients and RDP sessions in one place.",
+            " SSH tunnels, SSH logins, VPN clients, RDP sessions and Docker in one place.",
             Style::default().fg(TEXT()),
         )),
         Line::from(""),
@@ -3192,6 +3773,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         entry("  tunnels", "ssh forwards — local (-L), remote (-R), dynamic (-D)"),
         entry("  ssh", "interactive logins, each in a terminal window of its own"),
         entry("  rdp", "remote desktop sessions, running in the background"),
+        entry("  docker", "compose stacks and containers, here and on ssh hosts"),
         Line::from(""),
         section("groups"),
         text("entries sharing a group name stack under one header, and the"),
@@ -3219,6 +3801,11 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         text("left, the host on the right, over one sftp session. Tab moves"),
         text("between the panes and ↵ copies what is selected into the other"),
         text("one — no ssh_config, no scp command line to get right"),
+        Line::from(""),
+        section("docker"),
+        text("stacks are compose projects as docker labels them, so nothing"),
+        text("is configured: l on a stack shows every container's state over"),
+        text("their logs merged; l on one container shows only its own"),
         Line::from(""),
         section("logs and reports"),
         text("l opens the log of whatever is selected: what controlcenter did"),
@@ -3261,12 +3848,12 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
             Style::default().fg(DIM()).bold(),
         ))
     };
-    // key, vpn, tunnels, ssh, rdp
-    let row = |k: &str, a: &str, b: &str, c: &str, d: &str| {
+    // key, vpn, tunnels, ssh, rdp, docker
+    let row = |k: &str, a: &str, b: &str, c: &str, d: &str, e: &str| {
         Line::from(vec![
             Span::styled(format!(" {k:<8}"), Style::default().fg(ACCENT())),
             Span::styled(
-                format!("{a:<15}{b:<15}{c:<15}{d}"),
+                format!("{a:<15}{b:<15}{c:<15}{d:<15}{e}"),
                 Style::default().fg(TEXT()),
             ),
         ])
@@ -3306,7 +3893,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("", "session would be left running as root"),
         Line::from(""),
         section("moving about"),
-        entry("1-5 tab", "switch tab (shift+tab goes back)"),
+        entry("1-6 tab", "switch tab (shift+tab goes back)"),
         entry("↑ ↓", "move the selection · scroll a log"),
         entry("pgup pgdn", "move the selection by ten · scroll a log by a screen"),
         entry("← →", "switch pane · change the field under the cursor"),
@@ -3321,22 +3908,22 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("", "where c gives up on the login instead"),
         Line::from(""),
         section("what each one acts on"),
-        row("", "VPN", "TUNNELS", "SSH", "RDP"),
-        row("enter", "connect · stop ◆", "start/stop", "open session", "connect"),
-        row("a e d", "profile", "tunnel", "host", "connection"),
-        row("r", "refresh", "restart", "new session", "reconnect"),
-        row("p", "openvpn pw", "—", "stored pw", "never stored"),
-        row("f", "—", "—", "transfer files", "—"),
-        row("l", "profile log", "ssh output", "what it did", "client log"),
-        row("c", "errors", "failed", "last session", "finished"),
-        row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move connection"),
+        row("", "VPN", "TUNNELS", "SSH", "RDP", "DOCKER"),
+        row("enter", "connect · stop ◆", "start/stop", "open session", "connect", "start/stop"),
+        row("a e d", "profile", "tunnel", "host", "connection", "d: down · rm"),
+        row("r", "refresh", "restart", "new session", "reconnect", "restart"),
+        row("p", "openvpn pw", "—", "stored pw", "never stored", "—"),
+        row("f", "—", "—", "transfer files", "—", "—"),
+        row("l", "profile log", "ssh output", "what it did", "client log", "stack · one"),
+        row("c", "errors", "failed", "last session", "finished", "errors"),
+        row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move conn.", "—"),
         Line::from(""),
         Line::from(vec![
             Span::styled(" ? ", Style::default().fg(ACCENT()).bold()),
             Span::styled("for help · any key closes", Style::default().fg(DIM())),
         ]),
     ];
-    let rect = centered_rect(76, (lines.len() + 2) as u16, area);
+    let rect = centered_rect(92, (lines.len() + 2) as u16, area);
     f.render_widget(Clear, rect);
     let para = Paragraph::new(lines).block(
         Block::default()
@@ -3862,6 +4449,17 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// The end of a path is the part that tells two apart, so a long one loses
+/// its beginning.
+fn truncate_left(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max < 2 {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - (max - 1)).collect();
+    format!("…{tail}")
 }
 
 pub fn truncate_pub(s: &str, max: usize) -> String {

@@ -184,6 +184,7 @@ pub fn build(app: &App, target: &LogTarget, stem: &str) -> Report {
         tunnels(&mut out, app);
         ssh_hosts(&mut out, app);
         rdp_connections(&mut out, app);
+        docker_engines(&mut out, app);
     } else {
         what_comes_first(&mut out, app, &chain);
     }
@@ -206,6 +207,10 @@ pub fn build(app: &App, target: &LogTarget, stem: &str) -> Report {
 fn chain_targets(app: &App, target: &LogTarget) -> Vec<LogTarget> {
     let step = match target {
         LogTarget::Program | LogTarget::Vpn(..) => return Vec::new(),
+        LogTarget::Docker { engine, .. } if engine.is_empty() => return Vec::new(),
+        // A remote engine is reached the way a login to its host is, so the
+        // host and everything in front of it are the chain.
+        LogTarget::Docker { engine, .. } => Step::Docker(engine.clone()),
         LogTarget::Tunnel(name) => Step::Tunnel(name.clone()),
         LogTarget::Ssh(name) => Step::Ssh(name.clone()),
         LogTarget::Rdp(name) => Step::Rdp {
@@ -229,6 +234,12 @@ fn chain_targets(app: &App, target: &LogTarget) -> Vec<LogTarget> {
                 if !out.contains(&via) {
                     out.push(via);
                 }
+            }
+        }
+        if let Step::Docker(name) = &step {
+            let via = LogTarget::Ssh(name.clone());
+            if !out.contains(&via) {
+                out.push(via);
             }
         }
         let t = step.log_target();
@@ -257,6 +268,7 @@ fn target_block(out: &mut String, app: &App, target: &LogTarget) {
             None => field(out, "gone", "no rdp connection by this name is configured"),
         },
         LogTarget::Vpn(provider, profile) => vpn_profile_block(out, app, *provider, profile),
+        LogTarget::Docker { .. } => docker_block(out, app, target),
     }
 }
 
@@ -351,6 +363,85 @@ fn subject(out: &mut String, app: &App, target: &LogTarget) {
         LogTarget::Vpn(provider, profile) => {
             vpn_profile_block(out, app, *provider, profile);
         }
+        LogTarget::Docker { engine, .. } => {
+            docker_block(out, app, target);
+            if !engine.is_empty() {
+                chain(out, app, Step::Docker(engine.clone()));
+            }
+        }
+    }
+}
+
+/// An engine, a stack or a container: where it runs, the command that lists
+/// it, and every container in scope with docker's own word on its state.
+fn docker_block(out: &mut String, app: &App, target: &LogTarget) {
+    let LogTarget::Docker {
+        engine,
+        stack,
+        container,
+    } = target
+    else {
+        return;
+    };
+    let eng = crate::docker::Engine::from_key(engine);
+    field(out, "engine", eng.label());
+    if let crate::docker::Engine::Ssh(name) = &eng {
+        field(out, "reached over", format!("ssh host '{name}'"));
+    }
+    field(
+        out,
+        "lists with",
+        redact(&command_line(&app.docker_argv(&eng, &crate::docker::list_args()))),
+    );
+    match app.docker_unreachable(&eng) {
+        Some(why) => field(out, "reachable", why),
+        None => field(out, "reachable", "yes"),
+    }
+    let Some(st) = app.docker.get(&eng) else {
+        field(out, "state", "not listed — the host is gone or no longer runs docker");
+        return;
+    };
+    if let Some(e) = &st.error {
+        field(out, "last listing", format!("failed: {e}"));
+    } else if !st.listed {
+        field(out, "last listing", "none yet");
+    }
+    if !stack.is_empty() {
+        field(out, "stack", stack);
+    }
+    let in_scope: Vec<&crate::docker::Container> = st
+        .containers
+        .iter()
+        .filter(|c| {
+            (stack.is_empty() && container.is_empty())
+                || (&c.project == stack && (container.is_empty() || &c.name == container))
+        })
+        .collect();
+    if let Some(first) = in_scope.iter().find(|c| !c.working_dir.is_empty()) {
+        field(out, "working dir", &first.working_dir);
+        field(out, "compose files", first.config_files.replace(',', ", "));
+    }
+    if in_scope.is_empty() {
+        field(out, "containers", "none listed");
+    }
+    for c in in_scope {
+        field(
+            out,
+            &format!("container {}", c.name),
+            format!("{} — {} · {}", c.state, c.status, c.image),
+        );
+        if !c.ports.is_empty() {
+            field(out, "  ports", &c.ports);
+        }
+    }
+    if !container.is_empty() {
+        field(
+            out,
+            "log follows",
+            redact(&command_line(
+                &app.docker_argv(&eng, &crate::docker::logs_args(container, None)),
+            )),
+        );
     }
 }
 
@@ -465,6 +556,7 @@ fn ssh_block(out: &mut String, app: &App, h: &SshHost) {
         if h.skip_host_key_check { "skipped" } else { "normal" },
     );
     field(out, "extra args", redact(&h.extra_args));
+    field(out, "docker", if h.docker { "listed on the Docker tab" } else { "no" });
     requirements(out, app, &h.requires_vpn, &h.depends_on);
     field(out, "opens in", app.ssh_launcher.label());
     field(
@@ -702,6 +794,13 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
                 opens_a_session = true;
             }
             LogTarget::Rdp(_) => wanted.push(app.rdp_client.program()),
+            LogTarget::Docker { engine, .. } if engine.is_empty() => wanted.push("docker"),
+            LogTarget::Docker { .. } => {
+                wanted.push("ssh");
+                if app.ssh_password_helper == crate::ssh::PasswordHelper::Sshpass {
+                    wanted.push("sshpass");
+                }
+            }
             LogTarget::Vpn(p, _) => {
                 wanted.extend(p.binaries());
                 needs_root |= p.needs_root();
@@ -868,6 +967,15 @@ fn ssh_hosts(out: &mut String, app: &App) {
     for h in &app.ssh_hosts {
         let _ = writeln!(out, "### {}", h.name);
         ssh_block(out, app, h);
+        let _ = writeln!(out);
+    }
+}
+
+fn docker_engines(out: &mut String, app: &App) {
+    section(out, "docker engines");
+    for st in &app.docker.engines {
+        let _ = writeln!(out, "### docker on {}", st.engine.label());
+        docker_block(out, app, &st.engine.target());
         let _ = writeln!(out);
     }
 }

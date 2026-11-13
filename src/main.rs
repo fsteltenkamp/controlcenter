@@ -2,6 +2,7 @@ mod app;
 mod browser;
 mod chooser;
 mod config;
+mod docker;
 mod logs;
 mod platform;
 mod rdp;

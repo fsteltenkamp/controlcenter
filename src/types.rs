@@ -240,6 +240,10 @@ pub struct SshHost {
     /// login lands, which is the host's own answer to the question.
     #[serde(default)]
     pub remote_dir: String,
+    /// Listed on the Docker tab: its containers and stacks are managed by
+    /// running the docker CLI on it over this same ssh.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 pub fn default_ssh_port() -> u16 {

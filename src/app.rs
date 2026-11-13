@@ -1,6 +1,7 @@
 use crate::browser::FileBrowser;
 use crate::chooser::{Choice, Chooser};
 use crate::config::{self, AppConfig, Paths};
+use crate::docker::{self, ContainerLog, DockerMsg, DockerPane, DockerView, Engine, Row as DockerRow};
 use crate::logs::{Entry, Journal, LogTarget, Ring};
 use crate::rdp::{self, ActiveRdp, RdpStatus};
 use crate::report;
@@ -30,6 +31,9 @@ use std::time::{Duration, Instant};
 
 pub const THROUGHPUT_HISTORY: usize = 120;
 const VPN_REFRESH_SECS: u64 = 5;
+/// How often the Docker tab lists its engines while it is in front. Only then:
+/// a remote engine is an ssh connection per listing.
+const DOCKER_REFRESH: Duration = Duration::from_secs(5);
 /// How often the machine is swept for VPN connections controlcenter is not
 /// holding. The same clock as a status poll: an orphan is only interesting
 /// while the user is looking at a connection that will not stay up.
@@ -59,10 +63,18 @@ pub enum Tab {
     Tunnels,
     Ssh,
     Rdp,
+    Docker,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Dashboard, Tab::Vpn, Tab::Tunnels, Tab::Ssh, Tab::Rdp];
+    pub const ALL: [Tab; 6] = [
+        Tab::Dashboard,
+        Tab::Vpn,
+        Tab::Tunnels,
+        Tab::Ssh,
+        Tab::Rdp,
+        Tab::Docker,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -71,6 +83,7 @@ impl Tab {
             Self::Tunnels => "Tunnels",
             Self::Ssh => "SSH",
             Self::Rdp => "RDP",
+            Self::Docker => "Docker",
         }
     }
 
@@ -836,6 +849,7 @@ pub enum SshField {
     DependsOn,
     ExtraArgs,
     RemoteDir,
+    Docker,
 }
 
 pub const SSH_FIELDS: &[SshField] = &[
@@ -851,6 +865,7 @@ pub const SSH_FIELDS: &[SshField] = &[
     SshField::DependsOn,
     SshField::ExtraArgs,
     SshField::RemoteDir,
+    SshField::Docker,
 ];
 
 impl SshField {
@@ -868,12 +883,16 @@ impl SshField {
             Self::DependsOn => "Requires tunnel",
             Self::ExtraArgs => "Extra ssh args (optional)",
             Self::RemoteDir => "Transfers start in (optional)",
+            Self::Docker => "Docker on this host",
         }
     }
 
     /// Toggled with ◂ ▸ instead of typed into.
     pub fn is_picker(self) -> bool {
-        matches!(self, Self::SkipHostKey | Self::RequiresVpn | Self::DependsOn)
+        matches!(
+            self,
+            Self::SkipHostKey | Self::RequiresVpn | Self::DependsOn | Self::Docker
+        )
     }
 }
 
@@ -892,6 +911,7 @@ pub struct SshForm {
     pub dep: Picker,
     pub extra_args: String,
     pub remote_dir: String,
+    pub docker: bool,
     pub error: Option<String>,
     /// Set once the user has acknowledged the cleartext-password warning for
     /// this edit, so saving again does not ask twice.
@@ -914,6 +934,7 @@ impl SshForm {
             dep: Picker::tunnels(ctx.tunnels, "", None),
             extra_args: String::new(),
             remote_dir: String::new(),
+            docker: false,
             error: None,
             password_ack: false,
         }
@@ -934,6 +955,7 @@ impl SshForm {
             dep: Picker::tunnels(ctx.tunnels, &h.depends_on, None),
             extra_args: h.extra_args.clone(),
             remote_dir: h.remote_dir.clone(),
+            docker: h.docker,
             error: None,
             // Already stored: the warning was accepted when it was first saved.
             password_ack: !h.password.is_empty(),
@@ -963,7 +985,10 @@ impl SshForm {
             SshField::Password => Some(&mut self.password),
             SshField::ExtraArgs => Some(&mut self.extra_args),
             SshField::RemoteDir => Some(&mut self.remote_dir),
-            SshField::SkipHostKey | SshField::RequiresVpn | SshField::DependsOn => None,
+            SshField::SkipHostKey
+            | SshField::RequiresVpn
+            | SshField::DependsOn
+            | SshField::Docker => None,
         }
     }
 
@@ -997,6 +1022,7 @@ impl SshForm {
             depends_on: self.dep.value(),
             requires_vpn: self.vpn.value(),
             remote_dir: self.remote_dir.trim().to_string(),
+            docker: self.docker,
         })
     }
 }
@@ -1206,6 +1232,9 @@ pub enum Step {
     /// The transfer browser on an SSH host. A session of its own, brought up
     /// through the same chain as a login to the same host.
     Transfer(String),
+    /// The docker engine on an SSH host: nothing is opened, but it is reached
+    /// over the same ssh, so it waits for the same chain as a login does.
+    Docker(String),
     Rdp { name: String, password: String },
 }
 
@@ -1216,6 +1245,7 @@ impl Step {
             Self::Tunnel(n) => format!("tunnel '{n}'"),
             Self::Ssh(n) => format!("ssh '{n}'"),
             Self::Transfer(n) => format!("files on '{n}'"),
+            Self::Docker(n) => format!("docker on '{n}'"),
             Self::Rdp { name, .. } => format!("rdp '{name}'"),
         }
     }
@@ -1227,6 +1257,7 @@ impl Step {
             Self::Tunnel(n) => format!("tun {n}"),
             Self::Ssh(n) => format!("ssh {n}"),
             Self::Transfer(n) => format!("files {n}"),
+            Self::Docker(n) => format!("docker {n}"),
             Self::Rdp { name, .. } => format!("rdp {name}"),
         }
     }
@@ -1245,13 +1276,17 @@ impl Step {
             // A transfer is something done to a host, not a connection of its
             // own: it belongs in that host's log and in that host's report.
             Self::Ssh(n) | Self::Transfer(n) => LogTarget::Ssh(n.clone()),
+            Self::Docker(n) => Engine::Ssh(n.clone()).target(),
             Self::Rdp { name, .. } => LogTarget::Rdp(name.clone()),
         }
     }
 
     /// Steps that only fire and forget; everything else is waited on.
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Ssh(_) | Self::Transfer(_) | Self::Rdp { .. })
+        matches!(
+            self,
+            Self::Ssh(_) | Self::Transfer(_) | Self::Docker(_) | Self::Rdp { .. }
+        )
     }
 }
 
@@ -1342,7 +1377,7 @@ impl Catalog<'_> {
                 .unwrap_or_default(),
             // A transfer rides the host, so it waits for exactly what a
             // session to that host waits for.
-            Step::Ssh(n) | Step::Transfer(n) => self
+            Step::Ssh(n) | Step::Transfer(n) | Step::Docker(n) => self
                 .ssh_hosts
                 .iter()
                 .find(|h| &h.name == n)
@@ -2142,6 +2177,28 @@ pub struct LogPane {
     /// How many lines back from the newest the view is scrolled. 0 follows the
     /// tail, which is what a log that is still being written wants.
     pub scroll: usize,
+    /// On a stack's pane, which container's tile the arrows act on. A stack's
+    /// containers are drawn side by side rather than merged into one stream,
+    /// because one chatty service would otherwise bury what the others say.
+    pub tile: usize,
+    /// How far back each tile is scrolled, by container name — each follows
+    /// its own tail, so scrolling one back leaves the others live.
+    pub tile_scroll: HashMap<String, usize>,
+    /// The stack pane a single container was opened out of with `Enter`,
+    /// which `Esc` goes back to.
+    pub back: Option<Box<LogPane>>,
+}
+
+impl LogPane {
+    fn new(target: LogTarget) -> Self {
+        Self {
+            target,
+            scroll: 0,
+            tile: 0,
+            tile_scroll: HashMap::new(),
+            back: None,
+        }
+    }
 }
 
 /// Whether a key closes a popup that only displays something — a log, the
@@ -2192,6 +2249,15 @@ impl PanicSummary {
         }
         out
     }
+}
+
+/// A docker action that removes something, while it asks.
+pub struct DockerConfirm {
+    pub question: String,
+    engine: Engine,
+    target: LogTarget,
+    what: String,
+    args: Vec<String>,
 }
 
 /// What quitting would leave behind, while it asks what to do about it.
@@ -2301,6 +2367,23 @@ pub struct App {
     /// The list picker, open over whichever form field asked for it. The same
     /// `Ctrl+O` as the file browser, and never both at once.
     pub chooser: Option<(ChooserTarget, Chooser)>,
+    /// The Docker tab: every engine, what is on it, and the cursor.
+    pub docker: DockerView,
+    /// Whether there is a docker CLI here for this machine's engine. A remote
+    /// engine runs the one on its host and needs nothing here but ssh.
+    pub docker_installed: bool,
+    /// Actions on a stack or container still running, by what they are about.
+    pub docker_busy: HashMap<LogTarget, String>,
+    /// What each action printed, kept per stack or container so the pane on
+    /// one is not the narration of every other.
+    docker_actions: HashMap<LogTarget, Arc<Ring>>,
+    /// Container logs, by the container's target, followed while a pane is
+    /// open on the container or its stack.
+    docker_logs: HashMap<LogTarget, ContainerLog>,
+    /// A `compose down` or `docker rm`, while it asks.
+    pub docker_confirm: Option<DockerConfirm>,
+    docker_tx: Sender<DockerMsg>,
+    docker_rx: Receiver<DockerMsg>,
     /// Plan currently being executed, if any.
     pub activation: Option<Activation>,
     /// Tunnel-binding conflict awaiting the user's decision.
@@ -2340,6 +2423,7 @@ impl App {
         let rdp_client = rdp::resolve_client(&app_config.rdp.client);
         let (vpn_tx, vpn_rx) = channel();
         let (sftp_tx, sftp_rx) = channel();
+        let (docker_tx, docker_rx) = channel();
         let vpn_view = VpnView::new();
         let empty_ctx = FormContext {
             tunnels: &tunnels,
@@ -2404,6 +2488,14 @@ impl App {
             sftp_gen: 0,
             transfer_local: String::new(),
             chooser: None,
+            docker: DockerView::new(),
+            docker_installed: docker::installed(),
+            docker_busy: HashMap::new(),
+            docker_actions: HashMap::new(),
+            docker_logs: HashMap::new(),
+            docker_confirm: None,
+            docker_tx,
+            docker_rx,
             activation: None,
             conflict: None,
             port_prompt: None,
@@ -2420,6 +2512,7 @@ impl App {
         app.rebuild_rows();
         app.rebuild_ssh_rows();
         app.rebuild_rdp_rows();
+        app.sync_docker_engines();
         for id in ProviderId::ALL {
             app.refresh_provider(id);
             if app.vpn.get(id).installed {
@@ -2474,6 +2567,11 @@ impl App {
         // A transfer session is a child of ours like any other: it goes when
         // the program does, rather than being left holding a connection.
         self.close_transfer();
+        // A follow is a child of ours, and on a remote engine an ssh
+        // connection: it goes with the program. The containers stay.
+        for log in self.docker_logs.values_mut() {
+            log.stop();
+        }
         for (_, mut t) in self.active.drain() {
             t.stop();
         }
@@ -2624,7 +2722,59 @@ impl App {
                 rings.push(&st.log);
             }
         }
+        for (about, ring) in &self.docker_actions {
+            if target.covers(about) {
+                rings.push(ring);
+            }
+        }
         rings
+    }
+
+    /// The container logs a pane shows, each with the name to tag its lines
+    /// with — or none, on a pane about that one container.
+    ///
+    /// Not through [`Self::rings_for`], because what a container printed is not
+    /// something done *to* it: a container pane shows its own, a stack pane
+    /// shows every one of its containers tagged so they can be told apart, and
+    /// an engine or the whole program shows none, because a log of everything
+    /// every container ever said would bury what the program did.
+    fn docker_rings_for(&self, target: &LogTarget) -> Vec<(&Ring, Option<String>)> {
+        let LogTarget::Docker {
+            engine,
+            stack,
+            container,
+        } = target
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (about, log) in &self.docker_logs {
+            let LogTarget::Docker {
+                engine: e,
+                stack: s,
+                container: c,
+            } = about
+            else {
+                continue;
+            };
+            if e != engine {
+                continue;
+            }
+            if !container.is_empty() {
+                if c == container && s == stack {
+                    out.push((&*log.ring, None));
+                }
+            } else if !stack.is_empty() && s == stack {
+                let label = self
+                    .docker
+                    .get(&Engine::from_key(e))
+                    .and_then(|st| st.containers.iter().find(|x| &x.name == c))
+                    .map(|x| x.label().to_string())
+                    .unwrap_or_else(|| c.clone());
+                out.push((&*log.ring, Some(label)));
+            }
+        }
+        out
     }
 
     /// What a pane shows, oldest first.
@@ -2632,6 +2782,15 @@ impl App {
         let mut lines = self.journal.entries_for(target);
         for ring in self.rings_for(target) {
             lines.extend(ring.all());
+        }
+        for (ring, tag) in self.docker_rings_for(target) {
+            match tag {
+                None => lines.extend(ring.all()),
+                Some(tag) => lines.extend(ring.all().into_iter().map(|mut e| {
+                    e.text = format!("{tag} │ {}", e.text);
+                    e
+                })),
+            }
         }
         lines.sort_by_key(|e| e.at);
         lines
@@ -2661,6 +2820,7 @@ impl App {
                 None if self.ssh_rows.is_empty() => Err("no ssh host is configured yet".into()),
                 None => entry("a host"),
             },
+            Tab::Docker => Ok(self.docker.selection_target()),
             Tab::Rdp => match self.selected_rdp_conn() {
                 Some(i) => Ok(LogTarget::Rdp(self.rdp_conns[i].name.clone())),
                 None if self.rdp_rows.is_empty() => {
@@ -2675,10 +2835,8 @@ impl App {
     fn open_log(&mut self) {
         match self.selection_target() {
             Ok(target) => {
-                self.log_pane = Some(LogPane {
-                    target,
-                    scroll: 0,
-                })
+                self.log_pane = Some(LogPane::new(target));
+                self.docker_follow(true);
             }
             Err(why) => self.flash(why, true),
         }
@@ -2690,6 +2848,18 @@ impl App {
         let Some(pane) = &self.log_pane else {
             return;
         };
+        let tiles = self.log_tiles(&pane.target);
+        if !tiles.is_empty() {
+            self.on_tiles_key(key, &tiles);
+            return;
+        }
+        // A container opened out of its stack goes back there, rather than
+        // closing the pane the user came through.
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && pane.back.is_some() {
+            self.log_pane = self.log_pane.take().and_then(|p| p.back).map(|b| *b);
+            self.docker_follow(true);
+            return;
+        }
         let last = self.log_lines(&pane.target).len().saturating_sub(1);
         let scroll_by = |app: &mut Self, delta: isize| {
             if let Some(p) = &mut app.log_pane {
@@ -2708,12 +2878,116 @@ impl App {
         }
     }
 
+    /// The keys of a stack's tiled pane: the arrows choose a tile and scroll
+    /// it, `Enter` opens that one container out on its own.
+    fn on_tiles_key(&mut self, key: KeyEvent, tiles: &[docker::Container]) {
+        let Some(LogTarget::Docker { engine, .. }) = self.log_pane.as_ref().map(|p| p.target.clone())
+        else {
+            return;
+        };
+        let engine = Engine::from_key(&engine);
+        let n = tiles.len();
+        let at = self.log_pane.as_ref().map_or(0, |p| p.tile.min(n - 1));
+        let current = &tiles[at];
+        let last = self.tile_lines(&engine, current).len().saturating_sub(1);
+        let scroll = |app: &mut Self, delta: isize| {
+            if let Some(p) = &mut app.log_pane {
+                let s = p.tile_scroll.entry(current.name.clone()).or_default();
+                *s = s.saturating_add_signed(delta).min(last);
+            }
+        };
+        match key.code {
+            KeyCode::Left => {
+                if let Some(p) = &mut self.log_pane {
+                    p.tile = (at + n - 1) % n;
+                }
+            }
+            KeyCode::Right => {
+                if let Some(p) = &mut self.log_pane {
+                    p.tile = (at + 1) % n;
+                }
+            }
+            KeyCode::Up => scroll(self, 1),
+            KeyCode::Down => scroll(self, -1),
+            KeyCode::PageUp => scroll(self, 10),
+            KeyCode::PageDown => scroll(self, -10),
+            KeyCode::Enter => {
+                let stack = self.log_pane.take().map(Box::new);
+                let mut pane = LogPane::new(current.target(&engine));
+                pane.back = stack;
+                self.log_pane = Some(pane);
+                self.docker_follow(true);
+            }
+            KeyCode::Char('c') => self.clear_log(),
+            KeyCode::Char('s') => self.export_log(),
+            _ if closes_view(key) => self.log_pane = None,
+            _ => {}
+        }
+    }
+
+    /// The containers a pane shows as tiles: those of a stack, and none for
+    /// anything else — a single container, an engine, or no docker at all.
+    pub fn log_tiles(&self, target: &LogTarget) -> Vec<docker::Container> {
+        match target {
+            LogTarget::Docker {
+                stack, container, ..
+            } if !stack.is_empty() && container.is_empty() => self.docker_strip(target),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One tile: what the container printed, and what was done to that
+    /// container alone. What was done to the whole stack is drawn once,
+    /// under the tiles, rather than repeated in every one of them.
+    pub fn tile_lines(&self, engine: &Engine, c: &docker::Container) -> Vec<Entry> {
+        let about = c.target(engine);
+        let mut lines: Vec<Entry> = self
+            .journal
+            .all()
+            .iter()
+            .filter(|(t, _)| *t == about)
+            .map(|(_, e)| e.clone())
+            .collect();
+        if let Some(log) = self.docker_logs.get(&about) {
+            lines.extend(log.ring.all());
+        }
+        if let Some(ring) = self.docker_actions.get(&about) {
+            lines.extend(ring.all());
+        }
+        lines.sort_by_key(|e| e.at);
+        lines
+    }
+
+    /// What a stack's tiled pane shows under the tiles: everything done to
+    /// the stack and its engine, and nothing any one container said.
+    pub fn stack_own_lines(&self, target: &LogTarget) -> Vec<Entry> {
+        let container_level =
+            |t: &LogTarget| matches!(t, LogTarget::Docker { container, .. } if !container.is_empty());
+        let mut lines: Vec<Entry> = self
+            .journal
+            .all()
+            .iter()
+            .filter(|(t, _)| target.covers(t) && !container_level(t))
+            .map(|(_, e)| e.clone())
+            .collect();
+        for (about, ring) in &self.docker_actions {
+            if target.covers(about) && !container_level(about) {
+                lines.extend(ring.all());
+            }
+        }
+        lines.sort_by_key(|e| e.at);
+        lines
+    }
+
     /// `c` in the pane: throw away what is in it, on both sides of the merge.
     fn clear_log(&mut self) {
         let Some(target) = self.log_pane.as_ref().map(|p| p.target.clone()) else {
             return;
         };
         for ring in self.rings_for(&target) {
+            ring.clear();
+        }
+        for (ring, _) in self.docker_rings_for(&target) {
             ring.clear();
         }
         self.journal.clear_for(&target);
@@ -2882,6 +3156,15 @@ impl App {
             self.on_vpn_modal_key(key);
             return;
         }
+        if let Some(confirm) = self.docker_confirm.take() {
+            if matches!(
+                key.code,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+            ) {
+                self.docker_action(confirm.engine, confirm.target, confirm.what, confirm.args);
+            }
+            return;
+        }
 
         // Nothing is open, so this is the base application: the keys that mean
         // the same thing everywhere are handled here, and only what is left
@@ -2909,6 +3192,7 @@ impl App {
             KeyCode::Char('3') => self.tab = Tab::Tunnels,
             KeyCode::Char('4') => self.tab = Tab::Ssh,
             KeyCode::Char('5') => self.tab = Tab::Rdp,
+            KeyCode::Char('6') => self.tab = Tab::Docker,
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.prev(),
             _ => match self.tab {
@@ -2917,6 +3201,7 @@ impl App {
                 Tab::Tunnels => self.on_tunnels_key(key),
                 Tab::Ssh => self.on_ssh_key(key),
                 Tab::Rdp => self.on_rdp_key(key),
+                Tab::Docker => self.on_docker_key(key),
             },
         }
     }
@@ -3090,7 +3375,7 @@ impl App {
             | KeyCode::Char('e')
             | KeyCode::Char('d')
             | KeyCode::Char('p') => self.flash(
-                "the dashboard only watches — act on the VPN, Tunnels, SSH or RDP tab",
+                "the dashboard only watches — act on the VPN, Tunnels, SSH, RDP or Docker tab",
                 false,
             ),
             _ => {}
@@ -5263,6 +5548,7 @@ impl App {
             SshField::SkipHostKey => {
                 self.ssh_form.skip_host_key_check = !self.ssh_form.skip_host_key_check
             }
+            SshField::Docker => self.ssh_form.docker = !self.ssh_form.docker,
             SshField::RequiresVpn => {
                 if forward {
                     self.ssh_form.vpn.next()
@@ -6365,7 +6651,9 @@ impl App {
                 None => StepState::Waiting,
             },
             // Terminal steps are never waited on.
-            Step::Ssh(_) | Step::Transfer(_) | Step::Rdp { .. } => StepState::Ready,
+            Step::Ssh(_) | Step::Transfer(_) | Step::Docker(_) | Step::Rdp { .. } => {
+                StepState::Ready
+            }
         }
     }
 
@@ -6505,6 +6793,19 @@ impl App {
                     StartOutcome::Failed(format!("ssh host '{name}' is gone"))
                 }
             }
+            Step::Docker(name) => {
+                let engine = Engine::Ssh(name.clone());
+                match self.docker.get_mut(&engine) {
+                    Some(st) => {
+                        st.blocked = None;
+                        st.polled_at = None;
+                        StartOutcome::Started
+                    }
+                    None => StartOutcome::Failed(format!(
+                        "ssh host '{name}' is gone, or no longer runs docker"
+                    )),
+                }
+            }
             Step::Rdp { name, password } => {
                 self.spawn_rdp(&name.clone(), &password.clone());
                 StartOutcome::Started
@@ -6587,7 +6888,7 @@ impl App {
                     note: None,
                 })
             }
-            Step::Ssh(_) | Step::Transfer(_) => None,
+            Step::Ssh(_) | Step::Transfer(_) | Step::Docker(_) => None,
         }
     }
 
@@ -7174,6 +7475,515 @@ impl App {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Docker
+    //
+    // Engines are this machine and every SSH host marked `docker`; what is on
+    // them is listed by `docker ps` and grouped into stacks by compose's own
+    // labels. Every command runs on a thread and reports through `docker_tx`.
+    // -----------------------------------------------------------------------
+
+    /// This machine first, then the SSH hosts that run docker, in `ssh.toml`
+    /// order.
+    fn sync_docker_engines(&mut self) {
+        let wanted: Vec<Engine> = std::iter::once(Engine::Local)
+            .chain(
+                self.ssh_hosts
+                    .iter()
+                    .filter(|h| h.docker)
+                    .map(|h| Engine::Ssh(h.name.clone())),
+            )
+            .collect();
+        self.docker.sync(wanted);
+    }
+
+    fn docker_host(&self, engine: &Engine) -> Option<&SshHost> {
+        match engine {
+            Engine::Local => None,
+            Engine::Ssh(n) => self.ssh_hosts.iter().find(|h| &h.name == n),
+        }
+    }
+
+    /// The argv for `docker <args>` on an engine.
+    pub fn docker_argv(&self, engine: &Engine, args: &[String]) -> Vec<String> {
+        docker::command_line(
+            engine,
+            self.docker_host(engine),
+            &self.ssh_password_helper,
+            args,
+        )
+    }
+
+    /// Why an engine cannot be reached right now, if it cannot: this machine's
+    /// has no docker, or a remote one's chain is not up. A poll never brings a
+    /// chain up — that is `Enter` on the engine, which runs it as a plan.
+    pub fn docker_unreachable(&self, engine: &Engine) -> Option<String> {
+        match engine {
+            Engine::Local if !self.docker_installed => {
+                Some("docker was not found on PATH".into())
+            }
+            Engine::Local => None,
+            Engine::Ssh(name) => {
+                if self.docker_host(engine).is_none() {
+                    return Some(format!("ssh host '{name}' is gone"));
+                }
+                let plan = match self.plan_for(Step::Docker(name.clone())) {
+                    Ok(p) => p,
+                    Err(e) => return Some(e),
+                };
+                plan.iter()
+                    .filter(|s| !s.is_terminal())
+                    .find(|s| self.step_state(s) != StepState::Ready)
+                    .map(|s| format!("needs {} — Enter brings it up", s.describe()))
+            }
+        }
+    }
+
+    fn docker_poll(&mut self, engine: &Engine) {
+        let blocked = self.docker_unreachable(engine);
+        let argv = self.docker_argv(engine, &docker::list_args());
+        let host = self.docker_host(engine).cloned();
+        let Some(st) = self.docker.get_mut(engine) else {
+            return;
+        };
+        st.polled_at = Some(Instant::now());
+        st.blocked = blocked;
+        if st.blocked.is_some() || st.pending {
+            return;
+        }
+        st.pending = true;
+        docker::spawn_list(
+            engine.clone(),
+            argv,
+            host,
+            self.ssh_password_helper.clone(),
+            self.docker_tx.clone(),
+        );
+    }
+
+    fn on_docker_tick(&mut self) {
+        self.sync_docker_engines();
+        self.drain_docker();
+        // Listed while someone is looking: the tab, or a pane whose state
+        // strip is drawn from the listing.
+        let looking = self.tab == Tab::Docker
+            || matches!(
+                self.log_pane.as_ref().map(|p| &p.target),
+                Some(LogTarget::Docker { .. })
+            );
+        if looking {
+            let due: Vec<Engine> = self
+                .docker
+                .engines
+                .iter()
+                .filter(|e| !e.pending && e.polled_at.is_none_or(|t| t.elapsed() >= DOCKER_REFRESH))
+                .map(|e| e.engine.clone())
+                .collect();
+            for engine in due {
+                self.docker_poll(&engine);
+            }
+        }
+        self.docker_follow(false);
+    }
+
+    fn drain_docker(&mut self) {
+        while let Ok(msg) = self.docker_rx.try_recv() {
+            match msg {
+                DockerMsg::Listed { engine, result } => {
+                    let Some(st) = self.docker.get_mut(&engine) else {
+                        continue;
+                    };
+                    st.pending = false;
+                    match result {
+                        Ok(containers) => {
+                            let recovered = st.error.take();
+                            st.containers = containers;
+                            st.listed = true;
+                            if recovered.is_some() {
+                                self.note(engine.target(), "listing again");
+                            }
+                        }
+                        Err(e) => {
+                            // Written down when it changes, not every five seconds.
+                            if st.error.as_ref() != Some(&e) {
+                                st.error = Some(e.clone());
+                                self.journal.fail(engine.target(), format!("listing: {e}"));
+                            }
+                        }
+                    }
+                }
+                DockerMsg::Done {
+                    target,
+                    what,
+                    result,
+                } => {
+                    self.docker_busy.remove(&target);
+                    match result {
+                        Ok(()) => self.report(target.clone(), format!("{} — done", what), false),
+                        Err(e) => self.report(target.clone(), format!("{what} failed: {e}"), true),
+                    }
+                    if let LogTarget::Docker { engine, .. } = &target {
+                        if let Some(st) = self.docker.get_mut(&Engine::from_key(engine)) {
+                            st.polled_at = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run `docker <args>` on an engine as an action about `target`.
+    fn docker_action(&mut self, engine: Engine, target: LogTarget, what: String, args: Vec<String>) {
+        if let Some(busy) = self.docker_busy.get(&target) {
+            self.flash(format!("still {busy}"), true);
+            return;
+        }
+        if let Some(why) = self.docker_unreachable(&engine) {
+            self.flash(why, true);
+            return;
+        }
+        let argv = self.docker_argv(&engine, &args);
+        self.note(target.clone(), format!("{what}: {}", report::command_line(&argv)));
+        let ring = Arc::clone(
+            self.docker_actions
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(Ring::new("docker"))),
+        );
+        self.docker_busy.insert(target.clone(), what.clone());
+        self.flash(format!("{what}…"), false);
+        docker::spawn_action(
+            target,
+            what,
+            argv,
+            self.docker_host(&engine).cloned(),
+            self.ssh_password_helper.clone(),
+            ring,
+            self.docker_tx.clone(),
+        );
+    }
+
+    /// Keep a `docker logs --follow` running for every container the open
+    /// pane shows, and none for any other. `fresh` is a pane that has just
+    /// been opened, which reads a stopped container's log once more.
+    fn docker_follow(&mut self, fresh: bool) {
+        let wanted: Vec<(Engine, LogTarget, bool)> = match self.log_pane.as_ref().map(|p| &p.target) {
+            Some(LogTarget::Docker {
+                engine,
+                stack,
+                container,
+            }) if !stack.is_empty() || !container.is_empty() => {
+                let e = Engine::from_key(engine);
+                self.docker
+                    .get(&e)
+                    .map(|st| {
+                        st.containers
+                            .iter()
+                            .filter(|c| {
+                                &c.project == stack && (container.is_empty() || &c.name == container)
+                            })
+                            .map(|c| (e.clone(), c.target(&e), c.is_running()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        for (about, log) in self.docker_logs.iter_mut() {
+            if !wanted.iter().any(|(_, t, _)| t == about) {
+                log.stop();
+            }
+        }
+        for (engine, about, running) in wanted {
+            if self.docker_unreachable(&engine).is_some() {
+                continue;
+            }
+            let LogTarget::Docker { container, .. } = &about else {
+                continue;
+            };
+            let since = self.docker_logs.get(&about).and_then(ContainerLog::since);
+            let argv = self.docker_argv(&engine, &docker::logs_args(container, since));
+            let host = self.docker_host(&engine).cloned();
+            let helper = self.ssh_password_helper.clone();
+            let log = self.docker_logs.entry(about.clone()).or_default();
+            if log.following() {
+                continue;
+            }
+            // A running container whose follow ended has been restarted, or
+            // the connection dropped: pick it up again, but not in a loop.
+            let again = match log.started {
+                None => true,
+                Some(_) if fresh => true,
+                Some(at) => running && at.elapsed() >= DOCKER_REFRESH,
+            };
+            if !again {
+                continue;
+            }
+            let first = log.started.is_none();
+            let result = log.follow(&argv, host.as_ref(), &helper);
+            match result {
+                Ok(()) if first => {
+                    self.note(about, format!("following: {}", report::command_line(&argv)))
+                }
+                Ok(()) => {}
+                Err(e) => self.journal.fail(about, e),
+            }
+        }
+    }
+
+    fn on_docker_key(&mut self, key: KeyEvent) {
+        self.sync_docker_engines();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up | KeyCode::Down if ctrl => self.flash(
+                "docker decides what is on an engine — stacks are listed by name",
+                false,
+            ),
+            // The stack list is a tree of engines: the arrows open and fold
+            // it, and → off a stack crosses into its containers.
+            KeyCode::Left => match self.docker.focus {
+                DockerPane::Containers => self.docker.focus = DockerPane::Stacks,
+                DockerPane::Stacks => self.docker.collapse(),
+            },
+            KeyCode::Right => match self.docker.current_row() {
+                _ if self.docker.focus == DockerPane::Containers => {}
+                DockerRow::Engine(_) => self.docker.expand(),
+                DockerRow::Stack(..) if self.docker.stack_containers().is_empty() => {
+                    self.flash("this stack has no containers left", false)
+                }
+                DockerRow::Stack(..) => self.docker.focus = DockerPane::Containers,
+            },
+            KeyCode::Up => self.move_docker(Move::Up, false),
+            KeyCode::Down => self.move_docker(Move::Down, false),
+            KeyCode::PageUp => self.move_docker(Move::Up, true),
+            KeyCode::PageDown => self.move_docker(Move::Down, true),
+            KeyCode::Enter | KeyCode::Char(' ') => self.docker_toggle(),
+            KeyCode::Char('r') => self.docker_restart(),
+            KeyCode::Char('d') => self.docker_delete(),
+            KeyCode::Char('a') => self.flash(
+                "a stack comes from `docker compose up` in its directory; another engine \
+                 is an SSH host with Docker set to yes",
+                false,
+            ),
+            KeyCode::Char('e') => match self.docker.current_row() {
+                DockerRow::Engine(Engine::Ssh(n)) => {
+                    self.flash(format!("'{n}' is an SSH host — edit it on the SSH tab"), false)
+                }
+                _ => self.flash(
+                    "a stack is its compose file — edit that, then r restarts it",
+                    false,
+                ),
+            },
+            KeyCode::Char('p') => self.flash(
+                "docker keeps no password here — a remote engine uses its SSH host's",
+                false,
+            ),
+            KeyCode::Char('f') => self.flash(
+                "files move over SSH — pick the host on the SSH tab",
+                false,
+            ),
+            KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('c') => {
+                let target = self.docker.selection_target();
+                let engine = self.docker.current_row().engine().clone();
+                if let Some(st) = self.docker.get_mut(&engine) {
+                    st.error = None;
+                }
+                self.docker_actions.retain(|t, _| !target.covers(t));
+                self.flash("cleared", false);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_docker(&mut self, dir: Move, page: bool) {
+        let step = |at: usize, len: usize| {
+            if page {
+                page_to(at, len, dir)
+            } else {
+                match dir {
+                    Move::Up => (at + len - 1) % len,
+                    Move::Down => (at + 1) % len,
+                }
+            }
+        };
+        match self.docker.focus {
+            DockerPane::Stacks => {
+                let len = self.docker.rows().len();
+                if len > 0 {
+                    let at = step(self.docker.row_index(), len);
+                    self.docker.select_row(at);
+                }
+            }
+            DockerPane::Containers => {
+                let len = self.docker.stack_containers().len();
+                if len > 0 {
+                    let at = step(self.docker.container_index(), len);
+                    self.docker.select_container(at);
+                }
+            }
+        }
+    }
+
+    /// `Enter`: bring up what is down, take down what is up.
+    fn docker_toggle(&mut self) {
+        let row = self.docker.current_row();
+        let engine = row.engine().clone();
+        if let Some(c) = self.docker.selected_container().cloned() {
+            let (what, verb) = match c.state.as_str() {
+                "paused" => ("unpausing", "unpause"),
+                _ if c.is_running() => ("stopping", "stop"),
+                _ => ("starting", "start"),
+            };
+            self.docker_action(
+                engine.clone(),
+                c.target(&engine),
+                format!("{what} {}", c.name),
+                docker::container_args(verb, &c.name),
+            );
+            return;
+        }
+        match row {
+            DockerRow::Engine(Engine::Ssh(name)) if self.docker_unreachable(&engine).is_some() => {
+                self.activate(vec![Step::Docker(name)])
+            }
+            DockerRow::Engine(_) => {
+                if let Some(why) = self.docker_unreachable(&engine) {
+                    self.flash(why, true);
+                } else {
+                    self.docker_poll(&engine);
+                    self.flash(format!("listing docker on {}", engine.label()), false);
+                }
+            }
+            DockerRow::Stack(_, s) if s.is_empty() => self.flash(
+                "these belong to no stack — → picks one of them",
+                false,
+            ),
+            DockerRow::Stack(_, s) => {
+                let running = self
+                    .docker
+                    .stack_containers()
+                    .iter()
+                    .any(|c| c.is_running());
+                let (what, verb) = if running {
+                    ("stopping", "stop")
+                } else {
+                    ("starting", "start")
+                };
+                self.docker_action(
+                    engine.clone(),
+                    LogTarget::docker(engine.key(), &s, ""),
+                    format!("{what} stack {s}"),
+                    docker::compose_args(&s, verb),
+                );
+            }
+        }
+    }
+
+    /// `r`: restart the container or the stack, or list the engine again.
+    fn docker_restart(&mut self) {
+        let row = self.docker.current_row();
+        let engine = row.engine().clone();
+        if let Some(c) = self.docker.selected_container().cloned() {
+            self.docker_action(
+                engine.clone(),
+                c.target(&engine),
+                format!("restarting {}", c.name),
+                docker::container_args("restart", &c.name),
+            );
+            return;
+        }
+        match row {
+            DockerRow::Engine(_) => {
+                if let Some(st) = self.docker.get_mut(&engine) {
+                    st.error = None;
+                }
+                self.docker_poll(&engine);
+                self.flash(format!("listing docker on {}", engine.label()), false);
+            }
+            DockerRow::Stack(_, s) if s.is_empty() => {
+                self.flash("these belong to no stack — → picks one of them", false)
+            }
+            DockerRow::Stack(_, s) => self.docker_action(
+                engine.clone(),
+                LogTarget::docker(engine.key(), &s, ""),
+                format!("restarting stack {s}"),
+                docker::compose_args(&s, "restart"),
+            ),
+        }
+    }
+
+    /// `d`: `docker compose down` on a stack, `docker rm` on a stopped
+    /// container — both asked about first, because neither comes back with
+    /// `Enter`.
+    fn docker_delete(&mut self) {
+        let row = self.docker.current_row();
+        let engine = row.engine().clone();
+        if let Some(c) = self.docker.selected_container().cloned() {
+            if c.is_running() {
+                self.flash(format!("{} is running — Enter stops it first", c.name), true);
+                return;
+            }
+            self.docker_confirm = Some(DockerConfirm {
+                question: format!("Remove container '{}' (docker rm)?", c.name),
+                target: c.target(&engine),
+                what: format!("removing {}", c.name),
+                args: docker::container_args("rm", &c.name),
+                engine,
+            });
+            return;
+        }
+        match row {
+            DockerRow::Engine(Engine::Ssh(n)) => self.flash(
+                format!("set Docker to no on the SSH host '{n}' to drop it from this list"),
+                false,
+            ),
+            DockerRow::Engine(Engine::Local) => {
+                self.flash("this machine is always listed", false)
+            }
+            DockerRow::Stack(_, s) if s.is_empty() => {
+                self.flash("these belong to no stack — → picks one of them", false)
+            }
+            DockerRow::Stack(_, s) => {
+                self.docker_confirm = Some(DockerConfirm {
+                    question: format!(
+                        "Take stack '{s}' down? Its containers and networks are removed; \
+                         volumes are kept (docker compose down)"
+                    ),
+                    target: LogTarget::docker(engine.key(), &s, ""),
+                    what: format!("taking stack {s} down"),
+                    args: docker::compose_args(&s, "down"),
+                    engine,
+                })
+            }
+        }
+    }
+
+    /// The containers a docker pane is about, for the state strip over its
+    /// log: the one container, or every container of the stack.
+    pub fn docker_strip(&self, target: &LogTarget) -> Vec<docker::Container> {
+        let LogTarget::Docker {
+            engine,
+            stack,
+            container,
+        } = target
+        else {
+            return Vec::new();
+        };
+        if stack.is_empty() && container.is_empty() {
+            return Vec::new();
+        }
+        self.docker
+            .get(&Engine::from_key(engine))
+            .map(|st| {
+                docker::members(&st.containers, stack)
+                    .into_iter()
+                    .filter(|c| container.is_empty() || &c.name == container)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn on_tick(&mut self) {
         let dt = self.last_tick.elapsed().as_secs_f64().max(0.5);
         let mut total_rate = 0u64;
@@ -7264,6 +8074,8 @@ impl App {
             self.ticket_at = Instant::now();
             privileged::keep_warm();
         }
+
+        self.on_docker_tick();
 
         self.handle_reconnects();
         self.advance_activation();
@@ -7476,6 +8288,7 @@ mod tests {
             depends_on: dep.into(),
             requires_vpn: vpn.into(),
             remote_dir: String::new(),
+            docker: false,
         }
     }
 

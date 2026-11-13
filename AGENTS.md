@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 251 tests, all pure unit tests — no network, no root
+cargo test             # 267 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -50,6 +50,7 @@ so those still need the CI job or a real machine.
 | `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline |
 | `src/sftp.rs` | the one `sftp` process a transfer browser talks to, the listing it parses, and the remote pane's state |
 | `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
+| `src/docker.rs` | the Docker tab: engines, `docker ps` parsed into stacks and containers, the command line for an engine (local, or over an SSH-tab host), actions, following a container's log, and the tab's selection |
 | `src/browser.rs` | the file picker |
 | `src/chooser.rs` | the list picker — a tree: groups, clients and accounts as folders, entries as files |
 | `src/theme.rs` | the four colour themes |
@@ -196,6 +197,27 @@ release against a real client, never to quiet the prompt. A client command that 
 questions — `pangolin login`, `pangolin update`, anything that opens `/dev/tty` — is never
 run from a thread: it goes on `App::handoffs` and gets the terminal from the main loop.
 
+**A stack is what docker says it is.** `docker.rs` reads compose projects off the labels
+`docker ps` reports and never reads a compose file, so every compose verb is run as
+`docker compose -p <project>` without `-f`. A remote engine is the docker CLI run on the
+host through `docker::command_line`, which builds on `ssh::connection_args` like a tunnel
+and a transfer do — not `docker -H ssh://`, whose helper takes none of a host's options.
+A remote engine waits for its chain the same way a session does (`Step::Docker`), and a
+poll never brings that chain up: `docker_unreachable` says what is missing and `Enter`
+on the engine runs the plan.
+
+A container's own output is not something controlcenter did, so it stays out of
+`rings_for`: `App::docker_rings_for` gives a container pane its log and a stack every
+container's, tagged, and an engine or the program none. That merge is what a stack's
+*report* gets; its *pane* is drawn as tiles instead — still the one `LogPane` and the one
+renderer, which hands a stack target to `render_log_tiles`. Each tile is
+`App::tile_lines`, which holds only what is about that container, and what was done to
+the stack itself is `App::stack_own_lines` along the bottom, so nothing is drawn twice.
+Tile focus and per-tile scroll live on the `LogPane`, and `LogPane::back` is the stack a
+container was opened out of. A `docker logs --follow` runs only
+while a pane shows it (`App::docker_follow`) and picks up from the last timestamp when the
+pane opens again. Lines lose their terminal escapes before they reach a ring.
+
 **The UI thread never blocks.** Every connect, disconnect and status poll runs on a thread
 and reports back through `vpn_tx`/`vpn_rx`. A new long-running operation follows the same
 shape.
@@ -279,10 +301,11 @@ values are still read as NetBird.
 - `README.md` — what the program is, the tabs, the full keymap, requirements. Keep it
   short; it is the page a human reads first
 - `docs/connections.md` — groups, dependencies, conflicts, SSH sessions and passwords
+- `docs/docker.md` — the Docker tab, and remote engines
 - `docs/logs.md` — the log pane, and what an exported report contains
 - `docs/vpn.md` — how each VPN client is driven
 - `docs/configuration.md` — every config file, field by field
 - this file — anything an agent needs and a user does not
 
-A behaviour change that a user would notice belongs in one of the first five. A convention
+A behaviour change that a user would notice belongs in one of the first six. A convention
 that only matters while editing the code belongs here.

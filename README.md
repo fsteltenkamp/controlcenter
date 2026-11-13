@@ -1,6 +1,6 @@
 # ControlCenter
 
-TUI control center: SSH tunnels, SSH logins, VPN clients and RDP sessions in one place.
+TUI control center: SSH tunnels, SSH logins, VPN clients, RDP sessions and Docker in one place.
 Built with [ratatui](https://ratatui.rs).
 
 Configure tunnels, hosts, VPN profiles and RDP connections once, then bring them up and
@@ -21,6 +21,7 @@ cargo build --release
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
 | 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running — and `f`, a two-pane file browser for copying files to and from the host |
 | 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
+| 6 | **Docker** | compose stacks and their containers, on this machine and on any SSH host marked as running docker — start, stop, restart, take down, and a log per container, or a stack's containers tiled side by side |
 
 Entries on any of these tabs can share a **group** name to stack under one header and be
 acted on together, and can **require** a VPN profile or a tunnel. A tunnel can also run
@@ -54,11 +55,11 @@ Moving about:
 
 | Key | Action |
 | --- | --- |
-| `1`–`5` | jump to a tab |
+| `1`–`6` | jump to a tab |
 | `Tab` / `Shift+Tab` | next / previous tab |
 | `↑` `↓` | move the selection · scroll a log |
 | `PgUp` `PgDn` | move the selection ten rows · scroll a log by a screen |
-| `←` `→` | switch pane (VPN) · change the field under the cursor (forms) |
+| `←` `→` | switch pane (VPN) · fold and open an engine, step into its containers (Docker) · change the field under the cursor (forms) |
 | `Esc` | cancel a form, close a popup |
 | `y` | confirm in a prompt |
 | `Ctrl+O` | open a picker for the field under the cursor — files on a path field, the whole list on a VPN, tunnel or ssh-host field |
@@ -68,17 +69,17 @@ moving.
 
 ### What each key acts on
 
-| | VPN | Tunnels | SSH | RDP |
-| --- | --- | --- | --- | --- |
-| `Enter` | connect the profile, or stop a `◆` | start the tunnel | open a session | connect |
-| `a` `e` `d` | profile | tunnel | host | connection |
-| `r` | refresh this client now | restart it | open another session | reconnect |
-| `p` | forget an OpenVPN password | — keys only | forget the stored password | — never stored |
-| `f` | — files go over SSH | — files go over SSH | the transfer browser | — files go over SSH |
-| `l` | the profile's log | the tunnel's log | the host's log | the connection's log |
-| `s` | a report about it | a report about it | a report about it | a report about it |
-| `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions |
-| `Ctrl+↑` `Ctrl+↓` | the profile, in `vpn.toml` | the tunnel or its group | the host or its group | the connection or its group |
+| | VPN | Tunnels | SSH | RDP | Docker |
+| --- | --- | --- | --- | --- | --- |
+| `Enter` | connect the profile, or stop a `◆` | start the tunnel | open a session | connect | start or stop the stack or container; on a remote engine, bring up what its host needs |
+| `a` `e` `d` | profile | tunnel | host | connection | `d`: `compose down` a stack, `rm` a stopped container — asked first |
+| `r` | refresh this client now | restart it | open another session | reconnect | restart the stack or container, list an engine again |
+| `p` | forget an OpenVPN password | — keys only | forget the stored password | — never stored | — none kept |
+| `f` | — files go over SSH | — files go over SSH | the transfer browser | — files go over SSH | — files go over SSH |
+| `l` | the profile's log | the tunnel's log | the host's log | the connection's log | a container's log, or a stack's containers in tiles |
+| `s` | a report about it | a report about it | a report about it | a report about it | a report about it |
+| `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions | the engine's error and finished actions |
+| `Ctrl+↑` `Ctrl+↓` | the profile, in `vpn.toml` | the tunnel or its group | the host or its group | the connection or its group | — docker's order, by name |
 
 An entry moves inside its own group and a group header moves the whole group, so the
 list keeps the shape it is drawn in; `Ctrl+↑` `Ctrl+↓` on a group's first or last entry
@@ -133,6 +134,24 @@ plan. On the **Dashboard** `r` refreshes every VPN client, `c` clears every fini
 everywhere, and `l` and `s` act on the whole program rather than on one connection; the
 keys that need something selected say which tab owns it.
 
+### Docker
+
+The Docker tab lists each engine on the left, folded: `→` opens one to list its
+**stacks** — compose projects, as docker itself labels them, so a stack started from any
+directory shows up without being configured — and the selected stack's **containers** in the middle, each marked running, healthy, starting,
+unhealthy, stopped or crashed. A stack is marked by its worst container, so a crashed
+service shows on the stack before you open it.
+
+`l` on a container shows that container's log alone, followed live. `l` on a stack splits
+the log pane into a **tile per container**, side by side, each titled with the container's
+state and following its own log — `←` `→` pick a tile, `↑` `↓` scroll it, `Enter` opens
+that one container on its own and `Esc` comes back to the tiles. Containers that belong to no compose project are listed
+together as `(no stack)`.
+
+Docker on another machine runs over SSH: set **Docker on this host** on an SSH-tab host
+and it is listed as an engine of its own, reached with that host's port, key, password,
+VPN and tunnel. See [docs/docker.md](docs/docker.md).
+
 ### Logs and reports
 
 `l` opens the same log pane on every tab: what controlcenter did about the thing under the
@@ -186,6 +205,7 @@ Optional, each detected on startup and only greying out its own feature when mis
 | RDP tab | `xfreerdp3` (freerdp3) | `mstsc`, which is part of Windows |
 | SSH passwords | `sshpass` | nothing to install — see below |
 | VPN tab | `netbird`, `wireguard-tools` (`wg`, `wg-quick`), `openvpn`, `tailscale`, `pangolin` | the NetBird, WireGuard, OpenVPN, Tailscale and Pangolin installers; controlcenter looks under Program Files as well as on PATH |
+| Docker tab | `docker` with the compose plugin, for this machine's engine; a remote engine needs it on the host and only `ssh` here | Docker Desktop |
 
 A stored SSH password is never an argument. Where `sshpass` is installed it is used;
 where it is not — every Windows machine — controlcenter answers ssh's own prompt instead,
@@ -246,6 +266,7 @@ edit it by hand. `controlcenter --config-paths` prints exactly where each file l
   SSH sessions and passwords work
 - [docs/vpn.md](docs/vpn.md) — how each of the four VPN clients is driven, and what
   importing an OpenVPN profile does
+- [docs/docker.md](docs/docker.md) — the Docker tab: stacks, containers, logs and remote engines
 - [docs/logs.md](docs/logs.md) — the log pane, and what an exported report contains
 - [docs/configuration.md](docs/configuration.md) — every config file, field by field
 - [AGENTS.md](AGENTS.md) — instructions for AI agents working on this repository

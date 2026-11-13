@@ -815,6 +815,7 @@ mod tests {
             depends_on: String::new(),
             requires_vpn: String::new(),
             remote_dir: String::new(),
+            docker: false,
         }
     }
 

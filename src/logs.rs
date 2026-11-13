@@ -55,12 +55,19 @@ impl Ring {
     }
 
     pub fn push(&self, text: impl Into<String>) {
+        self.push_at(SystemTime::now(), text);
+    }
+
+    /// A line stamped with when its producer says it was written, which for a
+    /// container's log is not when it reached us: a first look reads back
+    /// hours of it at once.
+    pub fn push_at(&self, at: SystemTime, text: impl Into<String>) {
         let mut lines = self.lines.lock().unwrap();
         if lines.len() >= self.cap {
             lines.pop_front();
         }
         lines.push_back(Entry {
-            at: SystemTime::now(),
+            at,
             source: self.source,
             text: text.into(),
             error: false,
@@ -88,7 +95,7 @@ impl Ring {
 }
 
 /// Which connection a log pane, a journal entry or a report is about.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LogTarget {
     /// controlcenter itself: everything it did, on every tab.
     Program,
@@ -98,6 +105,14 @@ pub enum LogTarget {
     /// A VPN client, and the profile when the entry is about one. An empty
     /// profile means the client itself — a refresh, an install check.
     Vpn(ProviderId, String),
+    /// A docker engine — empty for this machine, otherwise the SSH host it runs
+    /// on — and the stack and container when the entry is about one. A
+    /// container that belongs to no stack has an empty stack and a name.
+    Docker {
+        engine: String,
+        stack: String,
+        container: String,
+    },
 }
 
 impl LogTarget {
@@ -105,9 +120,34 @@ impl LogTarget {
         Self::Vpn(provider, String::new())
     }
 
+    pub fn docker(engine: &str, stack: &str, container: &str) -> Self {
+        Self::Docker {
+            engine: engine.into(),
+            stack: stack.into(),
+            container: container.into(),
+        }
+    }
+
     /// How the pane titles it and the report names it.
     pub fn title(&self) -> String {
         match self {
+            Self::Docker {
+                engine,
+                stack,
+                container,
+            } => {
+                let on = if engine.is_empty() {
+                    String::new()
+                } else {
+                    format!(" on '{engine}'")
+                };
+                match (stack.is_empty(), container.is_empty()) {
+                    (_, false) => format!("container '{container}'{on}"),
+                    (false, true) => format!("stack '{stack}'{on}"),
+                    (true, true) if engine.is_empty() => "docker on this machine".into(),
+                    (true, true) => format!("docker on '{engine}'"),
+                }
+            }
             Self::Program => "controlcenter".into(),
             Self::Tunnel(n) => format!("tunnel '{n}'"),
             Self::Ssh(n) => format!("ssh host '{n}'"),
@@ -127,6 +167,14 @@ impl LogTarget {
             Self::Rdp(n) => format!("rdp-{n}"),
             Self::Vpn(p, name) if name.is_empty() => p.slug().to_string(),
             Self::Vpn(p, name) => format!("{}-{name}", p.slug()),
+            Self::Docker {
+                engine,
+                stack,
+                container,
+            } => {
+                let engine = if engine.is_empty() { "local" } else { engine };
+                format!("docker-{engine}-{stack}-{container}")
+            }
         };
         // A connection name is free text and ends up in a path.
         let mut slug: String = raw
@@ -155,6 +203,27 @@ impl LogTarget {
             (Self::Program, _) => true,
             (Self::Vpn(a, want), Self::Vpn(b, got)) => {
                 a == b && (want.is_empty() || got.is_empty() || want == got)
+            }
+            // The same shape as a VPN client and its profiles, one level
+            // deeper: an engine, a stack and a container each see what was
+            // done to the others in their line, and never to a sibling.
+            (
+                Self::Docker {
+                    engine: e1,
+                    stack: s1,
+                    container: c1,
+                },
+                Self::Docker {
+                    engine: e2,
+                    stack: s2,
+                    container: c2,
+                },
+            ) => {
+                let engine_level = |s: &str, c: &str| s.is_empty() && c.is_empty();
+                e1 == e2
+                    && (engine_level(s1, c1)
+                        || engine_level(s2, c2)
+                        || (s1 == s2 && (c1.is_empty() || c2.is_empty() || c1 == c2)))
             }
             (a, b) => a == b,
         }
@@ -234,6 +303,43 @@ pub fn file_stamp(t: SystemTime) -> String {
 pub fn clock(t: SystemTime) -> String {
     let (_, _, _, h, mi, s) = parts(t);
     format!("{h:02}:{mi:02}:{s:02}")
+}
+
+/// `2026-11-13T09:12:01.123456789Z`, as docker stamps a log line, into a time.
+/// Only UTC is read, because that is all docker writes; anything else is not a
+/// stamp and is left as part of the line.
+pub fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, mo, da) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = match time.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (time, ""),
+    };
+    let mut t = hms.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (h, mi, se) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    if !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let nanos: u32 = format!("{:0<9}", &frac[..frac.len().min(9)]).parse().ok()?;
+    let secs = days_from_civil(y, mo as u32, da as u32) * 86_400 + h * 3600 + mi * 60 + se;
+    let secs = u64::try_from(secs).ok()?;
+    Some(UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
+/// The inverse of [`civil_from_days`], from the same algorithm.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Split a time into UTC calendar parts. Times before the epoch cannot come
@@ -354,6 +460,36 @@ mod tests {
         j.clear_for(&LogTarget::Tunnel("db".into()));
         assert_eq!(j.all().len(), 1);
         assert_eq!(j.all()[0].1.text, "connected");
+    }
+
+    #[test]
+    fn a_docker_stamp_reads_back_as_the_time_it_names() {
+        let t = parse_rfc3339("2026-08-26T14:03:11.25Z").unwrap();
+        assert_eq!(stamp(t), "2026-08-26 14:03:11 UTC");
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().subsec_millis(),
+            250
+        );
+        assert_eq!(stamp(parse_rfc3339("2100-03-01T00:00:00Z").unwrap()), "2100-03-01 00:00:00 UTC");
+        assert!(parse_rfc3339("2026-08-26 14:03:11").is_none());
+        assert!(parse_rfc3339("hello").is_none());
+    }
+
+    #[test]
+    fn a_container_pane_sees_its_stack_and_engine_but_not_its_siblings() {
+        let engine = LogTarget::docker("", "", "");
+        let stack = LogTarget::docker("", "web", "");
+        let one = LogTarget::docker("", "web", "web-1");
+        let other = LogTarget::docker("", "web", "web-2");
+        let loose = LogTarget::docker("", "", "lonely");
+        assert!(engine.covers(&one) && one.covers(&engine));
+        assert!(stack.covers(&one) && one.covers(&stack));
+        assert!(!one.covers(&other));
+        assert!(!stack.covers(&loose) && !loose.covers(&stack));
+        assert!(engine.covers(&loose));
+        assert!(!one.covers(&LogTarget::docker("box", "web", "web-1")));
+        assert_eq!(one.title(), "container 'web-1'");
+        assert_eq!(one.slug(), "docker-local-web-web-1");
     }
 
     #[test]
