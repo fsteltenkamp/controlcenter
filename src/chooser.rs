@@ -227,6 +227,14 @@ impl Chooser {
         self.refresh();
     }
 
+    /// Back to the top level, where typing searches everything.
+    pub fn to_top(&mut self) {
+        self.folder.clear();
+        self.filter.clear();
+        self.selected = 0;
+        self.refresh();
+    }
+
     /// One folder up, with the folder we came out of selected.
     pub fn ascend(&mut self) {
         let Some(leaf) = self.folder.pop() else {

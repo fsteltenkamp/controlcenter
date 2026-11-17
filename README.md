@@ -19,9 +19,9 @@ cargo build --release
 | 1 | **Dashboard** | everything that is up: VPN state, tunnel counts and traffic, running RDP sessions, and the aggregate throughput sparkline |
 | 2 | **VPN** | NetBird, WireGuard, OpenVPN, Tailscale and Pangolin side by side — clients on the left, their profiles in the middle, status on the right, and anything already up that controlcenter did not start |
 | 3 | **Tunnels** | SSH forwards: local (`-L`), remote (`-R`) and dynamic/SOCKS (`-D`), with live ↑/↓ throughput and optional auto-reconnect |
-| 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running — and `f`, a two-pane file browser for copying files to and from the host |
+| 4 | **SSH** | interactive logins, each in a terminal window of its own so the TUI keeps running — `f`, a two-pane file browser for copying files to and from the host, and `!`, a script from the library run on it |
 | 5 | **RDP** | remote desktop sessions — `mstsc` on Windows, `xfreerdp3` elsewhere — running in the background with a log view |
-| 6 | **Docker** | compose stacks and their containers, on this machine and on any SSH host marked as running docker — start, stop, restart, take down, and a log per container, or a stack's containers tiled side by side |
+| 6 | **Docker** | compose stacks and their containers, on this machine and on any SSH host marked as running docker — start, stop, restart, take down, a log per container or a stack's containers tiled side by side, and `!`: a script or a shell in a container, as any user |
 
 Entries on any of these tabs can share a **group** name to stack under one header and be
 acted on together, and can **require** a VPN profile or a tunnel. A tunnel can also run
@@ -42,6 +42,7 @@ Every key means the same thing on every tab. Only what it acts on changes.
 | `r` | reconnect / reload |
 | `p` | remove the stored password |
 | `f` | files — the two-pane transfer browser |
+| `!` | run a script on it — or, in a container, open a shell |
 | `l` | log |
 | `s` | save a report to a file |
 | `c` | clear — the log, or the entries that have finished |
@@ -62,7 +63,7 @@ Moving about:
 | `←` `→` | switch pane (VPN) · fold and open an engine, step into its containers (Docker) · change the field under the cursor (forms) |
 | `Esc` | cancel a form, close a popup |
 | `y` | confirm in a prompt |
-| `Ctrl+O` | open a picker for the field under the cursor — files on a path field, the whole list on a VPN, tunnel or ssh-host field |
+| `Ctrl+O` | open a picker for the field under the cursor — files on a path field, the whole list on a VPN, tunnel or ssh-host field, the script library on a script field |
 
 There is no vim navigation: `h` `j` `k` `l` are action keys here, so the arrows do the
 moving.
@@ -76,6 +77,7 @@ moving.
 | `r` | refresh this client now | restart it | open another session | reconnect | restart the stack or container, list an engine again |
 | `p` | forget an OpenVPN password | — keys only | forget the stored password | — never stored | — none kept |
 | `f` | — files go over SSH | — files go over SSH | the transfer browser | — files go over SSH | — files go over SSH |
+| `!` | — scripts run on a host | — scripts run on a host | run a script on the host | — scripts run over SSH | run a script in a container, or open a shell in it |
 | `l` | the profile's log | the tunnel's log | the host's log | the connection's log | a container's log, or a stack's containers in tiles |
 | `s` | a report about it | a report about it | a report about it | a report about it | a report about it |
 | `c` | the client's error, exited sessions | failed tunnels | the last session's outcome | finished sessions | the engine's error and finished actions |
@@ -115,6 +117,24 @@ login lands.
 A download shows its progress; an upload shows its size and how long it has been going,
 because `sftp` does not report the far end's progress. Everything a transfer does goes into
 the host's log (`l`) and into its report (`s`).
+
+### Scripts
+
+`!` on an SSH host or a container opens a small form: the **script**, its **arguments**,
+and — in a container — the **user** to run as (`1000`, `1000:1000`, `www-data`; empty is
+the image's own). `Enter` runs it and the log pane opens on the run, filling as the script
+prints; `Enter` in that pane stops it. A container can open an interactive **shell**
+instead — `←` `→` on the first field — as any user, in a window of its own like an SSH
+session.
+
+The script comes from a library with three shelves, picked with the same tree as every
+other list: a handful **built in** (an overview, disk usage, memory, open ports, failed
+units, journal errors, pending updates, certificate expiry, docker), your own in
+`~/.config/controlcenter/scripts/`, and any **git repositories** you name in
+`config.toml`. Typing on the script field searches all of them. Nothing is copied to the
+host: the script goes to its interpreter on stdin, over the same ssh every other command
+to that host uses. The form shows the exact command line and the script itself before
+anything runs. See [docs/scripts.md](docs/scripts.md).
 
 ### Connections that are not ours
 
@@ -169,7 +189,8 @@ appear; see [docs/logs.md](docs/logs.md).
 ### The panic button
 
 `x` works from any tab. It lists what is up and asks, then takes down every tunnel, RDP
-session, SSH window and VPN profile — including the ones controlcenter did not start —
+session, SSH window, container shell, running script and VPN profile — including the ones
+controlcenter did not start —
 abandons any activation in flight and stops auto-reconnect, so nothing comes back on its
 own. Taking a VPN down needs root: silent with a sudo ticket or an elevated controlcenter,
 otherwise a polkit prompt for each one.
@@ -267,6 +288,7 @@ edit it by hand. `controlcenter --config-paths` prints exactly where each file l
 - [docs/vpn.md](docs/vpn.md) — how each of the four VPN clients is driven, and what
   importing an OpenVPN profile does
 - [docs/docker.md](docs/docker.md) — the Docker tab: stacks, containers, logs and remote engines
+- [docs/scripts.md](docs/scripts.md) — the script library, running a script, and container shells
 - [docs/logs.md](docs/logs.md) — the log pane, and what an exported report contains
 - [docs/configuration.md](docs/configuration.md) — every config file, field by field
 - [AGENTS.md](AGENTS.md) — instructions for AI agents working on this repository

@@ -7,6 +7,7 @@ mod logs;
 mod platform;
 mod rdp;
 mod report;
+mod scripts;
 mod sftp;
 mod ssh;
 mod theme;
@@ -62,6 +63,8 @@ fn main() -> Result<()> {
         println!("openvpn    : {}", paths.openvpn_dir.display());
         println!("runtime    : {}", paths.run_dir.display());
         println!("reports    : {}", paths.reports_dir.display());
+        println!("scripts    : {}", paths.scripts_dir.display());
+        println!("repos      : {}", paths.repos_dir.display());
         return Ok(());
     }
 

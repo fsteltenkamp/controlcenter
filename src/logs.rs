@@ -62,6 +62,16 @@ impl Ring {
     /// container's log is not when it reached us: a first look reads back
     /// hours of it at once.
     pub fn push_at(&self, at: SystemTime, text: impl Into<String>) {
+        self.record(at, text.into(), false);
+    }
+
+    /// A line the process wrote to stderr, where that is worth telling apart:
+    /// a script's own complaints, drawn in red among what it printed.
+    pub fn push_err(&self, text: impl Into<String>) {
+        self.record(SystemTime::now(), text.into(), true);
+    }
+
+    fn record(&self, at: SystemTime, text: String, error: bool) {
         let mut lines = self.lines.lock().unwrap();
         if lines.len() >= self.cap {
             lines.pop_front();
@@ -69,8 +79,8 @@ impl Ring {
         lines.push_back(Entry {
             at,
             source: self.source,
-            text: text.into(),
-            error: false,
+            text,
+            error,
         });
     }
 
@@ -113,6 +123,14 @@ pub enum LogTarget {
         stack: String,
         container: String,
     },
+    /// One run of a script, on an SSH host or in a container. A run is
+    /// something done *to* that subject, so the subject's pane shows it too;
+    /// its own pane shows only the run.
+    Script {
+        on: Box<LogTarget>,
+        script: String,
+        run: u64,
+    },
 }
 
 impl LogTarget {
@@ -128,9 +146,27 @@ impl LogTarget {
         }
     }
 
+    pub fn script(on: LogTarget, script: &str, run: u64) -> Self {
+        Self::Script {
+            on: Box::new(on),
+            script: script.into(),
+            run,
+        }
+    }
+
+    /// What a script run was run on, and anything else as itself: the
+    /// connection whose configuration and chain explain it.
+    pub fn subject(&self) -> &LogTarget {
+        match self {
+            Self::Script { on, .. } => on.subject(),
+            other => other,
+        }
+    }
+
     /// How the pane titles it and the report names it.
     pub fn title(&self) -> String {
         match self {
+            Self::Script { on, script, .. } => format!("script '{script}' on {}", on.title()),
             Self::Docker {
                 engine,
                 stack,
@@ -175,6 +211,7 @@ impl LogTarget {
                 let engine = if engine.is_empty() { "local" } else { engine };
                 format!("docker-{engine}-{stack}-{container}")
             }
+            Self::Script { on, script, run } => format!("script-{script}-{run}-{}", on.slug()),
         };
         // A connection name is free text and ends up in a path.
         let mut slug: String = raw
@@ -201,6 +238,10 @@ impl LogTarget {
     pub fn covers(&self, entry: &LogTarget) -> bool {
         match (self, entry) {
             (Self::Program, _) => true,
+            // A run's pane is that run alone; the pane of what it ran on — or
+            // of anything that pane would show — has every run in it.
+            (Self::Script { .. }, _) => self == entry,
+            (_, Self::Script { on, .. }) => self.covers(on),
             (Self::Vpn(a, want), Self::Vpn(b, got)) => {
                 a == b && (want.is_empty() || got.is_empty() || want == got)
             }
@@ -490,6 +531,26 @@ mod tests {
         assert!(!one.covers(&LogTarget::docker("box", "web", "web-1")));
         assert_eq!(one.title(), "container 'web-1'");
         assert_eq!(one.slug(), "docker-local-web-web-1");
+    }
+
+    #[test]
+    fn a_script_run_shows_on_what_it_ran_on_and_keeps_its_own_pane_to_itself() {
+        let host = LogTarget::Ssh("web".into());
+        let first = LogTarget::script(host.clone(), "overview.sh", 1);
+        let second = LogTarget::script(host.clone(), "overview.sh", 2);
+        assert!(host.covers(&first) && LogTarget::Program.covers(&first));
+        assert!(!first.covers(&host) && !first.covers(&second));
+        assert!(!LogTarget::Ssh("db".into()).covers(&first));
+
+        // In a container, the stack and the engine see it as well.
+        let c = LogTarget::docker("box", "web", "web-1");
+        let run = LogTarget::script(c.clone(), "overview.sh", 3);
+        assert!(LogTarget::docker("box", "web", "").covers(&run));
+        assert!(LogTarget::docker("box", "", "").covers(&run));
+        assert!(!LogTarget::docker("box", "web", "web-2").covers(&run));
+        assert_eq!(run.subject(), &c);
+        assert_eq!(run.title(), "script 'overview.sh' on container 'web-1' on 'box'");
+        assert_eq!(first.slug(), "script-overview-sh-1-ssh-web");
     }
 
     #[test]

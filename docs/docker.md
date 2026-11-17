@@ -39,7 +39,22 @@ directory as usual.
 | `d` | `compose down` — containers and networks go, volumes stay; asked first | `rm`, for a stopped container; asked first | — |
 | `l` | a tile per container, side by side | that container's log | what controlcenter did there |
 | `s` | a report | a report | a report |
-| `c` | clear the error and the finished actions under the cursor | | |
+| `!` | — pick a container | run a script in it, or open a shell, as any user | — pick a container |
+| `c` | clear the error and the finished actions and script runs under the cursor | | |
+
+## Scripts and shells in a container
+
+`!` on a running container opens the run form. Its first field chooses between a
+**script** from the library and an interactive **shell**; both take a **user** — a name,
+a uid, or either with `:group` / `:gid`, exactly what `docker exec -u` takes. Left empty
+it is the image's own `USER`, not root.
+
+A script is `docker exec -i <container> <interpreter>` with the script on stdin, so the
+image only needs the interpreter — `sh` for every built-in script. A shell is
+`docker exec -it`, running `bash` where the image has it and `sh` where it does not, unless
+the **shell** field names another; it opens where an SSH session would, in a window of its
+own or in this terminal. On a remote engine both run on the host, over its ssh, like every
+other docker command. See [scripts.md](scripts.md).
 
 ## States
 

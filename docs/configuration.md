@@ -20,6 +20,7 @@ Everything is edited in the TUI and stored as TOML, so you can also edit it by h
 | `wireguard/` | generated `.conf` files handed to the WireGuard client | 0700 |
 | `openvpn/<name>/` | imported `.ovpn` files and their certificates | 0700 |
 | `reports/` | reports exported from a log pane with `s` | 0700, files 0600 |
+| `scripts/` | your own scripts, listed as `local` in the script library | as you leave it |
 
 The modes are the Linux ones. Windows has no file modes, so the same rule is written as an
 ACL instead: `icacls <path> /inheritance:r /grant:r <you>:F` drops everything the parent
@@ -48,6 +49,12 @@ client = "auto"                    # auto | freerdp | mstsc
 [vpn]
 sudo = "ask"                       # ask | auto | never
 on_exit = "ask"                    # ask | stop | keep
+
+[scripts]
+repos = [
+  { name = "ops", url = "git@github.com:me/ops-scripts.git" },
+  { name = "pinned", url = "https://example.com/tools.git", ref = "v1.4" },
+]
 ```
 
 `ssh.terminal` is explained in [connections.md](connections.md#ssh-sessions).
@@ -75,6 +82,13 @@ overrides it for one run. See [vpn.md](vpn.md#root).
 On Windows there is no ticket to take and the setting does nothing: a process is elevated
 or it is not, decided before it started. Start controlcenter as administrator to use
 WireGuard or OpenVPN there.
+
+`scripts.repos` are git repositories of scripts, each listed in the script library as a
+folder under its `name`. `url` is anything `git fetch` takes. `ref` is a branch, a tag or
+a commit; left out, the repository's default branch is followed. A tag or a commit pins
+what can run, which is worth doing for a repository other people push to. The clones live
+in the cache directory (`--config-paths` prints it) and are fetched again when `!` is
+pressed more than five minutes after the last time. See [scripts.md](scripts.md).
 
 `vpn.on_exit` decides what happens to OpenVPN sessions still up when you quit — `ask`
 (the default), `stop`, or `keep`. They run as root, so once controlcenter is gone nothing

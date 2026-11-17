@@ -121,8 +121,22 @@ pub fn secret_note(value: &str) -> String {
 }
 
 /// A command line as the report prints it: one string, secrets masked.
+///
+/// A word that a plain join would lose — one with a blank or a quote in it,
+/// or an empty one — is quoted, so that `a 'b c'` does not read as three
+/// arguments when it was two.
 pub fn command_line(argv: &[String]) -> String {
-    redact(&argv.join(" "))
+    let words: Vec<String> = argv
+        .iter()
+        .map(|a| {
+            if a.is_empty() || a.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+                crate::ssh::posix_quote(a)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    redact(&words.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +220,12 @@ pub fn build(app: &App, target: &LogTarget, stem: &str) -> Report {
 /// too; the subject's own `chain` line already says so.
 fn chain_targets(app: &App, target: &LogTarget) -> Vec<LogTarget> {
     let step = match target {
+        // A run is explained by what it ran on and everything in front of that.
+        LogTarget::Script { on, .. } => {
+            let mut out = chain_targets(app, on);
+            out.push((**on).clone());
+            return out;
+        }
         LogTarget::Program | LogTarget::Vpn(..) => return Vec::new(),
         LogTarget::Docker { engine, .. } if engine.is_empty() => return Vec::new(),
         // A remote engine is reached the way a login to its host is, so the
@@ -269,6 +289,36 @@ fn target_block(out: &mut String, app: &App, target: &LogTarget) {
         },
         LogTarget::Vpn(provider, profile) => vpn_profile_block(out, app, *provider, profile),
         LogTarget::Docker { .. } => docker_block(out, app, target),
+        LogTarget::Script { .. } => script_block(out, app, target),
+    }
+}
+
+/// One script run: what ran, from where, how, and how it ended. The script
+/// itself is not copied in — its origin says where to read it, and a repo
+/// script's commit pins which version that was.
+fn script_block(out: &mut String, app: &App, target: &LogTarget) {
+    let Some(run) = app.script_run(target) else {
+        field(out, "gone", "this run has been cleared");
+        return;
+    };
+    field(out, "script", &run.script);
+    field(out, "from", &run.origin);
+    if !run.user.is_empty() {
+        field(out, "as user", &run.user);
+    }
+    field(out, "ran", redact(&command_line(&run.argv)));
+    field(out, "fed", "the script, on stdin");
+    match &run.outcome {
+        None => field(
+            out,
+            "state",
+            format!("running for {}", crate::ui::fmt_duration(run.started.elapsed())),
+        ),
+        Some(o) => field(
+            out,
+            "state",
+            format!("{} after {}", o.label(), crate::ui::fmt_duration(o.duration)),
+        ),
     }
 }
 
@@ -369,6 +419,8 @@ fn subject(out: &mut String, app: &App, target: &LogTarget) {
                 chain(out, app, Step::Docker(engine.clone()));
             }
         }
+        // What it ran on is described under "what has to be up first".
+        LogTarget::Script { .. } => script_block(out, app, target),
     }
 }
 
@@ -772,7 +824,7 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
     let mut needs_root = false;
     let mut opens_a_session = false;
     for t in std::iter::once(target).chain(chain) {
-        match t {
+        match t.subject() {
             LogTarget::Program => {
                 wanted.push("ssh");
                 if app.ssh_password_helper == crate::ssh::PasswordHelper::Sshpass {
@@ -805,6 +857,7 @@ fn environment(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
                 wanted.extend(p.binaries());
                 needs_root |= p.needs_root();
             }
+            LogTarget::Script { .. } => {}
         }
     }
     // Two links of a chain usually want ssh; the reader needs it once.
@@ -1011,7 +1064,7 @@ fn what_it_did(out: &mut String, app: &App, target: &LogTarget, chain: &[LogTarg
         wrote_any = true;
         let _ = writeln!(
             body,
-            "{}  {:<24}{}{}",
+            "{}  {:<24} {}{}",
             logs::stamp(e.at),
             about.title(),
             if e.error { "ERROR: " } else { "" },
@@ -1148,6 +1201,15 @@ mod tests {
         // a value is masked either way, and a port number is not a secret worth
         // keeping. Being wrong in this direction is the safe one.
         assert_eq!(redact("ssh -i ~/.ssh/id_ed25519 host"), "ssh -i ~/.ssh/id_ed25519 host");
+    }
+
+    #[test]
+    fn an_argument_with_a_blank_in_it_still_reads_as_one() {
+        let argv: Vec<String> = ["docker", "exec", "-i", "c", "sh", "-s", "--", "a", "b c", ""]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(command_line(&argv), "docker exec -i c sh -s -- a 'b c' ''");
     }
 
     #[test]

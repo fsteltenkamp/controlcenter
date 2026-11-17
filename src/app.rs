@@ -5,6 +5,7 @@ use crate::docker::{self, ContainerLog, DockerMsg, DockerPane, DockerView, Engin
 use crate::logs::{Entry, Journal, LogTarget, Ring};
 use crate::rdp::{self, ActiveRdp, RdpStatus};
 use crate::report;
+use crate::scripts::{self, ScriptMsg};
 use crate::sftp::{self, MsgKind, RemoteBrowser, SftpMsg};
 use crate::ssh::{self, SessionOutcome};
 use crate::theme::{self, Theme};
@@ -636,18 +637,192 @@ pub enum ChooserTarget {
     SshDep,
     RdpVpn,
     RdpDep,
+    /// The script field of the run form.
+    Script,
 }
 
 impl ChooserTarget {
     /// What is missing when there is nothing to pick from.
     fn subject(self) -> &'static str {
         match self {
+            Self::Script => "script",
             Self::TunnelSshHost => "ssh host",
             Self::TunnelVpn | Self::SshVpn | Self::RdpVpn => "VPN profile",
             Self::TunnelDep | Self::SshDep | Self::RdpDep => "tunnel",
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Run form: a script on a host or in a container, or a shell in a container
+// ---------------------------------------------------------------------------
+
+/// The shell a container gets when the form names none: bash where the image
+/// has it, sh where it does not — and every image has sh.
+const AUTO_SHELL: &str = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunField {
+    /// Script or shell — a container only.
+    Mode,
+    Script,
+    Args,
+    Shell,
+    /// `docker exec -u` — a container only.
+    User,
+}
+
+impl RunField {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mode => "run",
+            Self::Script => "script",
+            Self::Args => "arguments",
+            Self::Shell => "shell",
+            Self::User => "user (uid[:gid] or name)",
+        }
+    }
+
+    /// A field set by its picker rather than typed into.
+    pub fn is_picker(self) -> bool {
+        matches!(self, Self::Mode | Self::Script)
+    }
+}
+
+/// What `!` acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSubject {
+    Host(String),
+    Container {
+        engine: Engine,
+        name: String,
+        project: String,
+    },
+}
+
+impl RunSubject {
+    /// The log a run on it belongs under — and the key its last form is
+    /// remembered by.
+    pub fn target(&self) -> LogTarget {
+        match self {
+            Self::Host(n) => LogTarget::Ssh(n.clone()),
+            Self::Container {
+                engine,
+                name,
+                project,
+            } => LogTarget::docker(engine.key(), project, name),
+        }
+    }
+}
+
+/// The form `!` opens. Enter on it is the confirmation: it shows the script
+/// and the exact command line before anything runs, which is what makes it
+/// reasonable to run a file someone else pushed to a repository.
+#[derive(Debug, Clone)]
+pub struct RunForm {
+    pub subject: RunSubject,
+    /// A container's interactive shell rather than a script.
+    pub shell: bool,
+    pub script: Option<scripts::Script>,
+    pub args: String,
+    /// Empty is [`AUTO_SHELL`].
+    pub shell_cmd: String,
+    pub user: String,
+    pub field: usize,
+    pub error: Option<String>,
+}
+
+impl RunForm {
+    pub fn new(subject: RunSubject) -> Self {
+        Self {
+            subject,
+            shell: false,
+            script: None,
+            args: String::new(),
+            shell_cmd: String::new(),
+            user: String::new(),
+            field: 0,
+            error: None,
+        }
+    }
+
+    pub fn in_container(&self) -> bool {
+        matches!(self.subject, RunSubject::Container { .. })
+    }
+
+    pub fn fields(&self) -> Vec<RunField> {
+        match (self.in_container(), self.shell) {
+            (false, _) => vec![RunField::Script, RunField::Args],
+            (true, false) => vec![RunField::Mode, RunField::Script, RunField::Args, RunField::User],
+            (true, true) => vec![RunField::Mode, RunField::Shell, RunField::User],
+        }
+    }
+
+    pub fn field(&self) -> RunField {
+        let fields = self.fields();
+        fields[self.field.min(fields.len() - 1)]
+    }
+
+    fn focus(&mut self, want: RunField) {
+        if let Some(i) = self.fields().iter().position(|f| *f == want) {
+            self.field = i;
+        }
+    }
+
+    pub fn next_field(&mut self) {
+        self.field = (self.field + 1) % self.fields().len();
+    }
+
+    pub fn prev_field(&mut self) {
+        let n = self.fields().len();
+        self.field = (self.field + n - 1) % n;
+    }
+
+    pub fn toggle_mode(&mut self) {
+        if self.in_container() {
+            self.shell = !self.shell;
+            self.focus(RunField::Mode);
+        }
+    }
+
+    pub fn active_text_mut(&mut self) -> Option<&mut String> {
+        match self.field() {
+            RunField::Args => Some(&mut self.args),
+            RunField::Shell => Some(&mut self.shell_cmd),
+            RunField::User => Some(&mut self.user),
+            RunField::Mode | RunField::Script => None,
+        }
+    }
+}
+
+/// A shell in a container, waiting for the main loop: it needs a terminal, a
+/// window's or this one.
+pub struct ShellLaunch {
+    pub target: LogTarget,
+    pub argv: Vec<String>,
+    pub password: String,
+}
+
+/// What submitting the run form turns into.
+enum RunPlan {
+    Script(scripts::Launch),
+    Shell(ShellLaunch),
+}
+
+/// The last sync of one script repository.
+#[derive(Debug, Clone, Default)]
+pub struct RepoSync {
+    pub at: Option<Instant>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+/// How long a repository is left alone after a sync. `!` syncs anything
+/// older, so a push shows up the next time a script is picked — without a
+/// fetch on every keystroke.
+const REPO_SYNC_EVERY: Duration = Duration::from_secs(300);
+/// Runs kept for their panes once they have finished, across every host.
+const RUNS_KEPT: usize = 50;
 
 /// The lists a form needs to build its pickers.
 #[derive(Clone, Copy)]
@@ -1235,6 +1410,9 @@ pub enum Step {
     /// The docker engine on an SSH host: nothing is opened, but it is reached
     /// over the same ssh, so it waits for the same chain as a login does.
     Docker(String),
+    /// A script run on an SSH host, waiting in `App::pending_runs` for the
+    /// chain a login to the host would need.
+    Script(String),
     Rdp { name: String, password: String },
 }
 
@@ -1246,6 +1424,7 @@ impl Step {
             Self::Ssh(n) => format!("ssh '{n}'"),
             Self::Transfer(n) => format!("files on '{n}'"),
             Self::Docker(n) => format!("docker on '{n}'"),
+            Self::Script(n) => format!("script on '{n}'"),
             Self::Rdp { name, .. } => format!("rdp '{name}'"),
         }
     }
@@ -1258,6 +1437,7 @@ impl Step {
             Self::Ssh(n) => format!("ssh {n}"),
             Self::Transfer(n) => format!("files {n}"),
             Self::Docker(n) => format!("docker {n}"),
+            Self::Script(n) => format!("script {n}"),
             Self::Rdp { name, .. } => format!("rdp {name}"),
         }
     }
@@ -1275,7 +1455,7 @@ impl Step {
             Self::Tunnel(n) => LogTarget::Tunnel(n.clone()),
             // A transfer is something done to a host, not a connection of its
             // own: it belongs in that host's log and in that host's report.
-            Self::Ssh(n) | Self::Transfer(n) => LogTarget::Ssh(n.clone()),
+            Self::Ssh(n) | Self::Transfer(n) | Self::Script(n) => LogTarget::Ssh(n.clone()),
             Self::Docker(n) => Engine::Ssh(n.clone()).target(),
             Self::Rdp { name, .. } => LogTarget::Rdp(name.clone()),
         }
@@ -1285,7 +1465,7 @@ impl Step {
     fn is_terminal(&self) -> bool {
         matches!(
             self,
-            Self::Ssh(_) | Self::Transfer(_) | Self::Docker(_) | Self::Rdp { .. }
+            Self::Ssh(_) | Self::Transfer(_) | Self::Docker(_) | Self::Script(_) | Self::Rdp { .. }
         )
     }
 }
@@ -1377,7 +1557,7 @@ impl Catalog<'_> {
                 .unwrap_or_default(),
             // A transfer rides the host, so it waits for exactly what a
             // session to that host waits for.
-            Step::Ssh(n) | Step::Transfer(n) | Step::Docker(n) => self
+            Step::Ssh(n) | Step::Transfer(n) | Step::Docker(n) | Step::Script(n) => self
                 .ssh_hosts
                 .iter()
                 .find(|h| &h.name == n)
@@ -2187,6 +2367,9 @@ pub struct LogPane {
     /// The stack pane a single container was opened out of with `Enter`,
     /// which `Esc` goes back to.
     pub back: Option<Box<LogPane>>,
+    /// On a script run's pane, the host or container whose run form `Esc`
+    /// goes back to, so the next script is one key away rather than three.
+    pub back_to_form: Option<RunSubject>,
 }
 
 impl LogPane {
@@ -2197,6 +2380,7 @@ impl LogPane {
             tile: 0,
             tile_scroll: HashMap::new(),
             back: None,
+            back_to_form: None,
         }
     }
 }
@@ -2216,13 +2400,22 @@ pub struct PanicSummary {
     pub tunnels: usize,
     pub rdp: usize,
     pub ssh: usize,
+    /// Shells in containers, in windows of their own.
+    pub shells: usize,
+    /// Scripts still running.
+    pub scripts: usize,
     /// `provider:profile` for every VPN profile currently up.
     pub vpn: Vec<String>,
 }
 
 impl PanicSummary {
     pub fn is_empty(&self) -> bool {
-        self.tunnels == 0 && self.rdp == 0 && self.ssh == 0 && self.vpn.is_empty()
+        self.tunnels == 0
+            && self.rdp == 0
+            && self.ssh == 0
+            && self.shells == 0
+            && self.scripts == 0
+            && self.vpn.is_empty()
     }
 
     /// One line per kind, leaving out the kinds that have nothing up.
@@ -2243,6 +2436,12 @@ impl PanicSummary {
         }
         if self.ssh > 0 {
             out.push(plural(self.ssh, "SSH window"));
+        }
+        if self.shells > 0 {
+            out.push(plural(self.shells, "container shell"));
+        }
+        if self.scripts > 0 {
+            out.push(plural(self.scripts, "running script"));
         }
         if !self.vpn.is_empty() {
             out.push(format!("VPN: {}", self.vpn.join(", ")));
@@ -2384,6 +2583,27 @@ pub struct App {
     pub docker_confirm: Option<DockerConfirm>,
     docker_tx: Sender<DockerMsg>,
     docker_rx: Receiver<DockerMsg>,
+    /// The form `!` opened, while it is open.
+    pub run_form: Option<RunForm>,
+    /// The last form submitted for each host or container, so running the
+    /// same thing again is `!` and Enter.
+    run_memory: HashMap<LogTarget, RunForm>,
+    /// Script runs, running and finished, oldest first.
+    pub script_runs: Vec<scripts::Run>,
+    script_next: u64,
+    /// Runs on SSH hosts waiting for the host's chain, by host.
+    pending_runs: Vec<(String, scripts::Launch)>,
+    /// Script repositories, by name, and when each was last brought up to date.
+    pub repo_sync: HashMap<String, RepoSync>,
+    /// What git printed doing it. A repository is the program's business, not
+    /// any one host's, so this is in the program's pane.
+    git_log: Arc<Ring>,
+    script_tx: Sender<ScriptMsg>,
+    script_rx: Receiver<ScriptMsg>,
+    /// Container shells waiting for the main loop to hand them a terminal.
+    shell_launch: VecDeque<ShellLaunch>,
+    /// Container shells open in windows of their own, by what they are in.
+    pub shell_windows: Vec<(LogTarget, ssh::WindowSession)>,
     /// Plan currently being executed, if any.
     pub activation: Option<Activation>,
     /// Tunnel-binding conflict awaiting the user's decision.
@@ -2424,6 +2644,7 @@ impl App {
         let (vpn_tx, vpn_rx) = channel();
         let (sftp_tx, sftp_rx) = channel();
         let (docker_tx, docker_rx) = channel();
+        let (script_tx, script_rx) = channel();
         let vpn_view = VpnView::new();
         let empty_ctx = FormContext {
             tunnels: &tunnels,
@@ -2496,6 +2717,17 @@ impl App {
             docker_confirm: None,
             docker_tx,
             docker_rx,
+            run_form: None,
+            run_memory: HashMap::new(),
+            script_runs: Vec::new(),
+            script_next: 0,
+            pending_runs: Vec::new(),
+            repo_sync: HashMap::new(),
+            git_log: Arc::new(Ring::new("git")),
+            script_tx,
+            script_rx,
+            shell_launch: VecDeque::new(),
+            shell_windows: Vec::new(),
             activation: None,
             conflict: None,
             port_prompt: None,
@@ -2536,6 +2768,11 @@ impl App {
             if self.transfer.is_some() {
                 timeout = timeout.min(Duration::from_millis(100));
             }
+            // The same for a script that is still printing: its pane should
+            // read like a terminal, not like a page that refreshes.
+            if self.script_runs.iter().any(scripts::Run::running) {
+                timeout = timeout.min(Duration::from_millis(200));
+            }
             if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
@@ -2545,6 +2782,7 @@ impl App {
             }
             self.drain_sftp();
             self.poll_transfer();
+            self.drain_scripts();
             if self.last_tick.elapsed() >= tick_rate {
                 self.on_tick();
                 self.last_tick = Instant::now();
@@ -2560,6 +2798,10 @@ impl App {
                 self.run_handoff(terminal, handoff)?;
                 self.last_tick = Instant::now();
             }
+            while let Some(shell) = self.shell_launch.pop_front() {
+                self.run_shell(terminal, shell)?;
+                self.last_tick = Instant::now();
+            }
             if self.should_quit {
                 break;
             }
@@ -2567,6 +2809,10 @@ impl App {
         // A transfer session is a child of ours like any other: it goes when
         // the program does, rather than being left holding a connection.
         self.close_transfer();
+        // A script is a child of ours too, and on a host an ssh connection.
+        for run in self.script_runs.iter().filter(|r| r.running()) {
+            run.stop();
+        }
         // A follow is a child of ours, and on a remote engine an ssh
         // connection: it goes with the program. The containers stay.
         for log in self.docker_logs.values_mut() {
@@ -2727,6 +2973,14 @@ impl App {
                 rings.push(ring);
             }
         }
+        for run in &self.script_runs {
+            if target.covers(&run.target) {
+                rings.push(&run.ring);
+            }
+        }
+        if *target == LogTarget::Program {
+            rings.push(&self.git_log);
+        }
         rings
     }
 
@@ -2855,6 +3109,14 @@ impl App {
         }
         // A container opened out of its stack goes back there, rather than
         // closing the pane the user came through.
+        // A script run goes back to the form it was started from.
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && pane.back_to_form.is_some() {
+            let subject = self.log_pane.take().and_then(|p| p.back_to_form);
+            if let Some(subject) = subject {
+                self.open_run_form(subject);
+            }
+            return;
+        }
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && pane.back.is_some() {
             self.log_pane = self.log_pane.take().and_then(|p| p.back).map(|b| *b);
             self.docker_follow(true);
@@ -2867,6 +3129,7 @@ impl App {
             }
         };
         match key.code {
+            KeyCode::Enter => self.stop_run_in_pane(),
             KeyCode::Char('c') => self.clear_log(),
             KeyCode::Char('s') => self.export_log(),
             KeyCode::Up => scroll_by(self, 1),
@@ -2945,7 +3208,7 @@ impl App {
             .journal
             .all()
             .iter()
-            .filter(|(t, _)| *t == about)
+            .filter(|(t, _)| t.subject() == &about)
             .map(|(_, e)| e.clone())
             .collect();
         if let Some(log) = self.docker_logs.get(&about) {
@@ -2954,6 +3217,9 @@ impl App {
         if let Some(ring) = self.docker_actions.get(&about) {
             lines.extend(ring.all());
         }
+        for run in self.script_runs.iter().filter(|r| r.target.subject() == &about) {
+            lines.extend(run.ring.all());
+        }
         lines.sort_by_key(|e| e.at);
         lines
     }
@@ -2961,8 +3227,9 @@ impl App {
     /// What a stack's tiled pane shows under the tiles: everything done to
     /// the stack and its engine, and nothing any one container said.
     pub fn stack_own_lines(&self, target: &LogTarget) -> Vec<Entry> {
-        let container_level =
-            |t: &LogTarget| matches!(t, LogTarget::Docker { container, .. } if !container.is_empty());
+        let container_level = |t: &LogTarget| {
+            matches!(t.subject(), LogTarget::Docker { container, .. } if !container.is_empty())
+        };
         let mut lines: Vec<Entry> = self
             .journal
             .all()
@@ -3127,6 +3394,11 @@ impl App {
             self.on_log_key(key);
             return;
         }
+        // Takes text, so every letter is the form's; only Esc closes it.
+        if self.run_form.is_some() {
+            self.on_run_form_key(key);
+            return;
+        }
         match self.form_mode.clone() {
             FormMode::Add | FormMode::Edit(_) => {
                 self.on_form_key(key);
@@ -3239,6 +3511,8 @@ impl App {
                 .filter(|a| a.status == RdpStatus::Running)
                 .count(),
             ssh: self.ssh_windows.values().map(Vec::len).sum(),
+            shells: self.shell_windows.len(),
+            scripts: self.script_runs.iter().filter(|r| r.running()).count(),
             vpn,
         }
     }
@@ -3285,6 +3559,14 @@ impl App {
             }
         }
         self.ssh_windows.clear();
+        for (_, session) in self.shell_windows.iter_mut() {
+            session.kill();
+        }
+        self.shell_windows.clear();
+        self.pending_runs.clear();
+        for run in self.script_runs.iter().filter(|r| r.running()) {
+            run.stop();
+        }
         for id in ProviderId::ALL {
             // Before the client is told to go down, so a login cannot land after
             // it and put the tunnel back up.
@@ -3367,6 +3649,10 @@ impl App {
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('f') => self.flash(
                 "files move over SSH — pick the host on the SSH tab",
+                false,
+            ),
+            KeyCode::Char('!') => self.flash(
+                "scripts run on an SSH host or in a container — pick one on the SSH or Docker tab",
                 false,
             ),
             KeyCode::Enter
@@ -3482,6 +3768,10 @@ impl App {
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('f') => self.flash(
                 "a tunnel carries the connection, not the files — transfer on the SSH tab",
+                false,
+            ),
+            KeyCode::Char('!') => self.flash(
+                "a tunnel runs nothing itself — run a script on its host on the SSH tab",
                 false,
             ),
             KeyCode::Char('c') => self.clear_finished_tunnels(),
@@ -3645,6 +3935,10 @@ impl App {
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('f') => self.flash(
                 "a VPN carries the connection, not the files — transfer on the SSH tab",
+                false,
+            ),
+            KeyCode::Char('!') => self.flash(
+                "a VPN carries the connection — scripts run on the SSH tab or in a container",
                 false,
             ),
             KeyCode::Char('c') => self.clear_vpn_finished(),
@@ -5086,6 +5380,10 @@ impl App {
                 "an RDP session carries its own drives — transfer on the SSH tab",
                 false,
             ),
+            KeyCode::Char('!') => self.flash(
+                "scripts run over SSH — pick the host on the SSH tab",
+                false,
+            ),
             KeyCode::Char('c') => {
                 // Clear a finished session entry (keeps running ones).
                 if let Some(i) = self.selected_rdp_conn() {
@@ -5440,6 +5738,7 @@ impl App {
             KeyCode::Char('r') => self.open_selected_ssh(),
             KeyCode::Char('p') => self.clear_stored_password(),
             KeyCode::Char('f') => self.open_selected_transfer(),
+            KeyCode::Char('!') => self.open_selected_run(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => self.clear_finished_ssh(),
             _ => {}
@@ -5470,8 +5769,13 @@ impl App {
             return;
         };
         let name = self.ssh_hosts[i].name.clone();
-        if self.ssh_last.remove(&name).is_some() {
-            self.flash(format!("cleared the last session of '{name}'"), false);
+        let target = LogTarget::Ssh(name.clone());
+        let runs = self.script_runs.len();
+        self.script_runs
+            .retain(|r| r.running() || !target.covers(&r.target));
+        let runs = runs - self.script_runs.len();
+        if self.ssh_last.remove(&name).is_some() || runs > 0 {
+            self.flash(format!("cleared what finished on '{name}'"), false);
         } else {
             self.flash("nothing finished to clear", false);
         }
@@ -6329,6 +6633,9 @@ impl App {
                 _ => None,
             };
         }
+        if let Some(form) = &self.run_form {
+            return (form.field() == RunField::Script).then_some((ChooserTarget::Script, "script"));
+        }
         None
     }
 
@@ -6341,6 +6648,14 @@ impl App {
             ChooserTarget::SshDep => self.ssh_form.dep.choices(),
             ChooserTarget::RdpVpn => self.rdp_form.vpn.choices(),
             ChooserTarget::RdpDep => self.rdp_form.dep.choices(),
+            ChooserTarget::Script => scripts::choices(
+                &scripts::catalog(
+                    &self.paths.scripts_dir,
+                    &self.paths.repos_dir,
+                    &self.app_config.scripts.repos,
+                ),
+                &self.app_config.scripts.repos,
+            ),
         }
     }
 
@@ -6353,6 +6668,12 @@ impl App {
             ChooserTarget::SshDep => self.ssh_form.dep.value(),
             ChooserTarget::RdpVpn => self.rdp_form.vpn.value(),
             ChooserTarget::RdpDep => self.rdp_form.dep.value(),
+            ChooserTarget::Script => self
+                .run_form
+                .as_ref()
+                .and_then(|f| f.script.as_ref())
+                .map(|s| s.id.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -6419,6 +6740,7 @@ impl App {
                 ChooserTarget::SshDep => self.ssh_form.dep.set(&value),
                 ChooserTarget::RdpVpn => self.rdp_form.vpn.set(&value),
                 ChooserTarget::RdpDep => self.rdp_form.dep.set(&value),
+                ChooserTarget::Script => self.pick_script(&value),
             }
         }
     }
@@ -6495,6 +6817,478 @@ impl App {
             return self.vpn_form.active_text_mut();
         }
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // Scripts and container shells
+    //
+    // `!` opens one form for both. A script is fed to its interpreter on stdin
+    // over the host's ssh or a container's `docker exec -i`, and its output
+    // fills a ring the log pane shows; a shell gets a terminal, the same way
+    // an ssh session does. See `scripts.rs` for why stdin.
+    // -----------------------------------------------------------------------
+
+    /// `!` on the SSH tab.
+    fn open_selected_run(&mut self) {
+        match self.ssh_rows.get(self.ssh_selected) {
+            Some(RowItem::Item(i)) => {
+                let name = self.ssh_hosts[*i].name.clone();
+                self.open_run_form(RunSubject::Host(name));
+            }
+            Some(RowItem::Group(_)) => {
+                self.flash("a script runs on one host at a time — pick a host", false)
+            }
+            None => self.flash("no ssh host is configured yet", true),
+        }
+    }
+
+    /// `!` on the Docker tab: only a container has anything to run in.
+    fn open_container_run(&mut self) {
+        let engine = self.docker.current_row().engine().clone();
+        let Some(c) = self.docker.selected_container().cloned() else {
+            let why = match self.docker.current_row() {
+                DockerRow::Engine(Engine::Ssh(n)) => {
+                    format!("to run on '{n}' itself, use ! on the SSH tab — → picks a container here")
+                }
+                DockerRow::Stack(..) => "a script runs in one container — → picks one".to_string(),
+                DockerRow::Engine(Engine::Local) => {
+                    "a script runs in a container — open the engine and pick one".to_string()
+                }
+            };
+            self.flash(why, false);
+            return;
+        };
+        self.open_run_form(RunSubject::Container {
+            engine,
+            name: c.name.clone(),
+            project: c.project.clone(),
+        });
+    }
+
+    /// Open the form as it was last submitted for this subject, and go
+    /// straight to the library when there is no script to show yet.
+    fn open_run_form(&mut self, subject: RunSubject) {
+        let mut form = self
+            .run_memory
+            .get(&subject.target())
+            .cloned()
+            .unwrap_or_else(|| RunForm::new(subject));
+        form.error = None;
+        form.field = 0;
+        // Read again: the file may have changed, or a sync moved it.
+        if let Some(id) = form.script.as_ref().map(|s| s.id.clone()) {
+            form.script = self.load_script(&id).ok();
+        }
+        // Straight to the library, every time: the last script is selected in
+        // it, so running it again is still only Enter twice.
+        let pick = !form.shell;
+        if pick {
+            form.focus(RunField::Script);
+        }
+        self.run_form = Some(form);
+        self.sync_repos();
+        if pick {
+            self.open_field_picker();
+        }
+    }
+
+    fn load_script(&self, id: &str) -> Result<scripts::Script, String> {
+        scripts::load(
+            id,
+            &self.paths.scripts_dir,
+            &self.paths.repos_dir,
+            &self.app_config.scripts.repos,
+        )
+    }
+
+    /// What the chooser handed back, into the form.
+    fn pick_script(&mut self, id: &str) {
+        let loaded = self.load_script(id);
+        if let Some(form) = &mut self.run_form {
+            match loaded {
+                Ok(s) => {
+                    form.script = Some(s);
+                    form.error = None;
+                    form.focus(RunField::Args);
+                }
+                Err(e) => form.error = Some(e),
+            }
+        }
+    }
+
+    /// Bring every repository that has not been looked at for a while up to
+    /// date, on threads. Only ever from `!`: a configured repository costs
+    /// nothing until a script is about to be picked.
+    fn sync_repos(&mut self) {
+        for repo in self.app_config.scripts.repos.clone() {
+            let st = self.repo_sync.entry(repo.name.clone()).or_default();
+            if st.busy || st.at.is_some_and(|t| t.elapsed() < REPO_SYNC_EVERY) {
+                continue;
+            }
+            st.busy = true;
+            st.at = Some(Instant::now());
+            self.note(
+                LogTarget::Program,
+                format!(
+                    "scripts: bringing '{}' up to date from {}",
+                    repo.name,
+                    scripts::display_url(&repo.url)
+                ),
+            );
+            let dir = scripts::repo_dir(&self.paths.repos_dir, &repo);
+            scripts::spawn_sync(repo, dir, Arc::clone(&self.git_log), self.script_tx.clone());
+        }
+    }
+
+    fn on_run_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.run_form.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.run_form = None,
+            KeyCode::Enter => self.submit_run_form(),
+            KeyCode::Tab | KeyCode::Down => form.next_field(),
+            KeyCode::BackTab | KeyCode::Up => form.prev_field(),
+            KeyCode::Left | KeyCode::Right if form.field() == RunField::Mode => form.toggle_mode(),
+            KeyCode::Left | KeyCode::Right if form.field() == RunField::Script => {
+                self.open_field_picker()
+            }
+            KeyCode::Backspace => {
+                if let Some(text) = form.active_text_mut() {
+                    text.pop();
+                }
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_field_picker()
+            }
+            KeyCode::Char(c) => match form.field() {
+                RunField::Mode => form.toggle_mode(),
+                // Typing on the script field is searching the whole library,
+                // not the folder the current script happens to be in.
+                RunField::Script => {
+                    self.open_field_picker();
+                    if let Some((_, chooser)) = &mut self.chooser {
+                        chooser.to_top();
+                        chooser.push(c);
+                    }
+                }
+                _ => {
+                    if let Some(text) = form.active_text_mut() {
+                        text.push(c);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// The command lines the form would run, built by the functions that run
+    /// them — so what the form shows before Enter is exactly what Enter does.
+    fn plan_run(&self, form: &RunForm) -> Result<RunPlan, String> {
+        let helper = &self.ssh_password_helper;
+        match &form.subject {
+            RunSubject::Host(name) => {
+                let host = self
+                    .ssh_hosts
+                    .iter()
+                    .find(|h| &h.name == name)
+                    .ok_or_else(|| format!("ssh host '{name}' is gone"))?;
+                let script = form.script.clone().ok_or("pick a script first")?;
+                let words = scripts::remote_words(&script.body, &scripts::split_args(&form.args)?);
+                let argv = ssh::remote_argv(host, helper, &scripts::remote_line(&words), false);
+                Ok(RunPlan::Script(scripts::Launch {
+                    on: form.subject.target(),
+                    script,
+                    argv,
+                    password: host.password.clone(),
+                    user: String::new(),
+                }))
+            }
+            RunSubject::Container { engine, name, .. } => {
+                let host = self.docker_host(engine);
+                if matches!(engine, Engine::Ssh(_)) && host.is_none() {
+                    return Err(format!("ssh host '{}' is gone", engine.label()));
+                }
+                if form.user.trim().contains(char::is_whitespace) {
+                    return Err("a user is one word: a name or uid, and :group or :gid".into());
+                }
+                let password = host.map(|h| h.password.clone()).unwrap_or_default();
+                if form.shell {
+                    let command = if form.shell_cmd.trim().is_empty() {
+                        vec!["sh".to_string(), "-c".to_string(), AUTO_SHELL.to_string()]
+                    } else {
+                        scripts::split_args(&form.shell_cmd)?
+                    };
+                    let args = docker::exec_args(name, &form.user, true, &command);
+                    return Ok(RunPlan::Shell(ShellLaunch {
+                        target: form.subject.target(),
+                        argv: docker::interactive_command_line(engine, host, helper, &args),
+                        password,
+                    }));
+                }
+                let script = form.script.clone().ok_or("pick a script first")?;
+                let words = scripts::remote_words(&script.body, &scripts::split_args(&form.args)?);
+                let args = docker::exec_args(name, &form.user, false, &words);
+                Ok(RunPlan::Script(scripts::Launch {
+                    on: form.subject.target(),
+                    script,
+                    argv: self.docker_argv(engine, &args),
+                    password,
+                    user: form.user.trim().to_string(),
+                }))
+            }
+        }
+    }
+
+    /// The form's command line as the preview shows it, or why there is none.
+    pub fn run_preview(&self, form: &RunForm) -> Result<String, String> {
+        let argv = match self.plan_run(form)? {
+            RunPlan::Script(l) => l.argv,
+            RunPlan::Shell(s) => s.argv,
+        };
+        Ok(report::redact(&report::command_line(&argv)))
+    }
+
+    fn submit_run_form(&mut self) {
+        let Some(form) = self.run_form.clone() else {
+            return;
+        };
+        if !form.shell && form.script.is_none() {
+            if let Some(f) = &mut self.run_form {
+                f.focus(RunField::Script);
+            }
+            self.open_field_picker();
+            return;
+        }
+        let refuse = |app: &mut Self, why: String| {
+            if let Some(f) = &mut app.run_form {
+                f.error = Some(why);
+            }
+        };
+        if let RunSubject::Container { engine, name, .. } = &form.subject {
+            if let Some(why) = self.docker_unreachable(engine) {
+                return refuse(self, why);
+            }
+            let state = self
+                .docker
+                .get(engine)
+                .and_then(|st| st.containers.iter().find(|c| &c.name == name))
+                .map(|c| c.state.clone());
+            match state.as_deref() {
+                Some("running") => {}
+                Some(other) => {
+                    return refuse(
+                        self,
+                        format!("'{name}' is {other} — docker exec needs it running"),
+                    )
+                }
+                None => return refuse(self, format!("'{name}' is no longer listed")),
+            }
+        }
+        let plan = match self.plan_run(&form) {
+            Ok(p) => p,
+            Err(e) => return refuse(self, e),
+        };
+        self.run_memory.insert(form.subject.target(), form.clone());
+        self.run_form = None;
+        match (plan, &form.subject) {
+            (RunPlan::Shell(shell), _) => self.shell_launch.push_back(shell),
+            // A host is reached through its chain, like a login or a transfer.
+            (RunPlan::Script(launch), RunSubject::Host(name)) => {
+                self.pending_runs.retain(|(h, _)| h != name);
+                self.pending_runs.push((name.clone(), launch));
+                self.activate(vec![Step::Script(name.clone())]);
+            }
+            // A container is reached through its engine, which is up — the
+            // container was listed through it a moment ago.
+            (RunPlan::Script(launch), RunSubject::Container { .. }) => self.start_run(launch),
+        }
+    }
+
+    fn start_run(&mut self, launch: scripts::Launch) {
+        self.script_next += 1;
+        let id = self.script_next;
+        let name = launch.script.name().to_string();
+        let target = LogTarget::script(launch.on.clone(), &name, id);
+        let subject = self
+            .run_memory
+            .get(&launch.on)
+            .map(|form| form.subject.clone());
+        self.note(
+            target.clone(),
+            format!(
+                "running {name} from {}: {}",
+                launch.script.origin(),
+                report::command_line(&launch.argv)
+            ),
+        );
+        match scripts::start(id, launch, &self.ssh_password_helper, self.script_tx.clone()) {
+            Ok(run) => {
+                self.script_runs.push(run);
+                // Only finished runs are dropped, and the oldest first.
+                while self.script_runs.len() > RUNS_KEPT {
+                    match self.script_runs.iter().position(|r| !r.running()) {
+                        Some(i) => {
+                            self.script_runs.remove(i);
+                        }
+                        None => break,
+                    }
+                }
+                let mut pane = LogPane::new(target);
+                pane.back_to_form = subject;
+                self.log_pane = Some(pane);
+            }
+            Err(e) => self.report(target, format!("{name}: {e}"), true),
+        }
+    }
+
+    fn drain_scripts(&mut self) {
+        while let Ok(msg) = self.script_rx.try_recv() {
+            match msg {
+                ScriptMsg::Finished { id, result } => {
+                    let Some(run) = self.script_runs.iter_mut().find(|r| r.id == id) else {
+                        continue;
+                    };
+                    run.finish(result);
+                    let Some(outcome) = run.outcome.clone() else {
+                        continue;
+                    };
+                    let msg = format!(
+                        "{} {} after {}",
+                        run.script,
+                        outcome.label(),
+                        ui::fmt_duration(outcome.duration)
+                    );
+                    let target = run.target.clone();
+                    self.report(target, msg, outcome.failed());
+                }
+                ScriptMsg::Synced { repo, result } => {
+                    let st = self.repo_sync.entry(repo.clone()).or_default();
+                    st.busy = false;
+                    match result {
+                        Ok(()) => {
+                            st.error = None;
+                            let at = self
+                                .app_config
+                                .scripts
+                                .repos
+                                .iter()
+                                .find(|r| r.name == repo)
+                                .and_then(|r| {
+                                    scripts::head_commit(&scripts::repo_dir(&self.paths.repos_dir, r))
+                                })
+                                .unwrap_or_else(|| "?".into());
+                            self.note(LogTarget::Program, format!("scripts: '{repo}' is at {at}"));
+                            self.refresh_script_chooser();
+                        }
+                        Err(e) => {
+                            st.error = Some(e.clone());
+                            self.journal
+                                .fail(LogTarget::Program, format!("scripts: syncing '{repo}': {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A sync that lands while the library is open puts what it fetched in
+    /// front of the user, with what they had typed still typed.
+    fn refresh_script_chooser(&mut self) {
+        let Some((ChooserTarget::Script, old)) = &self.chooser else {
+            return;
+        };
+        let filter = old.filter.clone();
+        let mut fresh = Chooser::open(
+            "script",
+            self.choices_for(ChooserTarget::Script),
+            &self.chooser_value(ChooserTarget::Script),
+        );
+        for c in filter.chars() {
+            fresh.push(c);
+        }
+        self.chooser = Some((ChooserTarget::Script, fresh));
+    }
+
+    pub fn script_run(&self, target: &LogTarget) -> Option<&scripts::Run> {
+        let LogTarget::Script { run, .. } = target else {
+            return None;
+        };
+        self.script_runs.iter().find(|r| r.id == *run)
+    }
+
+    /// `Enter` in a running script's pane.
+    fn stop_run_in_pane(&mut self) {
+        let Some(target) = self.log_pane.as_ref().map(|p| p.target.clone()) else {
+            return;
+        };
+        match self.script_run(&target) {
+            Some(run) if run.running() => {
+                run.stop();
+                self.report(target, "stopping the script", false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Give a container shell a terminal: a window of its own, or this one —
+    /// the same choice, made the same way, as for an ssh session.
+    fn run_shell(&mut self, terminal: &mut Tui, launch: ShellLaunch) -> Result<()> {
+        let line = report::command_line(&launch.argv);
+        let target = launch.target.clone();
+        self.note(
+            target.clone(),
+            format!("shell in {}: {line}", self.ssh_launcher.label()),
+        );
+        let helper = self.ssh_password_helper.clone();
+        if let ssh::Launch::Window(term) = self.ssh_launcher.clone() {
+            match ssh::spawn_window(&launch.argv, &launch.password, &term, &helper) {
+                Ok(session) => {
+                    self.shell_windows.push((target.clone(), session));
+                    self.report(target, format!("shell opened in a new {} window", term.name()), false);
+                }
+                Err(e) => self.report(target, format!("shell: {e:#}"), true),
+            }
+            return Ok(());
+        }
+        crate::suspend_terminal(terminal)?;
+        println!("── controlcenter: {} ──", report::redact(&line));
+        let result = ssh::run_attached(&launch.argv, &launch.password, &helper);
+        crate::resume_terminal(terminal)?;
+        match result {
+            Ok(outcome) => self.report(
+                target,
+                format!(
+                    "shell {} after {}",
+                    outcome.label(),
+                    ui::fmt_duration(outcome.duration)
+                ),
+                outcome.failed(),
+            ),
+            Err(e) => self.report(target, format!("shell: {e:#}"), true),
+        }
+        Ok(())
+    }
+
+    fn poll_shell_windows(&mut self) {
+        let mut finished = Vec::new();
+        self.shell_windows.retain_mut(|(target, s)| match s.poll() {
+            Some(outcome) => {
+                finished.push((target.clone(), outcome));
+                false
+            }
+            None => true,
+        });
+        for (target, outcome) in finished {
+            self.journal.note(
+                target,
+                format!(
+                    "shell {} after {}",
+                    outcome.label(),
+                    ui::fmt_duration(outcome.duration)
+                ),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -6651,9 +7445,11 @@ impl App {
                 None => StepState::Waiting,
             },
             // Terminal steps are never waited on.
-            Step::Ssh(_) | Step::Transfer(_) | Step::Docker(_) | Step::Rdp { .. } => {
-                StepState::Ready
-            }
+            Step::Ssh(_)
+            | Step::Transfer(_)
+            | Step::Docker(_)
+            | Step::Script(_)
+            | Step::Rdp { .. } => StepState::Ready,
         }
     }
 
@@ -6806,6 +7602,19 @@ impl App {
                     )),
                 }
             }
+            Step::Script(name) => {
+                let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_runs)
+                    .into_iter()
+                    .partition(|(host, _)| host == name);
+                self.pending_runs = rest;
+                if mine.is_empty() {
+                    return StartOutcome::Failed(format!("nothing is waiting to run on '{name}'"));
+                }
+                for (_, launch) in mine {
+                    self.start_run(launch);
+                }
+                StartOutcome::Started
+            }
             Step::Rdp { name, password } => {
                 self.spawn_rdp(&name.clone(), &password.clone());
                 StartOutcome::Started
@@ -6888,7 +7697,7 @@ impl App {
                     note: None,
                 })
             }
-            Step::Ssh(_) | Step::Transfer(_) | Step::Docker(_) => None,
+            Step::Ssh(_) | Step::Transfer(_) | Step::Docker(_) | Step::Script(_) => None,
         }
     }
 
@@ -7781,6 +8590,7 @@ impl App {
                 "files move over SSH — pick the host on the SSH tab",
                 false,
             ),
+            KeyCode::Char('!') => self.open_container_run(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('c') => {
                 let target = self.docker.selection_target();
@@ -7789,6 +8599,8 @@ impl App {
                     st.error = None;
                 }
                 self.docker_actions.retain(|t, _| !target.covers(t));
+                self.script_runs
+                    .retain(|r| r.running() || !target.covers(&r.target));
                 self.flash("cleared", false);
             }
             _ => {}
@@ -8024,6 +8836,7 @@ impl App {
             }
         }
         self.poll_ssh_windows();
+        self.poll_shell_windows();
         for (name, session) in self.ovpn_active.iter_mut() {
             let before = session.status;
             session.poll();

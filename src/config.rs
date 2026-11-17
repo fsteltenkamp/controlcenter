@@ -24,6 +24,11 @@ pub struct Paths {
     pub run_dir: PathBuf,
     /// Reports exported from a log pane. Created the first time one is written.
     pub reports_dir: PathBuf,
+    /// The user's own scripts — the `local` shelf of the script library.
+    pub scripts_dir: PathBuf,
+    /// Clones of the script repositories in `config.toml`. A cache: anything
+    /// in it can be thrown away and is fetched again on the next sync.
+    pub repos_dir: PathBuf,
 }
 
 impl Paths {
@@ -39,6 +44,8 @@ impl Paths {
         let wireguard_dir = config_dir.join("wireguard");
         let openvpn_dir = config_dir.join("openvpn");
         let reports_dir = config_dir.join("reports");
+        let scripts_dir = config_dir.join("scripts");
+        let repos_dir = dirs.cache_dir().join("script-repos");
         let run_dir = dirs
             .runtime_dir()
             .map(Path::to_path_buf)
@@ -55,11 +62,15 @@ impl Paths {
             openvpn_dir,
             run_dir,
             reports_dir,
+            scripts_dir,
+            repos_dir,
         })
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.config_dir)?;
+        // Made up front so there is somewhere obvious to drop a script.
+        fs::create_dir_all(&self.scripts_dir)?;
         // These hold private keys and client certificates — and, for the short
         // while each one exists, the credentials file an OpenVPN reads and the
         // `.rdp` mstsc reads — so they are locked to their owner even before a
@@ -192,6 +203,29 @@ pub struct AppConfig {
     pub rdp: RdpConfig,
     #[serde(default)]
     pub vpn: VpnAppConfig,
+    #[serde(default)]
+    pub scripts: ScriptsConfig,
+}
+
+/// Where the script library comes from, beyond the built-in scripts and the
+/// `scripts` directory beside this file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScriptsConfig {
+    #[serde(default)]
+    pub repos: Vec<ScriptRepo>,
+}
+
+/// A git repository of scripts, cloned into the cache and kept up to date.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScriptRepo {
+    /// The folder it is listed as in the picker.
+    pub name: String,
+    /// Anything `git fetch` takes: https, ssh, or a path on this machine.
+    pub url: String,
+    /// A branch, a tag or a commit. Empty follows the repository's default
+    /// branch; a commit or a tag pins what can run.
+    #[serde(default, rename = "ref", skip_serializing_if = "String::is_empty")]
+    pub reference: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

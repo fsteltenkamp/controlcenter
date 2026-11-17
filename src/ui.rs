@@ -1,7 +1,7 @@
 use crate::app::{
     App, FormField, FormMode, Link, LogPane, Pane, PendingCopy, RdpField, RdpMode, RowItem,
-    SshField, SshMode, Step, Tab, TransferView, VpnMode, VpnPane, FORM_FIELDS, RDP_FIELDS,
-    SSH_FIELDS,
+    RunField, RunForm, RunSubject, SshField, SshMode, Step, Tab, TransferView, VpnMode, VpnPane,
+    FORM_FIELDS, RDP_FIELDS, SSH_FIELDS,
 };
 use crate::browser::FileBrowser;
 use crate::chooser::{Chooser, Row as ChooserRow};
@@ -126,6 +126,10 @@ pub fn render(f: &mut Frame, app: &App) {
 
     if let Some(c) = &app.docker_confirm {
         render_docker_confirm(f, &c.question, area);
+    }
+
+    if let Some(form) = &app.run_form {
+        render_run_form_overlay(f, app, form, area);
     }
 
     // One log pane for the whole program, over whichever tab opened it.
@@ -2030,6 +2034,32 @@ fn render_ssh(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(field("ended", format!("{} ago", fmt_duration(last.finished_at.elapsed()))));
             }
 
+            let on = LogTarget::Ssh(h.name.clone());
+            let runs: Vec<_> = app
+                .script_runs
+                .iter()
+                .filter(|r| r.target.subject() == &on)
+                .collect();
+            if let Some(last) = runs.last() {
+                lines.push(Line::from(""));
+                let (state, color) = match &last.outcome {
+                    None => (
+                        format!("running {}", fmt_duration(last.started.elapsed())),
+                        WARN(),
+                    ),
+                    Some(o) if o.failed() => (o.label(), DANGER()),
+                    Some(o) => (o.label(), DIM()),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("script     ", Style::default().fg(DIM())),
+                    Span::styled(format!("{} · ", last.script), Style::default().fg(TEXT())),
+                    Span::styled(state, Style::default().fg(color)),
+                ]));
+                if runs.len() > 1 {
+                    lines.push(field("", format!("{} runs kept · l shows them", runs.len())));
+                }
+            }
+
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 truncate(&ssh::command_preview(h, &app.ssh_password_helper), 60),
@@ -2510,6 +2540,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("ctrl↑↓", "move"),
                 ("r", "new session"),
                 ("f", "files"),
+                ("!", "script"),
                 ("p", "password"),
                 ("l", "log"),
                 ("s", "report"),
@@ -2522,6 +2553,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ("←→", "fold/open"),
                 ("r", "restart"),
                 ("d", "down/remove"),
+                ("!", "script/shell"),
                 ("l", "log"),
                 ("s", "report"),
                 ("c", "clear"),
@@ -2828,7 +2860,28 @@ fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
 
     let entries = app.log_lines(&pane.target);
     let inner = rect.width.saturating_sub(2) as usize;
-    let strip = docker_strip_lines(app, &pane.target, inner);
+    let mut strip = docker_strip_lines(app, &pane.target, inner);
+    let run = app.script_run(&pane.target);
+    if let Some(run) = run {
+        let (state, color) = match &run.outcome {
+            None => (
+                format!("running · {}", fmt_duration(run.started.elapsed())),
+                WARN(),
+            ),
+            Some(o) => (
+                format!("{} · after {}", o.label(), fmt_duration(o.duration)),
+                if o.failed() { DANGER() } else { OK() },
+            ),
+        };
+        strip.push(Line::from(vec![
+            Span::styled(format!(" {} ", run.script), Style::default().fg(TEXT()).bold()),
+            Span::styled(state, Style::default().fg(color)),
+            Span::styled(
+                format!("  {}", truncate(&run.origin, inner.saturating_sub(40))),
+                Style::default().fg(DIM()),
+            ),
+        ]));
+    }
     // Two borders, the footer, and the state strip over a docker pane.
     let rows = (rect.height.saturating_sub(3) as usize).saturating_sub(strip.len());
     let mut lines = from_bottom(&entries, pane.scroll, rows, |e| log_entry_lines(e, inner));
@@ -2845,6 +2898,12 @@ fn render_log_overlay(f: &mut Frame, app: &App, pane: &LogPane, area: Rect) {
     lines.push(Line::from(Span::styled(
         if pane.back.is_some() {
             " s report · c clear · ↑↓ scroll · Esc/q back to the stack · l close"
+        } else if run.is_some_and(|r| r.running()) && pane.back_to_form.is_some() {
+            " ↵ stop the script · s report · c clear · ↑↓ scroll · Esc/q back to the scripts · l close"
+        } else if run.is_some_and(|r| r.running()) {
+            " ↵ stop the script · s report · c clear · ↑↓ scroll · Esc/q/l close"
+        } else if pane.back_to_form.is_some() {
+            " s report · c clear · ↑↓ scroll · Esc/q back to the scripts · l close"
         } else {
             " s report · c clear · ↑↓ scroll · Esc/q/l close"
         },
@@ -3056,42 +3115,55 @@ fn log_entry_lines(entry: &logs::Entry, width: usize) -> Vec<Line<'static>> {
 /// of ssh options — and the interesting half is usually the end of it, so it
 /// wraps rather than being cut off at the border.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
+    // Spacing is kept rather than collapsed: what a script prints is often a
+    // table — `df`, `free`, `ps` — and its columns are made of runs of blanks.
+    let text = expand_tabs(text);
+    if width == 0 || text.chars().count() <= width {
+        return vec![text];
     }
     let mut out: Vec<String> = Vec::new();
     let mut line = String::new();
-    for word in text.split_whitespace() {
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let gap_len = rest.len() - rest.trim_start().len();
+        let (gap, after) = rest.split_at(gap_len);
+        let word_len = after.find(char::is_whitespace).unwrap_or(after.len());
+        let (word, next) = after.split_at(word_len);
+        rest = next;
+        if word.is_empty() {
+            break;
+        }
+        // The gap a line breaks at is dropped; any other is kept as it was,
+        // and so is the indent the text starts with.
+        let gap = if line.is_empty() && !out.is_empty() { "" } else { gap };
         // A word wider than the pane — a long path — is cut, because there is
         // nowhere to break it.
         if word.chars().count() > width {
-            if !line.is_empty() {
+            if !line.trim().is_empty() {
                 out.push(std::mem::take(&mut line));
             }
-            let mut rest = word;
-            while rest.chars().count() > width {
-                let cut = rest
+            line.clear();
+            let mut piece = word;
+            while piece.chars().count() > width {
+                let cut = piece
                     .char_indices()
                     .nth(width)
                     .map(|(i, _)| i)
-                    .unwrap_or(rest.len());
-                out.push(rest[..cut].to_string());
-                rest = &rest[cut..];
+                    .unwrap_or(piece.len());
+                out.push(piece[..cut].to_string());
+                piece = &piece[cut..];
             }
-            line = rest.to_string();
+            line = piece.to_string();
             continue;
         }
-        let joined = if line.is_empty() {
-            word.chars().count()
-        } else {
-            line.chars().count() + 1 + word.chars().count()
-        };
-        if joined > width {
+        if line.chars().count() + gap.chars().count() + word.chars().count() > width
+            && !line.is_empty()
+        {
             out.push(std::mem::take(&mut line));
+            line.push_str(word);
+            continue;
         }
-        if !line.is_empty() {
-            line.push(' ');
-        }
+        line.push_str(gap);
         line.push_str(word);
     }
     if !line.is_empty() || out.is_empty() {
@@ -3100,9 +3172,37 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Tabs to spaces at every eighth column, as a terminal would have shown them.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut col = 0usize;
+    for c in text.chars() {
+        if c == '\t' {
+            let pad = 8 - col % 8;
+            out.extend(std::iter::repeat_n(' ', pad));
+            col += pad;
+        } else {
+            out.push(c);
+            col += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::wrap_text;
+
+    #[test]
+    fn a_table_keeps_its_columns() {
+        assert_eq!(wrap_text("Mem:   62Gi   11Gi", 40), vec!["Mem:   62Gi   11Gi"]);
+        assert_eq!(wrap_text("a\tb", 40), vec!["a       b"]);
+        // Broken where it has to be, with the spacing inside each line kept.
+        assert_eq!(wrap_text("aa   bb   cc   dd", 9), vec!["aa   bb", "cc   dd"]);
+    }
 
     #[test]
     fn a_line_breaks_between_words_and_never_loses_one() {
@@ -3221,6 +3321,165 @@ fn render_quit_prompt(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(WARN()))
             .title(Span::styled(" quit ", Style::default().fg(WARN()).bold())),
+    );
+    f.render_widget(para, rect);
+}
+
+/// The form `!` opens: what will run, where, as whom, and the exact command
+/// line — then the script itself, so Enter is a decision made having seen it.
+fn render_run_form_overlay(f: &mut Frame, app: &App, form: &RunForm, area: Rect) {
+    let height = area.height.saturating_sub(4).clamp(12, 34);
+    let rect = centered_rect(area.width.saturating_sub(8).clamp(60, 110), height, area);
+    f.render_widget(Clear, rect);
+    let inner = rect.width.saturating_sub(2) as usize;
+    let value_width = value_width(rect, 27);
+
+    let title = match &form.subject {
+        RunSubject::Host(n) => format!(" run on ssh host '{n}' "),
+        RunSubject::Container { engine, name, .. } => match engine {
+            docker::Engine::Local => format!(" run in container '{name}' "),
+            docker::Engine::Ssh(h) => format!(" run in container '{name}' on '{h}' "),
+        },
+    };
+    let header = form.script.as_ref().map(|s| s.header()).unwrap_or_default();
+
+    let mut lines: Vec<Line> = Vec::new();
+    for fld in form.fields() {
+        let active = fld == form.field();
+        let label_style = if active {
+            Style::default().fg(ACCENT()).bold()
+        } else {
+            Style::default().fg(DIM())
+        };
+        let (value, style) = match fld {
+            RunField::Mode => (
+                format!("◂ {} ▸", if form.shell { "shell" } else { "script" }),
+                Style::default().fg(TEXT()),
+            ),
+            RunField::Script => match &form.script {
+                Some(s) => (s.name().to_string(), Style::default().fg(TEXT())),
+                None => ("— pick one —".to_string(), Style::default().fg(DIM())),
+            },
+            RunField::Args => (form.args.clone(), Style::default().fg(TEXT())),
+            RunField::Shell if form.shell_cmd.is_empty() && !active => {
+                ("bash where there is one, otherwise sh".into(), Style::default().fg(DIM()))
+            }
+            RunField::Shell => (form.shell_cmd.clone(), Style::default().fg(TEXT())),
+            RunField::User if form.user.is_empty() && !active => {
+                ("the image's own".into(), Style::default().fg(DIM()))
+            }
+            RunField::User => (form.user.clone(), Style::default().fg(TEXT())),
+        };
+        let cursor = if active && !fld.is_picker() { "▏" } else { "" };
+        let value = if fld.is_picker() { value } else { scrolled(&value, value_width) };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<26}", fld.label()), label_style),
+            Span::styled(value, style),
+            Span::styled(cursor, Style::default().fg(ACCENT())),
+        ]));
+        // What the script says its arguments are, right under where they go.
+        if fld == RunField::Args && !header.args.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" {:<26}{}", "", truncate(&header.args, value_width)),
+                Style::default().fg(DIM()),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    if let Some(script) = form.script.as_ref().filter(|_| !form.shell) {
+        if !header.description.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", truncate(&header.description, inner.saturating_sub(2))),
+                Style::default().fg(TEXT()),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" from {}", truncate(&script.origin(), inner.saturating_sub(7))),
+            Style::default().fg(DIM()),
+        )));
+    }
+    // Repositories still fetching, or that could not be: the library is
+    // missing them, and this is the one place that would say why.
+    for repo in &app.app_config.scripts.repos {
+        let Some(st) = app.repo_sync.get(&repo.name) else {
+            continue;
+        };
+        let (msg, color) = match (&st.error, st.busy) {
+            (_, true) => (format!(" repo '{}': fetching…", repo.name), DIM()),
+            (Some(e), _) => (format!(" repo '{}': {e}", repo.name), DANGER()),
+            _ => continue,
+        };
+        lines.push(Line::from(Span::styled(
+            truncate(&msg, inner),
+            Style::default().fg(color),
+        )));
+    }
+    match app.run_preview(form) {
+        Ok(line) => {
+            for chunk in wrap_text(&format!("$ {line}"), inner.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(
+                    format!(" {chunk}"),
+                    Style::default().fg(ACCENT()),
+                )));
+            }
+        }
+        Err(_) if form.script.is_none() && !form.shell => {}
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!(" {e}"),
+            Style::default().fg(DANGER()),
+        ))),
+    }
+
+    // Two borders, a blank, the error and the footer.
+    let room = (rect.height as usize).saturating_sub(lines.len() + 5);
+    if let Some(script) = form.script.as_ref().filter(|_| !form.shell && room > 2) {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", "─".repeat(inner.saturating_sub(2))),
+            Style::default().fg(BORDER()),
+        )));
+        let body: Vec<&str> = script.body.lines().collect();
+        let shown = room - 1;
+        for l in body.iter().take(shown) {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", truncate(&l.replace('\t', "    "), inner.saturating_sub(2))),
+                Style::default().fg(DIM()),
+            )));
+        }
+        if body.len() > shown {
+            if let Some(last) = lines.last_mut() {
+                *last = Line::from(Span::styled(
+                    format!(" … {} more lines", body.len() - shown + 1),
+                    Style::default().fg(DIM()),
+                ));
+            }
+        }
+    }
+
+    while lines.len() + 4 < rect.height as usize {
+        lines.push(Line::from(""));
+    }
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(DANGER()),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    let footer = match form.field() {
+        RunField::Script => " type or Ctrl+O to pick from the library · Enter run · Esc cancel",
+        RunField::Mode => " ◂▸ script or shell · tab/↓ next · Enter run · Esc cancel",
+        _ if form.shell => " tab/↓ next · ↑ prev · Enter open the shell · Esc cancel",
+        _ => " tab/↓ next · ↑ prev · Enter run · Esc cancel",
+    };
+    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM()))));
+
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT()))
+            .title(Span::styled(title, Style::default().fg(ACCENT()).bold())),
     );
     f.render_widget(para, rect);
 }
@@ -3807,6 +4066,12 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
         text("is configured: l on a stack shows every container's state over"),
         text("their logs merged; l on one container shows only its own"),
         Line::from(""),
+        section("scripts"),
+        text("! on an ssh host or a container runs a script from the library"),
+        text("— built in, your scripts directory, or a git repository — and"),
+        text("shows what it printed in the log pane. On a container it can"),
+        text("open a shell instead, as any uid:gid you name"),
+        Line::from(""),
         section("logs and reports"),
         text("l opens the log of whatever is selected: what controlcenter did"),
         text("about it, merged with what the process it started printed."),
@@ -3869,6 +4134,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("r", "reconnect · reload"),
         entry("p", "remove the stored password"),
         entry("f", "files — the two-pane transfer browser, on an ssh host"),
+        entry("!", "run a script on it — or, in a container, open a shell"),
         entry("l", "log"),
         entry("s", "save a report to a file — everything, not just this log"),
         entry("c", "clear — the log, or entries that have finished"),
@@ -3903,7 +4169,9 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         entry("", "the focus is where a copy comes from, and ↵ copies it"),
         entry("ctrl+o", "open a picker for the field under the cursor — files"),
         entry("", "on a path, the whole list on a VPN, tunnel or ssh-host"),
-        entry("", "field, where groups are folders and typing searches"),
+        entry("", "field, the script library on a script field — where"),
+        entry("", "groups are folders and typing searches"),
+        entry("enter", "in a running script's log: stop it"),
         entry("o", "open the login URL — in a VPN browser-login prompt,"),
         entry("", "where c gives up on the login instead"),
         Line::from(""),
@@ -3914,6 +4182,7 @@ fn render_keys_overlay(f: &mut Frame, area: Rect) {
         row("r", "refresh", "restart", "new session", "reconnect", "restart"),
         row("p", "openvpn pw", "—", "stored pw", "never stored", "—"),
         row("f", "—", "—", "transfer files", "—", "—"),
+        row("!", "—", "—", "run a script", "—", "script · shell"),
         row("l", "profile log", "ssh output", "what it did", "client log", "stack · one"),
         row("c", "errors", "failed", "last session", "finished", "errors"),
         row("ctrl+↑↓", "move profile", "move tunnel", "move host", "move conn.", "—"),

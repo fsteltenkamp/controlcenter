@@ -25,13 +25,20 @@ a process's own output is dim; anything that failed is red.
 | Dashboard | everything, in one list — the whole run |
 | VPN | the selected profile: its session log, what the client printed, and what was run to bring it up |
 | Tunnels | the selected tunnel: its ssh output and its starts, restarts and failures |
-| SSH | the selected host: the command line, where the session opened, how it ended, and every file transferred to or from it |
+| SSH | the selected host: the command line, where the session opened, how it ended, every file transferred to or from it, and every script run on it |
 | RDP | the selected connection: the client's log |
+| Docker | a container's log, or a stack's containers in tiles — and the scripts and shells run in them |
 
 An SSH *session* is the one thing with no output here — it runs in a terminal window of
 its own, and that is where what it prints stays. A transfer (`f`) is not: the `sftp`
 session behind it is a child process like any other, so what it and ssh printed is in the
 host's pane, and stays there after the browser is closed.
+
+A **script run** (`!`) gets a pane of its own, opened as it starts: the command line, what
+the script printed — its stderr in red — and how it ended, under a line saying whether it
+is still running. `Enter` in that pane stops it. The same lines are in the pane of the host
+or container it ran on, so `l` there shows every run. The last 50 runs are kept; `c` on the
+tab forgets the finished ones. See [scripts.md](scripts.md).
 
 In the pane, `↑` `↓` scroll a line at a time and `PgUp` `PgDn` a screen; the title says how
 far back you are. `c` clears it, `q`, `Esc` and `l` all close it.

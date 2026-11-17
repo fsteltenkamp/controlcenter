@@ -8,7 +8,7 @@ instructions there, and do not put usage documentation here.
 
 ```sh
 cargo build            # must stay warning-free
-cargo test             # 267 tests, all pure unit tests — no network, no root
+cargo test             # 280 tests, all pure unit tests — no network, no root
 cargo build --release
 ```
 
@@ -47,8 +47,9 @@ so those still need the CI job or a real machine.
 | `src/logs.rs` | the line ring every child process fills, the journal of what the program did, and `LogTarget` — which connection a pane, an entry or a report is about |
 | `src/report.rs` | the report `s` exports, and the redaction every line goes through |
 | `src/tunnel.rs` | spawning ssh, the counting relay, per-tunnel status |
-| `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline |
+| `src/ssh.rs` | interactive sessions: terminal detection, windowed and inline — and `remote_argv`, the one place a configured host becomes a command line for something run on it |
 | `src/sftp.rs` | the one `sftp` process a transfer browser talks to, the listing it parses, and the remote pane's state |
+| `src/scripts.rs` | the script library (built in, `scripts/`, git repositories), reading a script's `#!` and header, splitting arguments, a run, and a repository sync; the built-in scripts are in `src/scripts/builtin/` |
 | `src/rdp.rs` | RDP sessions: xfreerdp3, and mstsc through a generated `.rdp` |
 | `src/docker.rs` | the Docker tab: engines, `docker ps` parsed into stacks and containers, the command line for an engine (local, or over an SSH-tab host), actions, following a container's log, and the tab's selection |
 | `src/browser.rs` | the file picker |
@@ -218,6 +219,25 @@ container was opened out of. A `docker logs --follow` runs only
 while a pane shows it (`App::docker_follow`) and picks up from the last timestamp when the
 pane opens again. Lines lose their terminal escapes before they reach a ring.
 
+**A script goes over stdin, and `!` is one form.** `scripts.rs` never copies a file to a
+host: the argv is `ssh::remote_argv` for a host or `docker::command_line` over
+`docker::exec_args` for a container — the same builders every other remote command uses —
+and the body is written to the interpreter's stdin (`interpreter` reads it off the `#!`).
+That is why a run never gets a tty: a pty would echo the script back into its output. A
+container's shell is the other half of the same form, and does get one
+(`docker::interactive_command_line`, `ssh -t`); it is handed a terminal by the main loop
+from `App::shell_launch`, the way an ssh session is. What the form previews comes from
+`App::plan_run`, which submitting also calls, so the preview is what runs.
+
+A run is `LogTarget::Script { on, .. }`: its own pane shows only it, and `covers` puts it
+in the pane of whatever it ran `on` and anything above that. A report on a run is scoped
+through `LogTarget::subject`, so it explains the host or container and its chain. A run on
+a host waits for the host's chain as `Step::Script`, with the launch parked in
+`App::pending_runs` until the step fires. Repositories are fetched with the git CLI, never
+prompting (`GIT_TERMINAL_PROMPT=0`, `BatchMode=yes`), only when `!` is pressed, and what
+git printed goes to the program's log; a URL is written down through `display_url`, which
+drops an https token.
+
 **The UI thread never blocks.** Every connect, disconnect and status poll runs on a thread
 and reports back through `vpn_tx`/`vpn_rx`. A new long-running operation follows the same
 shape.
@@ -302,10 +322,11 @@ values are still read as NetBird.
   short; it is the page a human reads first
 - `docs/connections.md` — groups, dependencies, conflicts, SSH sessions and passwords
 - `docs/docker.md` — the Docker tab, and remote engines
+- `docs/scripts.md` — the script library, `!`, and container shells
 - `docs/logs.md` — the log pane, and what an exported report contains
 - `docs/vpn.md` — how each VPN client is driven
 - `docs/configuration.md` — every config file, field by field
 - this file — anything an agent needs and a user does not
 
-A behaviour change that a user would notice belongs in one of the first six. A convention
+A behaviour change that a user would notice belongs in one of the first seven. A convention
 that only matters while editing the code belongs here.

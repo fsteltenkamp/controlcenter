@@ -95,49 +95,102 @@ pub fn transfer_args(host: &SshHost) -> Vec<String> {
 /// The command line as the user would type it, for the details panel.
 /// A stored password is never shown — it goes through the environment.
 pub fn command_preview(host: &SshHost, helper: &PasswordHelper) -> String {
-    let mut parts: Vec<String> = Vec::new();
+    login_argv(host, helper).join(" ")
+}
+
+/// The whole argv of an interactive login, `sshpass -e` in front where that is
+/// what carries the password.
+pub fn login_argv(host: &SshHost, helper: &PasswordHelper) -> Vec<String> {
+    let mut argv = wrapper(host, helper);
+    argv.push("ssh".into());
+    argv.extend(build_args(host));
+    argv
+}
+
+/// `sshpass -e`, where that is how this host's password reaches ssh.
+fn wrapper(host: &SshHost, helper: &PasswordHelper) -> Vec<String> {
     if !host.password.is_empty() && *helper == PasswordHelper::Sshpass {
-        parts.push("sshpass".into());
-        parts.push("-e".into());
+        vec!["sshpass".into(), "-e".into()]
+    } else {
+        Vec::new()
     }
-    parts.push("ssh".into());
-    parts.extend(build_args(host));
-    parts.join(" ")
+}
+
+/// The argv that runs `remote` — one string, for the host's shell — on a
+/// configured host. Everything that runs a command on a host rather than
+/// logging in to it comes through here: a docker engine, a script, a shell in
+/// a container.
+///
+/// `tty` asks for a terminal on the far side, which an interactive command
+/// needs and a piped one must not have — a pty would echo the script fed on
+/// stdin back into its output. Without one nothing can answer a prompt, since
+/// the TUI has the terminal, so a question becomes an error that can be shown
+/// instead, the same as for sftp.
+pub fn remote_argv(host: &SshHost, helper: &PasswordHelper, remote: &str, tty: bool) -> Vec<String> {
+    let mut argv = wrapper(host, helper);
+    argv.push("ssh".into());
+    if tty {
+        argv.push("-t".into());
+    }
+    argv.extend(connection_args(host));
+    if host.password.is_empty() && !tty {
+        argv.push("-o".into());
+        argv.push("BatchMode=yes".into());
+    }
+    argv.push("-o".into());
+    argv.push("ConnectTimeout=10".into());
+    argv.push(host.destination());
+    argv.push(remote.into());
+    argv
+}
+
+/// Quote one word for the POSIX shell on the far end of an ssh connection,
+/// which is handed the remote command as a single string.
+pub fn posix_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+".contains(c))
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// A `Command` for an argv built here, with the password where the helper
+/// looks for it and never on the line itself. Stdin is closed: a caller that
+/// feeds one sets it again.
+pub fn command(argv: &[String], password: &str, helper: &PasswordHelper) -> Command {
+    let mut cmd = Command::new(platform::program(&argv[0]));
+    cmd.args(&argv[1..]);
+    if matches!(argv[0].as_str(), "ssh" | "sshpass") {
+        carry_password(&mut cmd, password, helper);
+    }
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    platform::hidden(&mut cmd);
+    cmd
 }
 
 /// Run ssh attached to the current terminal and wait for it to finish.
 /// The caller must have left the alternate screen and raw mode first.
 pub fn run_interactive(host: &SshHost, helper: &PasswordHelper) -> Result<SessionOutcome> {
-    let args = build_args(host);
+    run_attached(&login_argv(host, helper), &host.password, helper)
+}
+
+/// Run any argv on the current terminal: a login, or a shell in a container.
+pub fn run_attached(argv: &[String], password: &str, helper: &PasswordHelper) -> Result<SessionOutcome> {
     let started = Instant::now();
-
-    let sshpass = !host.password.is_empty() && *helper == PasswordHelper::Sshpass;
-    let mut cmd = if sshpass {
-        // -e reads the password from SSHPASS so it never lands in the process
-        // list, where any user on the box could read it.
-        let mut c = Command::new(platform::program("sshpass"));
-        c.arg("-e").arg("ssh").args(&args);
-        c
-    } else {
-        let mut c = Command::new(platform::program("ssh"));
-        c.args(&args);
-        c
-    };
-    carry_password(&mut cmd, &host.password, helper);
-
+    let mut cmd = Command::new(platform::program(&argv[0]));
+    cmd.args(&argv[1..]);
+    carry_password(&mut cmd, password, helper);
     let mut child = cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| {
-            if sshpass {
-                "spawning sshpass (is sshpass installed?)".to_string()
-            } else {
-                "spawning ssh".to_string()
-            }
-        })?;
-    let status = child.wait().context("waiting for ssh")?;
+        .with_context(|| format!("spawning {} (is it installed?)", argv[0]))?;
+    let status = child.wait().with_context(|| format!("waiting for {}", argv[0]))?;
 
     Ok(SessionOutcome {
         code: status.code().unwrap_or(-1),
@@ -397,27 +450,24 @@ impl WindowSession {
 /// Two dialects, because the window is a shell's and the shells do not agree —
 /// on how a status is read back, on how a line is held, or on what a quote
 /// means. Both say the same thing.
-fn session_script(host: &SshHost, helper: &PasswordHelper) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !host.password.is_empty() && *helper == PasswordHelper::Sshpass {
-        parts.push("sshpass".into());
-        parts.push("-e".into());
-    }
-    parts.push("ssh".into());
-    parts.extend(build_args(host).iter().map(|a| shell_quote(a)));
-    let cmd = parts.join(" ");
+fn session_script(argv: &[String]) -> String {
+    let cmd = argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     #[cfg(not(windows))]
     {
         format!(
-            "{cmd}; s=$?; if [ \"$s\" -ne 0 ]; then printf '\\n[controlcenter] ssh exited %s — press Enter to close ' \"$s\"; read -r _; fi; exit $s"
+            "{cmd}; s=$?; if [ \"$s\" -ne 0 ]; then printf '\\n[controlcenter] exited %s — press Enter to close ' \"$s\"; read -r _; fi; exit $s"
         )
     }
     #[cfg(windows)]
     {
         // `||` runs the right-hand side only on a non-zero exit, which is the
         // whole of what the shell form above does with $?.
-        format!("{cmd} || (echo. & echo [controlcenter] ssh failed & pause)")
+        format!("{cmd} || (echo. & echo [controlcenter] it failed & pause)")
     }
 }
 
@@ -459,7 +509,17 @@ pub fn spawn_windowed(
     term: &Terminal,
     helper: &PasswordHelper,
 ) -> Result<WindowSession> {
-    let script = session_script(host, helper);
+    spawn_window(&login_argv(host, helper), &host.password, term, helper)
+}
+
+/// Any argv in a window of its own — a login, or a shell in a container.
+pub fn spawn_window(
+    argv: &[String],
+    password: &str,
+    term: &Terminal,
+    helper: &PasswordHelper,
+) -> Result<WindowSession> {
+    let script = session_script(argv);
     let mut cmd = Command::new(platform::program(&term.program));
     let mut placed = false;
     for arg in &term.args {
@@ -480,7 +540,7 @@ pub fn spawn_windowed(
             place_script(&mut cmd, &script);
         }
     }
-    carry_password(&mut cmd, &host.password, helper);
+    carry_password(&mut cmd, password, helper);
     // A console of its own is what makes this a window on Windows; elsewhere
     // the emulator opens one and this is not a thing that exists.
     #[cfg(windows)]
@@ -627,7 +687,7 @@ mod tests {
             extra_args: "-o ProxyCommand=none".into(),
             ..host()
         };
-        let script = session_script(&h, &PasswordHelper::Sshpass);
+        let script = session_script(&login_argv(&h, &PasswordHelper::Sshpass));
         assert!(script.starts_with("ssh -o ProxyCommand=none example.com"));
         // The window stays up after a failure so the error can be read.
         assert!(script.contains(if cfg!(windows) { "pause" } else { "read -r _" }));
@@ -639,14 +699,14 @@ mod tests {
             password: "hunter2".into(),
             ..host()
         };
-        let script = session_script(&h, &PasswordHelper::Sshpass);
+        let script = session_script(&login_argv(&h, &PasswordHelper::Sshpass));
         assert!(script.starts_with("sshpass -e ssh"));
         assert!(!script.contains("hunter2"));
 
         // With no sshpass to wrap it, ssh is run directly and answers its own
         // prompt — but the password is still nowhere near the command line.
         let askpass = PasswordHelper::Askpass(std::path::PathBuf::from("/opt/controlcenter"));
-        let script = session_script(&h, &askpass);
+        let script = session_script(&login_argv(&h, &askpass));
         assert!(script.starts_with("ssh "));
         assert!(!script.contains("hunter2"));
     }

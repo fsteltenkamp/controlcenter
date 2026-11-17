@@ -321,6 +321,26 @@ pub fn command_line(
     helper: &PasswordHelper,
     args: &[String],
 ) -> Vec<String> {
+    line(engine, host, helper, args, false)
+}
+
+/// The same, for a command that wants a terminal: a shell in a container.
+pub fn interactive_command_line(
+    engine: &Engine,
+    host: Option<&SshHost>,
+    helper: &PasswordHelper,
+    args: &[String],
+) -> Vec<String> {
+    line(engine, host, helper, args, true)
+}
+
+fn line(
+    engine: &Engine,
+    host: Option<&SshHost>,
+    helper: &PasswordHelper,
+    args: &[String],
+    tty: bool,
+) -> Vec<String> {
     let Engine::Ssh(_) = engine else {
         let mut argv = vec!["docker".to_string()];
         argv.extend(args.iter().cloned());
@@ -333,54 +353,32 @@ pub fn command_line(
         argv.extend(args.iter().cloned());
         return argv;
     };
-    let mut argv: Vec<String> = Vec::new();
-    if !host.password.is_empty() && *helper == PasswordHelper::Sshpass {
-        argv.push("sshpass".into());
-        argv.push("-e".into());
-    }
-    argv.push("ssh".into());
-    argv.extend(ssh::connection_args(host));
-    if host.password.is_empty() {
-        // Nothing here can answer a prompt — the TUI has the terminal — so a
-        // question becomes an error that can be shown, the same as for sftp.
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.push("-o".into());
-    argv.push("ConnectTimeout=10".into());
-    argv.push(host.destination());
     let remote: Vec<String> = std::iter::once("docker".to_string())
-        .chain(args.iter().map(|a| posix_quote(a)))
+        .chain(args.iter().map(|a| ssh::posix_quote(a)))
         .collect();
-    argv.push(remote.join(" "));
-    argv
+    ssh::remote_argv(host, helper, &remote.join(" "), tty)
 }
 
-fn posix_quote(arg: &str) -> String {
-    if !arg.is_empty()
-        && arg
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./=:@,+".contains(c))
-    {
-        return arg.to_string();
+/// `docker exec` into a running container: `-i` always, because a script is
+/// fed on stdin and a shell reads it, `-t` for a shell, and the user — a name,
+/// a uid, or either with `:group` — only when one was asked for, so that an
+/// empty field means the image's own `USER` rather than root.
+pub fn exec_args(container: &str, user: &str, tty: bool, command: &[String]) -> Vec<String> {
+    let mut args = vec!["exec".to_string(), if tty { "-it" } else { "-i" }.to_string()];
+    let user = user.trim();
+    if !user.is_empty() {
+        args.push("-u".into());
+        args.push(user.into());
     }
-    format!("'{}'", arg.replace('\'', r"'\''"))
+    args.push(container.into());
+    args.extend(command.iter().cloned());
+    args
 }
 
 /// A `Command` for an argv from [`command_line`], with the host's password
 /// where the helper looks for it and never on the line itself.
-fn command(argv: &[String], host: Option<&SshHost>, helper: &PasswordHelper) -> Command {
-    let mut cmd = Command::new(platform::program(&argv[0]));
-    cmd.args(&argv[1..]);
-    if let Some(h) = host {
-        if argv[0] != "docker" {
-            ssh::carry_password(&mut cmd, &h.password, helper);
-        }
-    }
-    cmd.stdin(Stdio::null());
-    #[cfg(windows)]
-    platform::hidden(&mut cmd);
-    cmd
+pub fn command(argv: &[String], host: Option<&SshHost>, helper: &PasswordHelper) -> Command {
+    ssh::command(argv, host.map_or("", |h| h.password.as_str()), helper)
 }
 
 pub fn installed() -> bool {
@@ -1022,11 +1020,11 @@ mod tests {
 
     #[test]
     fn the_ps_template_survives_the_remote_shell() {
-        let quoted = posix_quote(PS_FORMAT);
+        let quoted = ssh::posix_quote(PS_FORMAT);
         assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
-        assert_eq!(posix_quote("it's"), r"'it'\''s'");
-        assert_eq!(posix_quote("web-1"), "web-1");
-        assert_eq!(posix_quote(""), "''");
+        assert_eq!(ssh::posix_quote("it's"), r"'it'\''s'");
+        assert_eq!(ssh::posix_quote("web-1"), "web-1");
+        assert_eq!(ssh::posix_quote(""), "''");
     }
 
     #[test]
