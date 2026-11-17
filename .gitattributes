@@ -1,0 +1,5 @@
+# The built-in scripts are compiled in with include_str! and piped to a remote
+# /bin/sh, so they have to stay LF on a Windows checkout (core.autocrlf=true on
+# the runners): a CRLF shebang names "/bin/sh\r", and every line after it ends
+# in a stray carriage return the far shell would execute.
+*.sh text eol=lf
